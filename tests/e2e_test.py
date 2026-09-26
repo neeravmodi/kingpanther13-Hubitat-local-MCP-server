@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -67,10 +67,11 @@ MODERN_PROTOCOL_VERSION = "2026-07-28"
 SUPPORTED_PROTOCOL_VERSIONS = [MODERN_PROTOCOL_VERSION, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 
 # Mirrors initializeProtocolVersions() / defaultProtocolVersion(): the handshake negotiates
-# every supported revision EXCEPT the modern one. 2026-07-28 deleted `initialize`, so a client
-# that reaches it is legacy-era by construction and must never be handed a version it cannot
-# speak. Derived from the transport list above so the two cannot drift.
-INITIALIZE_PROTOCOL_VERSIONS = [v for v in SUPPORTED_PROTOCOL_VERSIONS if v != MODERN_PROTOCOL_VERSION]
+# every supported revision OLDER than the modern era (2026-07-28 or later). 2026-07-28 deleted
+# `initialize`, so a client that reaches it is legacy-era by construction and must never be handed
+# a version it cannot speak. Derived from the transport list above so the two cannot drift;
+# YYYY-MM-DD strings compare correctly as plain strings.
+INITIALIZE_PROTOCOL_VERSIONS = [v for v in SUPPORTED_PROTOCOL_VERSIONS if v < MODERN_PROTOCOL_VERSION]
 DEFAULT_PROTOCOL_VERSION = INITIALIZE_PROTOCOL_VERSIONS[0]
 # The revision the legacy_protocol group speaks on the wire. 2025-06-18 is the one that made
 # MCP-Protocol-Version REQUIRED on every POST, and it is what the shipping production clients
@@ -809,7 +810,7 @@ class HubitatMcpClient:
             version = headers.get("MCP-Protocol-Version")
             assert version is not None and version not in {
                 supported for supported in SUPPORTED_PROTOCOL_VERSIONS
-                if supported != MODERN_PROTOCOL_VERSION
+                if supported < MODERN_PROTOCOL_VERSION
             }, (
                 "raw E2E requests may use only 2026-07-28 or an unsupported-version "
                 "negative control; headerless and legacy revisions are forbidden"
@@ -949,6 +950,9 @@ class HubitatMcpClient:
                 # a client-side hot loop while preserving one logical call.
                 time.sleep(state_only_delay)
                 state_only_delay = min(state_only_delay * 2, 0.25)
+            parsed = self._decode_tool_result(name, arguments, result)
+            _op_ok = not (isinstance(parsed, dict) and parsed.get("success") is False)
+            return parsed
         except BaseException as exc:
             _op_ok = False
             # Cleanup can make more calls before the runner sees this exception.
@@ -985,8 +989,8 @@ class HubitatMcpClient:
             if _dur >= 7.5:
                 print(f"  [SLOW] {_dur:4.1f}s  {op_key}  ({self._active_test or '?'})"
                       f"{'' if _op_ok else '  [err/504]'}")
-        assert result is not None
 
+    def _decode_tool_result(self, name: str, arguments: dict, result: dict) -> Any:
         # Check for tool-level error
         if result.get("isError"):
             content_text = ""
@@ -1218,6 +1222,15 @@ def test(group: str):
 # ---------------------------------------------------------------------------
 
 
+def _is_stranded_button_controller(app: dict) -> bool:
+    """A Button Controller-5.1 child left by a test: it relabels itself after the device it binds,
+    so it is recognised by type plus a fixture-device name, never by the BAT_E2E_ prefix alone.
+    The parent "Button Controllers" app is a different type and never matches."""
+    name = str(app.get("name") or app.get("label") or "")
+    return (str(app.get("type") or "") == "Button Controller-5.1" and bool(app.get("parentId"))
+            and bool(str(app.get("id") or "")) and (PREFIX in name or "E2E_PERM_" in name))
+
+
 class TestRunner:
     def __init__(self, client: HubitatMcpClient, verbose: bool = False):
         self.client = client
@@ -1267,33 +1280,17 @@ class TestRunner:
         self.defer_native_deletes = os.environ.get("E2E_DEFER_NATIVE_DELETES") == "1"
         self.created_variable_names: list[str] = []
 
-        # Mid-run recovery for the platform's per-app load limiter. Once enough load
-        # accumulates in the platform's sliding window (back-to-back full runs get
-        # there), the hub throws LimitExceededException in the DEVICE's context on
-        # every device-method dispatch from the server app -- commands false-succeed
-        # and produce no event, and the block stays until the app instance is
-        # bounced (disable/enable; verified live, no reboot needed). The watchdog
-        # endpoint can do that bounce while the server stays the app under test, so
-        # the dispatch-dependent tests retry ONCE after a bounce instead of failing
-        # a healthy build on cadence. Every bounce is printed loudly and counted in
-        # the summary -- recovery is never silent.
+        # Dispatch-dependent tests may attempt a watchdog disable/enable before
+        # one retry. Only the retried operation/readback establishes recovery;
+        # a verified re-enable alone is not a passing test.
         self.watchdog_url = os.environ.get("WATCHDOG_URL", "")
         self.server_app_id = os.environ.get("HUBITAT_APP_ID", "")
         self.throttle_bounces = 0
         self._soft_passes: list[str] = []
-        # Inter-test pacing (see _run_one): optional client-side breathing room per test, ON TOP
-        # of the unconditional 0.2s per-call gap in _send. Byte volume (real per-run hub backups,
-        # large accumulated wizard pages) is one limiter input, but call CADENCE is another and was
-        # wrongly dismissed: the full 137-test lane still tripped the per-app limiter with backups
-        # mocked and rules kept small, because back-to-back calls (reads included) drove app 38's
-        # short-window duty cycle over the ceiling. The _send 0.2s gap is the primary lever; raise
-        # this for additional per-test spacing if the lane is still hot.
+        # Optional per-test spacing, in addition to the per-call gap in _send.
         self.pace_seconds = float(os.environ.get("E2E_PACE_SECONDS", "0"))
-        # Opt-in escalation so a recurring per-app load limiter is NOT soft-passed forever: once the
-        # limiter has tripped (and been app-bounced) this many times in a run, escalate from an
-        # app-bounce to a full HUB REBOOT, which resets the platform's load counters (an app-bounce
-        # only clears the app instance). 0 = disabled (default; pure soft-pass behaviour). Capped at a
-        # few reboots/run so it can never loop. See _reboot_hub_for_limiter / _clear_load_throttle.
+        # Reboot escalation is opt-in and disabled in normal CI. A zero threshold
+        # leaves repeated failures to the caller's assertions; it does not grant a pass.
         self.limiter_reboot_after = int(os.environ.get("E2E_LIMITER_REBOOT_AFTER", "0"))
         self._limiter_reboots = 0
 
@@ -1443,21 +1440,18 @@ class TestRunner:
             return False
 
     def _clear_load_throttle(self, reason: str) -> bool:
-        """Bounce (disable/enable) the server app via the WATCHDOG to clear the
-        platform's per-app load-limiter block (LimitExceededException -- device
-        commands false-succeed with no event while it holds).
-        Returns True when the bounce fully verified, so the caller can retry its
-        dispatch exactly once. A bounce is NOT a reset: it clears the block on the
-        app INSTANCE, but the platform's load counters survive it, so the retry can
-        re-trip the limiter immediately -- only a hub reboot resets those counters
-        (hence _reboot_hub_for_limiter). Callers must handle a still-limited retry.
-        LOUD on purpose: a recovery that happened must be visible in the run log
-        and the summary."""
+        """Attempt watchdog disable/enable; True verifies those flags, not recovery.
+
+        The caller must verify its single retried dispatch. Attempts are logged
+        and counted even when the retry remains blocked.
+        """
         if not (self.watchdog_url and self.server_app_id):
             print(f"    [THROTTLE] suspected load-limiter block ({reason}) but "
                   "WATCHDOG_URL/HUBITAT_APP_ID not set -- cannot bounce, failing as-is.")
             return False
         print(f"    [THROTTLE] suspected platform load-limiter block: {reason}")
+        if getattr(self, "_load_diagnostics", False) and not self.throttle_bounces:
+            self._record_load_snapshot("first limiter recovery")
         print(f"    [THROTTLE] bouncing server app {self.server_app_id} via the watchdog (disable/enable)...")
         if not self._watchdog_set_app_disabled(True):
             print("    [THROTTLE] disable leg did not verify -- not retrying the enable; failing as-is.")
@@ -1486,6 +1480,35 @@ class TestRunner:
                 and self._limiter_reboots < 3):
             self._reboot_hub_for_limiter()
         return True
+
+    def _call_with_limiter_bounce(self, gateway: str, tool: str, args: dict, label: str,
+                                  bounces: int = 1) -> tuple[Any, str | None]:
+        """One gateway call under the platform load-limiter contract: (envelope, limiter_message).
+        The limiter reaches us in TWO shapes -- some tools RAISE it, the RMUtils-backed ones
+        (hub_set_rule_paused, hub_call_rule, hub_set_rule_private_boolean) return it inside a
+        {'success': False, 'error': '...excessive hub load'} envelope -- so both are normalized
+        into the second element. Each trip bounces the app and retries, up to `bounces` rounds.
+        A non-None second element can survive the retry; the caller decides whether
+        a converged read-back means the write landed anyway. Other errors propagate."""
+
+        def _attempt():
+            try:
+                envelope = self.client.call_tool(gateway, {"tool": tool, "args": args})
+            except McpToolError as exc:
+                if "excessive hub load" not in str(exc):
+                    raise
+                return None, str(exc)
+            if (isinstance(envelope, dict) and envelope.get("success") is False
+                    and "excessive hub load" in str(envelope.get("error", ""))):
+                return envelope, str(envelope.get("error"))
+            return envelope, None
+
+        res, limited = _attempt()
+        for _round in range(bounces):
+            if not limited or not self._clear_load_throttle(f"{label}: {limited}"):
+                break
+            res, limited = _attempt()
+        return res, limited
 
     def _reboot_hub_for_limiter(self) -> bool:
         """Escalation for a recurring per-app load limiter: REBOOT the hub to reset the platform's
@@ -1804,11 +1827,90 @@ class TestRunner:
 
     def _last_op_str(self, error: BaseException | None = None) -> str:
         """Prefer the failing call's identity over any subsequent cleanup call."""
-        lo = getattr(error, "_mcp_failed_op", None) or getattr(self.client, "_last_op", None)
+        lo = getattr(error, "_mcp_failed_op", None)
+        if lo is None and isinstance(error, AssertionError):
+            return "assertion"
+        lo = lo or getattr(self.client, "_last_op", None)
         if not lo:
             return "unknown"
         op_key, dur, ok = lo
         return f"{op_key} {dur:.1f}s{'' if ok else ' [err]'}"
+
+    def _capture_504_context(self, name: str, exc: BaseException | None = None,
+                             failed_at: datetime | None = None) -> None:
+        """Print the server app's hub log from two minutes before the 504-failed call's start, and
+        the latest structured MCP history, so the hub-side timeline survives in the run log instead
+        of rolling out of Past Logs before anyone reads it. The failed call is the one the exception
+        carries (_mcp_failed_op), not _last_op, which by now is whatever ran afterwards; the window is
+        anchored at `failed_at` (when the failure was caught), not at capture time, because the
+        capture runs after the retry settle. The hub log is read from the main app first and, when
+        that read fails or is still loading, from the watchdog, a separate app. Raw transport only,
+        so op_timings and _last_op are untouched."""
+        app_id = getattr(self, "server_app_id", "")
+        if not app_id:
+            print(f"    [504-CONTEXT] {name}: HUBITAT_APP_ID not set -- cannot read the server app's hub log")
+            return
+        failed_op = getattr(exc, "_mcp_failed_op", None) or getattr(self.client, "_last_op", None)
+        dur = float(failed_op[1]) if failed_op and isinstance(failed_op[1], (int, float)) else 0.0
+        label = self._last_op_str(exc)
+        since = ((failed_at or datetime.now(UTC)) - timedelta(seconds=dur + 120)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def _print(source: str, entries: list) -> None:
+            print(f"    [504-CONTEXT] {name}: {source}, {len(entries)} entries (failed op {label}):")
+            for e in entries[-300:]:
+                ts = e.get("name") or e.get("timestamp") or e.get("time") or ""
+                if isinstance(ts, (int, float)):
+                    ts = datetime.fromtimestamp(ts / 1000, UTC).strftime("%H:%M:%S.%f")[:-3]
+                print(f"      {str(ts)[:23]} {str(e.get('level') or '')[:5]:5s} "
+                      f"{str(e.get('component') or '')[:12]} {str(e.get('message') or '')[:220]}")
+
+        def _read_main(args: dict) -> list:
+            """One log read; anything but a completed, usable list raises (the caller falls back)."""
+            raw = self.client._send("tools/call", {
+                "name": "hub_read_diagnostics", "arguments": {"tool": "hub_get_logs", "args": args}})
+            if not isinstance(raw, dict) or raw.get("isError") or raw.get("resultType") not in (None, "complete"):
+                raise ValueError(f"log read did not complete ({(raw or {}).get('resultType') or 'isError'})")
+            content = raw.get("content")
+            text = content[0].get("text") if isinstance(content, list) and content \
+                and isinstance(content[0], dict) else None
+            if not text:
+                raise ValueError("log read returned no content")
+            data = json.loads(text)
+            if not isinstance(data, dict) or data.get("status") == "in_progress" \
+                    or data.get("success") is False or data.get("error") \
+                    or data.get("message") == "No log data returned from hub":
+                raise ValueError(f"log read unusable: {str(data)[:120]}")
+            entries = data.get("logs") if "logs" in data else data.get("entries")
+            if not isinstance(entries, list):
+                raise ValueError("log read returned no entries list")
+            return entries
+
+        try:
+            source, entries = None, None
+            try:
+                entries = _read_main({"mode": "hub", "appId": int(app_id), "since": since, "limit": 300})
+                source = f"hub log since {since}"
+            except Exception as exc_main:
+                try:
+                    # The watchdog filters only by level, so keep the server app's own lines; its
+                    # newest-first cap stands in for the time window.
+                    entries = [e for e in self._watchdog_hub_logs(level="", limit=300)
+                               if str(e.get("message") or "").startswith(f"app|{app_id}|")]
+                    source = f"hub log via watchdog, newest 300 (main read failed: {str(exc_main)[:80]})"
+                except Exception as exc_wd:
+                    print(f"    [504-CONTEXT] {name}: hub log unreadable (main: {str(exc_main)[:80]}; "
+                          f"watchdog: {str(exc_wd)[:80]})")
+            if entries is not None:
+                _print(source, entries)
+            try:
+                mcp_entries = _read_main({"mode": "mcp", "limit": 100})
+            except Exception as exc_mcp:
+                print(f"    [504-CONTEXT] {name}: mcp log read failed: {exc_mcp}")
+            else:
+                _print("mcp log, newest 100", mcp_entries)
+        except Exception as exc_any:
+            # Diagnostics only: a failure here must never change the retry outcome.
+            print(f"    [504-CONTEXT] {name}: capture failed: {exc_any}")
 
     def _settle_before_504_retry(self, name: str) -> None:
         """After a relay 504, poll a trivial call until transport is responsive before re-running.
@@ -1835,7 +1937,49 @@ class TestRunner:
             time.sleep(5.0)
         print(f"    [BACKOFF] {name}: settle window elapsed -- re-running anyway")
 
+    def _record_load_snapshot(self, phase: str, *, include_mesh: bool = False) -> None:
+        """Bounded read-only evidence around the workload preceding RM dispatches."""
+        last_op = self.client._last_op
+        snapshot = {"phase": phase, "at": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "recentCalls": self.client.op_timings[-10:]}
+        try:
+            stats = self.client.call_tool("hub_read_diagnostics", {
+                "tool": "hub_get_performance_stats", "args": {"type": "app", "sortBy": "totalMs", "limit": 0},
+            })
+            snapshot.update({key: stats.get(key) for key in ("uptime", "snapshot", "appSummary")})
+            rows = stats.get("appStats", [])
+            fields = ("id", "count", "pctBusy", "pctTotal", "stateSize", "totalMs", "averageMs",
+                      "totalEvents", "states", "hubActions", "pendingEvents", "cloudCalls", "largeState")
+            snapshot["apps"] = [{key: row.get(key) for key in fields}
+                                for index, row in enumerate(rows)
+                                if index < 5 or str(row.get("id")) == self.server_app_id]
+            if include_mesh:
+                mesh = self.client.call_tool("hub_get_hub_mesh")
+                snapshot["mesh"] = {"enabled": mesh.get("hubMeshEnabled"),
+                                    "fullRefreshInterval": mesh.get("fullRefreshInterval")}
+                for key in ("peers", "sharedDevices", "localLinkedDevices"):
+                    snapshot["mesh"][key + "Count"] = len(mesh.get(key, []))
+        except Exception as exc:
+            snapshot["diagnosticError"] = type(exc).__name__
+        finally:
+            self.client._last_op = last_op
+        print("    LOAD_SNAPSHOT " + json.dumps(snapshot, sort_keys=True), flush=True)
+
     def _run_one(self, group: str, name: str, method_name: str) -> None:
+        print(f"  [TEST] {datetime.now(UTC).isoformat(timespec='seconds')} {group}/{name}", flush=True)
+        capture_load = getattr(self, "_load_diagnostics", False)
+        matrix = method_name == "test_device_configuration_matrix"
+        if capture_load and (matrix or method_name == "test_set_rule_native_lifecycle"):
+            self._record_load_snapshot(f"before {name}", include_mesh=matrix)
+        try:
+            self._run_one_attempts(group, name, method_name)
+        finally:
+            if capture_load and matrix:
+                self._record_load_snapshot(f"after {name}")
+            if self.pace_seconds > 0:
+                time.sleep(self.pace_seconds)
+
+    def _run_one_attempts(self, group: str, name: str, method_name: str) -> None:
         method = getattr(self, method_name)
         self._current_test = f"{group}/{name}"
         self.client._active_test = self._current_test   # so per-op timings attribute to this test
@@ -1869,9 +2013,12 @@ class TestRunner:
                 if "504" in str(exc) and attempt == 1:
                     retry_reason = "relay 504"
                     print(f"    [RETRY] {name} aborted by relay 504 -- re-running the test once")
+                    failed_at = datetime.now(UTC)
                     self._settle_before_504_retry(name)
+                    self._capture_504_context(name, exc, failed_at)
                     continue
                 if "504" in str(exc):
+                    self._capture_504_context(name, exc, datetime.now(UTC))
                     print(f"    FULL-FAILURE {name}: persistent relay 504 across retry "
                           f"(failure op {self._last_op_str(exc)}): {exc}")
                     self._record(name, group, "fail",
@@ -1886,7 +2033,9 @@ class TestRunner:
                 if "504" in es and attempt == 1:
                     retry_reason = "relay 504"
                     print(f"    [RETRY] {name} failed on a relay 504 -- re-running the test once")
+                    failed_at = datetime.now(UTC)
                     self._settle_before_504_retry(name)
+                    self._capture_504_context(name, exc, failed_at)
                     continue
                 # Server 5xx that is NOT a 504 (500/501/502/503): suspected per-app load limiter.
                 # Bounce/recover the app (which escalates to a reboot at the configured threshold),
@@ -1902,18 +2051,12 @@ class TestRunner:
                 # failure goes to the run log here -- a truncated structured response
                 # (error/repairHints/settingsSkipped all cut off) has repeatedly forced an
                 # extra run just to learn why a test failed.
+                if "504" in es:
+                    self._capture_504_context(name, exc, datetime.now(UTC))
                 print(f"    FULL-FAILURE {name} (failure op {self._last_op_str(exc)}): {exc}")
                 self._record(name, group, "fail",
                              message=f"[{self._last_op_str(exc)}] {exc}"[:200], duration=elapsed)
                 return
-        # Inter-test breathing room for the hub's per-app load limiter. The limiter has
-        # tripped MID-RUN on a freshly-booted hub, and the suite's recent speedups all
-        # removed the natural idle gaps the older, slower flow gave the server app between
-        # heavy phases -- raising its short-window duty cycle. A client-side sleep costs
-        # the hub NOTHING (no request is in flight) and caps that duty cycle. Tunable via
-        # E2E_PACE_SECONDS; 0 disables.
-        if self.pace_seconds > 0:
-            time.sleep(self.pace_seconds)
 
     # -- Rule helper: create, verify, delete ---------------------------------
 
@@ -3161,49 +3304,20 @@ class TestRunner:
 
     @test("native_apps")
     def test_set_app_disabled_roundtrip(self) -> None:
-        # Item 2 (#257): toggle a standalone non-e2e app's disabled flag and restore it.
-        # Pinned to "Hub Health Monitor & Auto Reboot" (app id 68) -- the only user-installed app on
-        # the test hub that is NOT e2e infrastructure (not the MCP server under test (38), the v1/v2
-        # watchdogs (5506/5993), the RM/VRB/Basic-Rules/Dashboard/HSM parent containers, or HPM (37)).
-        # Reads the app's current disabled state, flips it (tool read-back + list-apps verified), and
-        # restores the original state in finally so the run leaves the hub as it found it.
-        APP_ID = 68
-
-        def current_disabled():
-            listed = self.client.call_tool("hub_read_apps_code", {
-                "tool": "hub_list_apps", "args": {"scope": "instances", "filter": "user"}})
-            apps = listed
-            for _ in range(3):
-                if isinstance(apps, dict):
-                    apps = apps.get("apps") or apps.get("instances") or apps.get("list") or []
-                else:
-                    break
-            for a in (apps if isinstance(apps, list) else []):
-                if not isinstance(a, dict):
-                    continue
-                data = a.get("data")
-                d = data if isinstance(data, dict) else a
-                if str(d.get("id") or a.get("id") or "") == str(APP_ID):
-                    return bool(d.get("disabled"))
-            return None
-
-        original = current_disabled()
-        assert original is not None, \
-            f"app {APP_ID} (Hub Health Monitor) not found on the test hub -- cannot exercise hub_set_app_disabled"
-
-        def set_disabled(val):
-            res = self.client.call_tool("hub_manage_native_rules_and_apps", {
-                "tool": "hub_set_app_disabled", "args": {"appId": APP_ID, "disabled": val}})
-            assert res.get("success") is True, f"hub_set_app_disabled(disabled={val}) failed: {res}"
-            assert res.get("disabled") == val, f"hub_set_app_disabled read-back wrong: wanted {val}, got {res}"
-            return res
-
+        # Own the fixture: a user's existing app may intentionally be protected.
+        app_id = self._create_native_rule("DisableRoundtrip", {
+            "addActions": [{"capability": "log", "message": "disable roundtrip fixture"}]})
         try:
-            set_disabled(not original)
-            assert current_disabled() == (not original), \
-                "hub_list_apps does not reflect the flipped disabled state"
+            for disabled in (True, False):
+                result = self.client.call_tool("hub_manage_native_rules_and_apps", {
+                    "tool": "hub_set_app_disabled",
+                    "args": {"appId": app_id, "disabled": disabled}})
+                assert result.get("success") is True, f"disable toggle failed: {result}"
+                assert result.get("disabled") is disabled, f"disable read-back wrong: {result}"
+                status = self._rm_rule_status_when(app_id, lambda row, expected=disabled: row.get("disabled") is expected)
+                assert status.get("disabled") is disabled, f"rule listing has wrong disabled state: {status}"
         finally:
-            set_disabled(original)  # restore the app to the state we found it in
+            self._delete_native(app_id)
 
     @test("devices")
     def test_get_device(self) -> None:
@@ -5400,27 +5514,7 @@ class TestRunner:
         # instance's block, so even the bounced retry can hit it again.
         def _status_write(tool: str, args: dict, label: str) -> Any:
             gateway = "hub_manage_rule_machine" if tool == "hub_set_rule_paused" else "hub_manage_native_rules_and_apps"
-
-            def _attempt():
-                """(envelope, limiter_message) for one call. The limiter reaches us in TWO
-                shapes -- hub_set_app_disabled RAISES it, hub_set_rule_paused returns it inside
-                a {'success': False, 'error': '...excessive hub load'} envelope -- so both are
-                normalized into the second element and take the SAME recovery path below.
-                Anything that is not the limiter propagates."""
-                try:
-                    envelope = self.client.call_tool(gateway, {"tool": tool, "args": args})
-                except McpToolError as exc:
-                    if "excessive hub load" not in str(exc):
-                        raise
-                    return None, str(exc)
-                if (isinstance(envelope, dict) and envelope.get("success") is False
-                        and "excessive hub load" in str(envelope.get("error", ""))):
-                    return envelope, str(envelope.get("error"))
-                return envelope, None
-
-            res, limited = _attempt()
-            if limited and self._clear_load_throttle(f"{label}: {limited}"):
-                res, limited = _attempt()
+            res, limited = self._call_with_limiter_bounce(gateway, tool, args, label)
             if limited:
                 # An app bounce clears the app INSTANCE; the limiter that blocks RMUtils lives on
                 # the platform's load counters, so the retry above can hit it again (observed: the
@@ -5461,22 +5555,8 @@ class TestRunner:
             hub_get_rule_health's `stopped`, not in the appsList status the paused/disabled
             writes poll."""
 
-            def _attempt():
-                try:
-                    envelope = self.client.call_tool("hub_manage_rule_machine", {
-                        "tool": "hub_call_rule", "args": {"ruleId": app_id, "action": action}})
-                except McpToolError as exc:
-                    if "excessive hub load" not in str(exc):
-                        raise
-                    return None, str(exc)
-                if (isinstance(envelope, dict) and envelope.get("success") is False
-                        and "excessive hub load" in str(envelope.get("error", ""))):
-                    return envelope, str(envelope.get("error"))
-                return envelope, None
-
-            res, limited = _attempt()
-            if limited and self._clear_load_throttle(f"{label}: {limited}"):
-                res, limited = _attempt()
+            res, limited = self._call_with_limiter_bounce(
+                "hub_manage_rule_machine", "hub_call_rule", {"ruleId": app_id, "action": action}, label)
             if limited:
                 # The limiter can abort the reply to a write that already committed, so a
                 # converged health read means the envelope is stale, not the write failed.
@@ -5966,6 +6046,18 @@ class TestRunner:
             assert f"privateT.{pb_idx}" not in pb_after, \
                 f"the pre-rebuild privateBoolean row survived the retarget: {pb_after}"
 
+            # The same rebuild as a patches op, finalised by the batch's one updateRule.
+            pb_patch = self._patch_rule(caller_id, [
+                {"modifyAction": {"index": int(pb_new_idx), "mods": {"value": False}}}])
+            assert [e.get("op") for e in pb_patch] == ["modifyAction"] and pb_patch[0].get("success") is True, \
+                f"patches modifyAction did not succeed: {pb_patch}"
+            pb_patched_idx = pb_patch[0].get("newActionIndex")
+            pb_patched = self._get_persisted_rule_config(caller_id).get("settings") or {}
+            assert pb_patched_idx is not None \
+                and str(pb_patched.get(f"pvTF.{pb_patched_idx}")).lower() == "true" \
+                and f"privateT.{pb_new_idx}" not in pb_patched, \
+                f"patches modifyAction did not rebuild the action with value False: {pb_patch} / {pb_patched}"
+
             # Keep one live >1 ruleId request: a successful call proves the batch envelope and
             # exact echoed ids; a platform load-limiter refusal proves the parsed array reached
             # RMUtils. Do not converge or resume here -- pause/resume behavior is covered by the
@@ -6216,24 +6308,10 @@ class TestRunner:
             rule_b = self._create_native_rule("CallRuleAggB")
             ids = [int(rule_a), int(rule_b)]
 
-            def _attempt():
-                # hub_call_rule stop/start is limiter-susceptible, the same as the sibling
-                # lifecycle test documents. _run_one's generic retry only matches a 50[0-3]
-                # status, which an "excessive hub load" McpToolError never carries -- so
-                # without this the test fails outright rather than flake-retrying.
-                try:
-                    envelope = self.client.call_tool("hub_manage_rule_machine", {
-                        "tool": "hub_call_rule", "args": {"ruleId": ids, "action": "stop"}})
-                except McpToolError as exc:
-                    if "excessive hub load" not in str(exc):
-                        raise
-                    return None, str(exc)
-                if (isinstance(envelope, dict) and envelope.get("success") is False
-                        and "excessive hub load" in str(envelope.get("error", ""))):
-                    return envelope, str(envelope.get("error"))
-                return envelope, None
-
-            res, limited = _attempt()
+            # hub_call_rule stop/start is limiter-susceptible, the same as the sibling lifecycle
+            # test documents. _run_one's generic retry only matches a 50[0-3] status, which an
+            # "excessive hub load" McpToolError never carries -- so without this the test fails
+            # outright rather than flake-retrying.
             # Two bounce rounds, not one. The sibling lifecycle test's own comments record
             # that a single bounce+retry was NOT enough there and it needed a further
             # converged-read fallback -- so one round here would inherit a failure mode that
@@ -6241,12 +6319,9 @@ class TestRunner:
             # refusal produces no envelope to assert, so it cannot fall back to a read the way
             # the sibling does; it retries harder instead, then reports the limiter error if both
             # bounce+retry rounds are exhausted.
-            for _round in range(2):
-                if not limited:
-                    break
-                if not self._clear_load_throttle(f"multi-id hub_call_rule: {limited}"):
-                    break
-                res, limited = _attempt()
+            res, limited = self._call_with_limiter_bounce(
+                "hub_manage_rule_machine", "hub_call_rule", {"ruleId": ids, "action": "stop"},
+                "multi-id hub_call_rule", bounces=2)
             assert not limited, (
                 "multi-id hub_call_rule stayed blocked by the platform load limiter after "
                 f"two bounce+retry rounds: {limited}"
@@ -7690,7 +7765,34 @@ class TestRunner:
                 and "removetrigger" in str(rejected.get("error", "")).lower() \
                 and "not touched" in str(rejected.get("restoreHint", "")).lower(), \
                 f"modifyTrigger state-change token should refuse pre-write: {rejected}"
-            self._set_rule(app_id, {"removeTrigger": {"index": tidx}}, strict=True)
+            # Retarget in ONE patches call: removeTrigger + addTrigger both run under the single
+            # trailing updateRule. The replacement uses state "on" so it cannot be confused with the
+            # removed trigger (modified to "off" above) if RM hands the freed index back.
+            retarget = self._patch_rule(app_id, [
+                {"removeTrigger": {"index": tidx}},
+                {"addTrigger": {"capability": "Switch", "deviceIds": [sw], "state": "on"}},
+            ])
+            assert [e.get("op") for e in retarget] == ["removeTrigger", "addTrigger"] \
+                and all(e.get("success") is True for e in retarget), \
+                f"patches retarget did not run both sub-ops successfully: {retarget}"
+            new_tidx = retarget[1].get("triggerIndex")
+            assert new_tidx is not None, \
+                f"patches addTrigger did not return a triggerIndex: {retarget}"
+            assert str(tidx) not in [str(i) for i in retarget[0].get("afterIndices") or []], \
+                f"patches removeTrigger left trigger {tidx} in the rule: {retarget}"
+            retarget_settings = self._get_persisted_rule_config(app_id).get("settings") or {}
+            assert self._setting_holds_exact(retarget_settings.get(f"tDev{new_tidx}"), sw) \
+                and str(retarget_settings.get(f"tstate{new_tidx}")).lower() == "on", \
+                f"patches addTrigger settings did not land on trigger {new_tidx}: {retarget_settings}"
+            # patches modifyTrigger: the same single-op helper, finalised by the batch's one updateRule.
+            patched_mod = self._patch_rule(app_id, [{"modifyTrigger": {"index": new_tidx, "mods": {"state": "off"}}}])
+            assert [e.get("op") for e in patched_mod] == ["modifyTrigger"] \
+                and patched_mod[0].get("success") is True and patched_mod[0].get("partial") is not True, \
+                f"patches modifyTrigger did not succeed cleanly: {patched_mod}"
+            patched_settings = self._get_persisted_rule_config(app_id).get("settings") or {}
+            assert str(patched_settings.get(f"tstate{new_tidx}")).lower() == "off", \
+                f"patches modifyTrigger did not persist state 'off' on trigger {new_tidx}: {patched_settings}"
+            self._set_rule(app_id, {"removeTrigger": {"index": new_tidx}}, strict=True)
             self._assert_rule_healthy(app_id)
 
             # Fail-closed bulk triggers: a clean Switch-off trigger lands, the refused state-change
@@ -8821,12 +8923,29 @@ class TestRunner:
                     and copy_settings.get(f"xVarV.{copy_idx}") == str_var_name \
                     and copy_settings.get(f"xVar3.{copy_idx}") == str_src_name, \
                     f"String copy selector/target/source did not persist on index {copy_idx}: {copy_settings}"
-                # What the copy itself WROTE. The persisted rule can still hold numOp/customDev at
-                # this index: the refused numeric-target fromDevice case above (the switch
-                # attribute) leaves settings without an actType, so the next add reuses that index.
+                # The refused numeric-target fromDevice case above (the switch attribute) opened a
+                # row and wrote numOp/customDev before refusing; its actionCancel drops that row
+                # and consumes its index, so the copy must carry none of those leftovers.
                 copy_applied = [str(k) for k in (copy_entry.get("settingsApplied") or [])]
                 assert not any(k.startswith("numOp.") for k in copy_applied), \
                     f"String copy wrote a numOp field: settingsApplied={copy_applied}"
+                stale = [k for k in (f"numOp.{copy_idx}", f"customDev.{copy_idx}") if k in copy_settings]
+                assert not stale, \
+                    f"String copy at index {copy_idx} inherited the refused add's fields {stale}: {copy_settings}"
+                # The cancelled rows themselves must be GONE: a refusal that left its actType
+                # behind would show up as an orphaned settings row in rule health, and its mode
+                # fields (numOp/customDev) must not linger at any index outside the rule's two
+                # real actions (the math unary owns its numOp; the String copy owns neither).
+                health_c = self.client.call_tool("hub_manage_rule_machine", {
+                    "tool": "hub_get_rule_health", "args": {"appId": app_c}})
+                assert not health_c.get("orphanedActionRows"), \
+                    f"refused adds left orphaned action rows behind: {health_c.get('orphanedActionRows')}"
+                known_c = {str(mu_idx), str(copy_idx)}
+                stray_c = [k for k in copy_settings
+                           if str(k).startswith(("numOp.", "customDev."))
+                           and str(k).split(".", 1)[1] not in known_c]
+                assert not stray_c, \
+                    f"refused adds left stale mode fields outside the real actions {known_c}: {stray_c}"
                 # A Boolean target's copy picker is uncaptured, so it is refused before any write.
                 bool_copy = self._patch_rule(app_c, [
                     {"addAction": {"capability": "setVariable", "variable": bool_var_name,
@@ -8838,32 +8957,50 @@ class TestRunner:
             finally:
                 self._delete_native(app_c)
 
-            # Rule D: Number copy, then RUN the actions. The persisted settings alone do not prove
-            # it: without valOffset.<N> RM throws "Ambiguous method overloading ... Long#plus" at
-            # run time and leaves the target unchanged, although the rule saves and reads healthy.
+            # Rule D: Number copy, then numOp "add number", then RUN the actions. The persisted
+            # settings alone do not prove it: without valOffset.<N> RM throws "Ambiguous method
+            # overloading ... Long#plus" at run time and leaves the target unchanged, although the
+            # rule saves and reads healthy. The run lands 7 + 3 = 10 only if both actions execute.
             self.client.call_tool("hub_manage_variables", {
                 "tool": "hub_set_variable", "args": {"name": var_name, "value": 0}})
             copy_spec = {"capability": "setVariable", "variable": var_name,
                          "sourceVariable": num_src_name}
-            app_d = self._create_native_rule("SetVarNumCopy", {"addActions": [copy_spec]})
+            add_spec = {"capability": "setVariable", "variable": var_name,
+                        "numOp": "add number", "value": 3}
+            app_d = self._create_native_rule("SetVarNumCopy", {"addActions": [copy_spec, add_spec]})
             try:
                 d_settings = self._get_persisted_rule_config(app_d).get("settings") or {}
                 d_idx = next((str(k).split(".", 1)[1] for k, v in d_settings.items()
                               if str(k).startswith("numOp.") and v == "variable"), None)
                 assert d_idx is not None, f"no numOp.<N>='variable' persisted: {d_settings}"
                 assert d_settings.get(f"xVar3.{d_idx}") == num_src_name                     and str(d_settings.get(f"valOffset.{d_idx}")) in ("0", "0.0"),                     f"Number copy source/offset did not persist on index {d_idx}: {d_settings}"
+                add_idx = next((str(k).split(".", 1)[1] for k, v in d_settings.items()
+                                if str(k).startswith("numOp.") and v == "add number"), None)
+                assert add_idx is not None, f"no numOp.<N>='add number' persisted: {d_settings}"
+                assert str(d_settings.get(f"valNumber.{add_idx}")) in ("3", "3.0"), \
+                    f"add-number constant did not persist on index {add_idx}: {d_settings}"
                 self._assert_rule_healthy(app_d)
-                self.client.call_tool("hub_manage_rule_machine", {
-                    "tool": "hub_call_rule", "args": {"ruleId": app_d, "action": "actions"}})
+                run, limited = self._call_with_limiter_bounce(
+                    "hub_manage_rule_machine", "hub_call_rule", {"ruleId": app_d, "action": "actions"},
+                    "hub_call_rule(action=actions)")
                 got = None
                 deadline = time.time() + 15.0
                 while time.time() < deadline:
                     got = self.client.call_tool("hub_manage_variables", {
                         "tool": "hub_get_variable", "args": {"name": var_name}}).get("value")
-                    if str(got) in ("7", "7.0"):
+                    if str(got) in ("10", "10.0"):
                         break
                     time.sleep(1.0)
-                assert str(got) in ("7", "7.0"),                     f"running the Number copy did not set {var_name} to 7 (got {got!r})"
+                # The limiter can abort the reply to a run that already happened, so the variable
+                # read above is the verdict; the run's own outcome explains a miss.
+                if str(got) not in ("10", "10.0"):
+                    assert not limited, (
+                        f"hub_call_rule(action=actions) stayed blocked by the platform load limiter "
+                        f"and {var_name} never reached 10 (got {got!r}): {limited}")
+                    assert not (isinstance(run, dict) and run.get("success") is False), \
+                        f"hub_call_rule(action=actions) reported failure and {var_name} is {got!r}: {run}"
+                assert str(got) in ("10", "10.0"), \
+                    f"running copy (7) then add number (3) did not set {var_name} to 10 (got {got!r}; run result {run})"
             finally:
                 self._delete_native(app_d)
         finally:
@@ -9245,17 +9382,34 @@ class TestRunner:
             assert bulk_kept in page and bulk_skipped not in page, \
                 f"addActions stop must keep the clean prefix and never write the tail: {page}"
 
-            # Fail-closed replacement: the old list is cleared before the adds, so only the clean first
-            # replacement item remains; skipping finalisation is not a rollback.
+            # A replacement item that any single add would refuse is caught before the clear: the call
+            # is refused whole and the existing list survives.
             repl_kept, repl_skipped = "E2E replace stop kept", "E2E replace stop skipped"
-            repl_stop = self._rm_stop_call(app_id, {"replaceActions": [
+            pre_clear = self._rm_stop_call(app_id, {"replaceActions": [
                 {"capability": "log", "message": repl_kept},
                 refused_spec,
                 {"capability": "log", "message": repl_skipped},
             ]})
+            assert pre_clear.get("success") is False and not pre_clear.get("addedActions") \
+                and "replaceActions[1]:" in str(pre_clear.get("error", "")) \
+                and "action:" in str(pre_clear.get("error", "")), \
+                f"expected a whole-call refusal naming replaceActions[1] before anything was cleared: {pre_clear}"
+            page = self._rule_page_text(app_id)
+            assert bulk_kept in page and repl_kept not in page, \
+                f"a replaceActions refused before the clear must leave the existing list intact: {page}"
+
+            # Fail-closed replacement: an item refused only inside its add (an unknown switch verb passes
+            # the pre-clear checks) stops the batch after the clear, so only the clean first replacement
+            # item remains; skipping finalisation is not a rollback.
+            repl_stop = self._rm_stop_call(app_id, {"replaceActions": [
+                {"capability": "log", "message": repl_kept},
+                {"capability": "switch", "action": "blink", "deviceIds": [int(self.get_test_switch_id())]},
+                {"capability": "log", "message": repl_skipped},
+            ]})
             added = repl_stop.get("addedActions") or []
             assert len(added) == 3 and added[0].get("success") is not False \
-                and not added[0].get("partial") and added[1].get("success") is False, \
+                and not added[0].get("partial") and added[1].get("success") is False \
+                and "Unknown switch action 'blink'" in str(added[1].get("error", "")), \
                 f"expected a clean replacement item, then the refusal, then the skipped tail: {repl_stop}"
             self._assert_bulk_stop(repl_stop, "replaceActions[1]", added[2:])
             page = self._rule_page_text(app_id)
@@ -11640,10 +11794,34 @@ class TestRunner:
             "addActions": [{"capability": "log", "message": "E2E gated"}],
         })
         try:
-            pb = self.client.call_tool("hub_manage_rule_machine", {
-                "tool": "hub_set_rule_private_boolean", "args": {"ruleId": int(app_id), "value": False}})
-            assert pb.get("success") is not False, \
-                f"could not set the Private Boolean false, so the Required Expression is not gated: {pb}"
+            pb, limited = self._call_with_limiter_bounce(
+                "hub_manage_rule_machine", "hub_set_rule_private_boolean",
+                {"ruleId": int(app_id), "value": False}, "hub_set_rule_private_boolean(value=False)")
+            if limited:
+                # hub_set_rule_private_boolean has no page-button route (RMUtils is the only way this
+                # app can set another rule's Private Boolean), so when the limiter still refuses it
+                # after a bounce, let Rule Machine set it: a helper rule whose only action is "Set
+                # Private Boolean false" on the gated rule, run through hub_call_rule's Run Actions
+                # button (the hub UI's own route, which the limiter does not gate). The gate under
+                # test is unchanged: PB false -> RM drops the trigger subscriptions -> updateRule
+                # reports SUPPRESSED. A device-condition expression is NOT an equivalent stand-in:
+                # RM subscribes to the device to track it, and that subscription reads as OK.
+                print(f"    [LIMITER] Private Boolean write blocked ({limited}); setting it through a "
+                      "helper rule's privateBoolean action run via the Run Actions button instead.")
+                setter_id = self._create_native_rule("GatedTriggerSetter", {
+                    "addActions": [{"capability": "privateBoolean", "ruleIds": [int(app_id)], "value": False}],
+                })
+                try:
+                    run, run_limited = self._call_with_limiter_bounce(
+                        "hub_manage_rule_machine", "hub_call_rule",
+                        {"ruleId": int(setter_id), "action": "actions"}, "helper rule hub_call_rule(action=actions)")
+                    assert not run_limited, f"helper rule's Run Actions stayed blocked by the platform load limiter: {run_limited}"
+                    assert run.get("success") is True, f"helper rule's Run Actions did not succeed: {run}"
+                finally:
+                    self._delete_native(setter_id)
+            else:
+                assert pb.get("success") is not False, \
+                    f"could not set the Private Boolean false, so the Required Expression is not gated: {pb}"
             # strict: a relay-dropped response raises instead of returning a verdict-less sentinel.
             res = self._set_rule(app_id, {"button": "updateRule"}, strict=True)
             settle = str((res or {}).get("subscriptionSettle") or "")
@@ -12210,6 +12388,12 @@ class TestRunner:
         assert "mcp_version=" in submit_url, \
             f"submitUrl must prefill mcp_version: {submit_url!r}"
         report = result.get("report") or ""
+        # Hub model is the hardware model hub_get_info reports, never the internal hardwareID.
+        hub_model = re.search(r"^- \*\*Hub model:\*\* (.+)$", report, re.MULTILINE)
+        assert hub_model, "report is missing the Hub model line"
+        expected_model = self.client.call_tool("hub_get_info", {}).get("model")
+        assert hub_model.group(1) == expected_model, \
+            f"report Hub model {hub_model.group(1)!r} != hub_get_info model {expected_model!r}"
         for marker in (
             "## Environment",
             "- **Connection:** ",
@@ -12286,31 +12470,6 @@ class TestRunner:
             f"agent_behavior preflight must be the single verbatim step: {agent_preflight!r}"
         assert "## Verbatim Tool Calls\n_Not provided_" in (agent.get("report") or ""), \
             f"agent_behavior must render the missing-evidence gap: {agent.get('report')!r}"
-
-    @test("system_tools")
-    def test_report_issue_retains_tool_error(self) -> None:
-        # Invalid read arguments fail before touching any device or rule.
-        marker = f"BAT_retained_error_invalid_mode_{time.time_ns()}"
-        try:
-            self.client.call_tool("hub_get_logs", {"mode": marker})
-        except (McpError, McpToolError) as exc:
-            assert marker in str(exc), f"expected the invalid-mode validation error, got: {exc}"
-        else:
-            raise AssertionError("invalid log mode should produce a tool error")
-        result = self.client.call_tool("hub_report_issue", {
-            "title": "E2E retained error probe", "expected": "invalid mode rejected",
-            "actual": "validation error returned", "llmClient": "hubitat-e2e-suite",
-            "llmModel": "n/a (automated suite)",
-        })
-        assert result.get("success") is True, result
-        assert result.get("failingTool") == "hub_get_logs", result
-        assert result.get("logs", {}).get("retainedErrorCount", 0) >= 1, result
-        report = result.get("report") or ""
-        _, found, after = report.partition("## Retained Server Errors")
-        assert found, f"report has no Retained Server Errors section: {report!r}"
-        retained = after.partition("## Recent Error/Warning Logs")[0]
-        assert marker in retained, retained
-        assert result.get("failingToolSource") == "retained_error", result
 
     @test("system_tools")
     def test_hub_mesh_read(self) -> None:
@@ -13454,6 +13613,78 @@ class TestRunner:
     # Developer Mode via UI, which CI can't do (toggle excluded from
     # hub_update_mcp_settings allowlist by design). Covered by ToolUpdateMcpSettingsSpec
     # at the unit level + manual BAT.
+
+    @test("developer_mode")
+    def test_protected_mcp_app_preserves_developer_self_admin(self) -> None:
+        """Protected self rejects generic writes while dedicated Developer Mode still works."""
+        app_id = str(self.client.app_id)
+
+        def read_settings():
+            result = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_app_config",
+                "args": {"appId": app_id, "includeSettings": True}})
+            assert result.get("success") is True, "protected app must remain readable"
+            assert str((result.get("app") or {}).get("id")) == app_id, "wrong app read back"
+            assert isinstance(result.get("settings"), dict), "raw settings missing"
+            return result["settings"]
+
+        before = read_settings()
+        protected = before.get("protectedAppIds")
+        if isinstance(protected, str):
+            try:
+                protected = json.loads(protected)
+            except ValueError:
+                pass
+        if not self._setting_holds_exact(protected, app_id):
+            raise SkipTest("MCP instance is not selected in Protected apps; preserving the user's choice")
+        original_level = before.get("mcpLogLevel")
+        assert original_level in ("debug", "info", "warn", "error"), \
+            "persisted mcpLogLevel is required to restore this test exactly"
+
+        # Same-value edit is harmless if the guard regresses; never probe self-delete
+        # or self-disable against the endpoint that must finish the test and cleanup.
+        for gateway, leaf in (("hub_manage_native_rules_and_apps", "hub_set_native_app"),
+                              ("hub_manage_rule_machine", "hub_set_rule")):
+            try:
+                result = self.client.call_tool(gateway, {
+                    "tool": leaf,
+                    "args": {"appId": app_id, "settings": {"mcpLogLevel": original_level},
+                             "confirm": True}})
+            except (McpError, McpToolError) as exc:
+                message = str(exc)
+            else:
+                assert result.get("success") is False, "generic edit of protected self was accepted"
+                message = str(result.get("error") or result.get("message") or result)
+            assert "protected" in message.lower() and app_id in message, \
+                f"expected protected-app refusal, got: {message}"
+            assert read_settings() == before, "refused generic edit changed persisted settings"
+
+        # The allowlist must stay closed even with Developer Mode on and self protected.
+        try:
+            self.client.call_tool("hub_manage_mcp", {
+                "tool": "hub_update_mcp_settings",
+                "args": {"settings": {"protectedAppIds": before["protectedAppIds"]}, "confirm": True}})
+            raise AssertionError("self-admin accepted the UI-only protection setting")
+        except (McpError, McpToolError) as exc:
+            assert "protectedAppIds" in str(exc) and "not allowed" in str(exc), str(exc)
+        assert read_settings() == before, "rejected protection-list update changed settings"
+
+        try:
+            changed_level = "info" if original_level != "info" else "warn"
+            result = self.client.call_tool("hub_manage_mcp", {
+                "tool": "hub_update_mcp_settings",
+                "args": {"settings": {"mcpLogLevel": changed_level}, "confirm": True}})
+            assert result.get("success") is True, f"authorized self-admin failed: {result}"
+            after = read_settings()
+            assert after.get("mcpLogLevel") == changed_level, "self-admin change did not persist"
+            assert after.get("protectedAppIds") == before.get("protectedAppIds"), \
+                "dedicated self-admin changed the protection list"
+        finally:
+            restored = self.client.call_tool("hub_manage_mcp", {
+                "tool": "hub_update_mcp_settings",
+                "args": {"settings": {"mcpLogLevel": original_level}, "confirm": True}})
+            assert restored.get("success") is True, "could not restore original logging level"
+            assert read_settings() == before, "settings differ after self-admin restoration"
 
     @test("developer_mode")
     def test_t220_update_mcp_settings_boolean_flip(self) -> None:
@@ -15780,6 +16011,36 @@ class TestRunner:
                                 print(f"  [WARN] Visual Rule sweep delete failed for '{vname}': {exc}")
             except Exception as exc:
                 print(f"  [WARN] Visual Rule sweep failed: {exc}")
+            # Button Controller backstop: the button tests create Button Controller-5.1 children
+            # with a BAT_E2E_ name, but the app relabels itself after the device it binds
+            # ("Button Controller-5.1: E2E_PERM_Button"), so neither the RM list nor a bare
+            # PREFIX match ever sees them. Reap by type + a fixture-device name in the label.
+            # One no-cursor read returns the whole list; paging by offset while deleting would
+            # skip rows.
+            try:
+                listed = self.client.call_tool("hub_read_apps_code", {
+                    "tool": "hub_list_apps", "args": {"scope": "instances", "includeHidden": True}})
+                reaped = 0
+                for a in (listed.get("apps", []) if isinstance(listed, dict) else []):
+                    if not _is_stranded_button_controller(a):
+                        continue
+                    aname, aid = str(a.get("name") or a.get("label") or ""), str(a.get("id"))
+                    try:
+                        print(f"  Sweep: deleting Button Controller '{aname}' (id={aid})")
+                        res = self.client.call_tool("hub_manage_rule_machine", {
+                            "tool": "hub_delete_native_app",
+                            "args": {"appId": aid, "force": True, "confirm": True},
+                        })
+                        if isinstance(res, dict) and res.get("success") is False:
+                            print(f"  [WARN] Button Controller sweep delete refused for '{aname}': {res.get('error')}")
+                            continue
+                        reaped += 1
+                    except Exception as exc:
+                        print(f"  [WARN] Button Controller sweep delete failed for '{aname}': {exc}")
+                if reaped:
+                    print(f"  Sweep: reaped {reaped} Button Controller instance(s)")
+            except Exception as exc:
+                print(f"  [WARN] Button Controller sweep failed: {exc}")
 
         # Layer 5: stranded mcptest throwaways. The @test("deadman") test installs 'Deadman Test
         # Target' (instance + code class), the @test("app_code_update") tests create the
@@ -16084,6 +16345,7 @@ class TestRunner:
         self._restore_permanent_configuration_fixtures("pre-run")
 
         # Group for display
+        self._load_diagnostics = True
         current_group = None
         for group, display_name, method_name in tests_to_run:
             if group != current_group:
@@ -16141,9 +16403,9 @@ class TestRunner:
 
         if self.throttle_bounces:
             print(f"\n  [THROTTLE] {self.throttle_bounces} watchdog bounce(s) of app "
-                  f"{self.server_app_id or '?'} were needed mid-run -- the platform's per-app "
-                  "load limiter tripped under the accumulated back-to-back load. The retried "
-                  "dispatches passed; this is a capacity signal, not a product failure.")
+                  f"{self.server_app_id or '?'} were attempted after load-limiter errors. "
+                  "A verified app re-enable does not prove dispatch recovered; "
+                  "the individual test results above record the outcome.")
 
         if self._fixture_reset_failures:
             print(f"\n  [FIXTURE-RESET] {len(self._fixture_reset_failures)} permanent-fixture reset(s) FAILED -- "

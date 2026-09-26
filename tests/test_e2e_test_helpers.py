@@ -659,6 +659,95 @@ def test_print_summary_requires_tests_and_fixture_resets_to_succeed(
     assert ("[FIXTURE-RESET]" in output) is bool(reset_failures)
 
 
+@pytest.mark.parametrize("outcome", ["pass", "fail", "skip", "retry"])
+@pytest.mark.parametrize("pace", [0, 0.5])
+def test_run_one_paces_once_after_terminal_result(monkeypatch, outcome, pace):
+    runner = object.__new__(et.TestRunner)
+    runner.client = SimpleNamespace(_last_op=None)
+    runner.results = []
+    runner._soft_passes = []
+    runner.pace_seconds = pace
+    sleeps = []
+    monkeypatch.setattr(et.time, "sleep", sleeps.append)
+    runner._settle_before_504_retry = lambda name: None
+    attempts = []
+
+    def probe():
+        attempts.append(1)
+        if outcome == "fail":
+            raise AssertionError("value did not change")
+        if outcome == "skip":
+            raise et.SkipTest("fixture unavailable")
+        if outcome == "retry" and len(attempts) == 1:
+            raise et.RelayLostResponseError("504 Gateway Timeout")
+
+    runner.probe = probe
+    runner._run_one("isolated", "probe", "probe")
+    assert sleeps == ([pace] if pace else [])
+    assert len(attempts) == (2 if outcome == "retry" else 1)
+    assert len(runner.results) == 1
+    assert runner.results[0]["status"] == {"retry": "pass"}.get(outcome, outcome)
+
+
+def test_assertion_failure_is_not_attributed_to_successful_cleanup():
+    runner = object.__new__(et.TestRunner)
+    runner.client = SimpleNamespace(_last_op=("hub_delete_variable", 3.6, True))
+    assert runner._last_op_str(AssertionError("copy stayed at zero")) == "assertion"
+
+
+def test_limiter_summary_does_not_claim_retried_dispatches_passed(capsys):
+    runner = object.__new__(et.TestRunner)
+    runner.results = [{"group": "native_apps", "name": "blocked", "status": "fail",
+                       "message": "dispatch remained blocked", "duration": 0.1}]
+    runner.client = SimpleNamespace(op_timings=[], continuation_timings=[])
+    runner.throttle_bounces = 6
+    runner.server_app_id = "38"
+    runner._fixture_reset_failures = []
+    runner._soft_passes = []
+    assert runner._print_summary() is False
+    output = capsys.readouterr().out
+    assert "retried dispatches passed" not in output
+    assert "6 watchdog bounce(s)" in output
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_load_snapshot_is_read_only_redacted_and_preserves_failed_operation(capsys, unavailable):
+    calls = []
+    failed_op = ("hub_call_rule", 1.2, False)
+    runner = object.__new__(et.TestRunner)
+    runner.server_app_id = "38"
+
+    def call_tool(name, arguments=None):
+        calls.append(name)
+        runner.client._last_op = (name, 0.1, True)
+        if unavailable:
+            raise et.McpToolError(name, "sensitive response detail")
+        if name == "hub_read_diagnostics":
+            assert arguments["tool"] == "hub_get_performance_stats"
+            return {"uptime": 42, "appStats": [
+                {"id": i, "totalMs": 100 - i, "name": "private app name"} for i in range(6)
+            ] + [{"id": 38, "totalMs": 5}]}
+        assert name == "hub_get_hub_mesh"
+        return {"hubMeshEnabled": True, "hubMeshToken": "secret token",
+                "peers": [{"token": "peer secret"}], "sharedDevices": []}
+
+    runner.client = SimpleNamespace(call_tool=call_tool, _last_op=failed_op,
+                                    op_timings=[("hub_call_rule", 1.2, "native_apps/example", False)])
+    runner._record_load_snapshot("before fixture edits", include_mesh=True)
+    assert runner.client._last_op is failed_op
+    output = capsys.readouterr().out
+    assert "secret" not in output and "private app name" not in output and "sensitive" not in output
+    snapshot = json.loads(output.split("LOAD_SNAPSHOT ", 1)[1])
+    if unavailable:
+        assert snapshot["diagnosticError"] == "McpToolError"
+        assert calls == ["hub_read_diagnostics"]
+    else:
+        assert [row["id"] for row in snapshot["apps"]] == [0, 1, 2, 3, 4, 38]
+        assert snapshot["mesh"]["enabled"] is True
+        assert snapshot["mesh"]["peersCount"] == 1
+        assert calls == ["hub_read_diagnostics", "hub_get_hub_mesh"]
+
+
 def test_limiter_lines_falls_back_to_watchdog_and_filters_exact_device_method(monkeypatch):
     target = (
         "dev|5781|BAT_E2E_CmdRoundtrip|error|"
@@ -728,6 +817,193 @@ def test_limiter_logged_uses_watchdog_for_unusable_main_reads_and_requires_fresh
 
     assert baseline == {f"stale|{stale}"}
     assert runner._limiter_logged(5781, method="on", baseline=baseline) is True
+
+
+_LIMITED = "RMUtils.sendAction failed: App 38 generates excessive hub load"
+
+
+@pytest.mark.parametrize(
+    "replies, bounces, bounce_ok, expected_calls, expected_bounces, expect_limited",
+    [
+        pytest.param([{"success": True}], 1, True, 1, 0, False, id="clean-call-never-bounces"),
+        pytest.param([{"success": False, "error": _LIMITED}, {"success": True}], 1, True, 2, 1, False,
+                     id="envelope-trip-bounces-and-retries"),
+        pytest.param([et.McpToolError("hub_manage_rule_machine", _LIMITED), {"success": True}], 1, True, 2, 1, False,
+                     id="raised-trip-bounces-and-retries"),
+        pytest.param([{"success": False, "error": _LIMITED}] * 3, 2, True, 3, 2, True,
+                     id="sticky-limiter-exhausts-bounce-rounds"),
+        pytest.param([{"success": False, "error": _LIMITED}], 1, False, 1, 1, True,
+                     id="failed-bounce-does-not-retry"),
+        pytest.param([{"success": False, "error": "no such rule"}], 1, True, 1, 0, False,
+                     id="other-failure-is-returned-not-bounced"),
+    ],
+)
+def test_call_with_limiter_bounce_retries_only_limiter_trips(
+    replies, bounces, bounce_ok, expected_calls, expected_bounces, expect_limited,
+):
+    calls, bounced = [], []
+    replies = iter(replies)
+
+    class Client:
+        def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    runner = object.__new__(et.TestRunner)
+    runner.client = Client()
+    runner._clear_load_throttle = lambda reason: bounced.append(reason) or bounce_ok
+
+    res, limited = runner._call_with_limiter_bounce(
+        "hub_manage_rule_machine", "hub_call_rule", {"ruleId": 7, "action": "actions"},
+        "probe", bounces=bounces)
+
+    assert calls == [("hub_manage_rule_machine",
+                      {"tool": "hub_call_rule", "args": {"ruleId": 7, "action": "actions"}})] * expected_calls
+    assert len(bounced) == expected_bounces
+    assert all(reason.startswith("probe: ") for reason in bounced)
+    assert (limited is not None) is expect_limited
+    if not expect_limited:
+        assert limited is None and isinstance(res, dict)
+
+
+def test_call_with_limiter_bounce_propagates_non_limiter_errors():
+    class Client:
+        def call_tool(self, name, arguments):
+            raise et.McpToolError("hub_manage_rule_machine", "rule 7 not found")
+
+    runner = object.__new__(et.TestRunner)
+    runner.client = Client()
+    runner._clear_load_throttle = lambda reason: pytest.fail("a non-limiter error must not bounce")
+
+    with pytest.raises(et.McpToolError, match="not found"):
+        runner._call_with_limiter_bounce("hub_manage_rule_machine", "hub_call_rule", {}, "probe")
+
+
+def _logs_body(payload):
+    return {"resultType": "complete", "content": [{"text": json.dumps(payload)}]}
+
+
+def test_capture_504_context_names_the_failed_call_and_anchors_the_window(capsys):
+    """Label and window come from the exception's failed op and the failure time, not _last_op or now."""
+    sent = []
+
+    class Client:
+        _last_op = ("hub_get_visual_rule", 0.8, True)
+
+        def _send(self, method, params, headers=None):
+            sent.append(params)
+            if params["arguments"]["args"]["mode"] == "hub":
+                return _logs_body({"logs": [{"name": "2026-09-26 06:07:01.100", "level": "WARN",
+                                             "message": "app|38|MCP|[hubrt] slow GET"}]})
+            return _logs_body({"entries": [{"timestamp": 1790402821000, "level": "debug",
+                                            "component": "mrtr", "message": "slice scheduled"}]})
+
+    runner = object.__new__(et.TestRunner)
+    runner.client = Client()
+    runner.server_app_id = "38"
+    exc = et.McpError("504 Gateway Timeout on tools/call")
+    exc._mcp_failed_op = ("hub_set_visual_rule", 10.3, False)
+    failed_at = et.datetime(2026, 9, 26, 13, 5, 40, tzinfo=et.UTC)
+
+    runner._capture_504_context("test_visual_rule_editor_form_lifecycle", exc, failed_at)
+
+    out = capsys.readouterr().out
+    assert [p["arguments"]["args"]["mode"] for p in sent] == ["hub", "mcp"]
+    assert sent[0]["arguments"]["args"]["appId"] == 38
+    assert sent[0]["arguments"]["args"]["since"] == "2026-09-26T13:03:29Z"   # failed_at - (10.3s + 120s)
+    assert "failed op hub_set_visual_rule 10.3s [err]" in out
+    assert "hub_get_visual_rule" not in out
+    assert "[hubrt] slow GET" in out and "slice scheduled" in out
+    assert runner.client._last_op == ("hub_get_visual_rule", 0.8, True)
+
+
+@pytest.mark.parametrize("main_reply", [
+    pytest.param("raise", id="main-read-504"),
+    pytest.param(_logs_body({"status": "in_progress", "retryable": True}), id="snapshot-still-loading"),
+    pytest.param(_logs_body({"logs": [], "error": "Unexpected log format from hub"}), id="error-body"),
+    pytest.param({"resultType": "input_required", "requestState": "x"}, id="continuation-not-followed"),
+    pytest.param({"isError": True, "content": [{"text": "{}"}]}, id="is-error"),
+])
+def test_capture_504_context_falls_back_to_the_watchdog_when_the_main_read_is_unusable(capsys, monkeypatch, main_reply):
+    """A failed, still-loading or errored main read must fall back, never print as '0 entries'."""
+
+    class Client:
+        _last_op = None
+
+        def _send(self, method, params, headers=None):
+            if params["arguments"]["args"]["mode"] == "hub":
+                if main_reply == "raise":
+                    raise et.RelayLostResponseError("504 Gateway Timeout on tools/call")
+                return main_reply
+            return _logs_body({"entries": []})
+
+    runner = object.__new__(et.TestRunner)
+    runner.client = Client()
+    runner.server_app_id = "38"
+    runner.watchdog_url = "https://watchdog.invalid/mcp"
+    monkeypatch.setattr(et.requests, "post", lambda *a, **k: _watchdog_response([
+        {"name": "2026-09-26 06:07:01.100", "level": "warn", "message": "app|38|MCP Rule Server|slow slice"},
+        {"name": "2026-09-26 06:07:01.200", "level": "info", "message": "app|5993|Watchdog|unrelated"},
+    ]))
+
+    runner._capture_504_context("probe")
+
+    out = capsys.readouterr().out
+    assert "hub log via watchdog" in out
+    assert "slow slice" in out and "unrelated" not in out
+    assert "hub log since" not in out
+
+
+def test_capture_504_context_reports_both_hub_log_sources_unreadable(capsys, monkeypatch):
+    class Client:
+        _last_op = None
+
+        def _send(self, method, params, headers=None):
+            raise et.RelayLostResponseError("504 Gateway Timeout on tools/call")
+
+    runner = object.__new__(et.TestRunner)
+    runner.client = Client()
+    runner.server_app_id = "38"
+    runner.watchdog_url = ""
+
+    runner._capture_504_context("probe")
+
+    out = capsys.readouterr().out
+    assert "hub log unreadable (main:" in out and "watchdog:" in out
+    assert "mcp log read failed" in out
+
+
+def test_capture_504_context_without_app_id_says_so(capsys):
+    runner = object.__new__(et.TestRunner)
+    runner.client = SimpleNamespace(_last_op=None, _send=lambda *a, **k: pytest.fail("must not read logs without an app id"))
+    runner.server_app_id = ""
+
+    runner._capture_504_context("probe")
+
+    assert "HUBITAT_APP_ID not set" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("app, stranded", [
+    pytest.param({"id": 46736, "type": "Button Controller-5.1", "parentId": 7242,
+                  "name": "Button Controller-5.1: E2E_PERM_Button"}, True, id="relabelled-after-perm-button"),
+    pytest.param({"id": 46737, "type": "Button Controller-5.1", "parentId": 7242,
+                  "name": "Button Controller-5.1: BAT_E2E_WalkBtnDev"}, True, id="relabelled-after-bat-device"),
+    pytest.param({"id": 7242, "type": "Button Controllers", "parentId": None,
+                  "name": "Button Controllers"}, False, id="parent-app"),
+    pytest.param({"id": 50, "type": "Button Controller-5.1", "parentId": None,
+                  "name": "Button Controller-5.1: E2E_PERM_Button"}, False, id="no-parent"),
+    pytest.param({"id": 17765, "type": "Button Controller-5.1", "parentId": 7242,
+                  "name": "Button Controller-5.1"}, False, id="unlabelled"),
+    pytest.param({"id": 60, "type": "Button Controller-5.1", "parentId": 7242,
+                  "name": "Button Controller-5.1: Kitchen Pico"}, False, id="real-device"),
+    pytest.param({"id": 61, "type": "Rule-5.1", "parentId": 216,
+                  "name": "BAT_E2E_Rule"}, False, id="other-type"),
+])
+def test_is_stranded_button_controller(app, stranded):
+    assert et._is_stranded_button_controller(app) is stranded
 
 
 def test_run_artifact_suffix_is_stable_and_unique_per_github_attempt():
@@ -1450,6 +1726,37 @@ def test_failure_diagnostic_retains_transport_operation_after_successful_cleanup
     assert client._last_op[0] == "hub_delete_file"
     assert runner._last_op_str(caught.value).startswith("hub_get_source ")
     assert runner._last_op_str(caught.value).endswith(" [err]")
+
+
+@pytest.mark.parametrize("is_error", [True, False])
+def test_tool_failure_telemetry_survives_successful_cleanup(is_error):
+    client = et.HubitatMcpClient("http://hub.invalid", "1", "unused")
+
+    def send(method, params=None, **_kwargs):
+        if params["name"] == "hub_call_rule":
+            return {**_raw_tool_body({"success": False, "error": "excessive hub load"}),
+                    "isError": is_error}
+        return _raw_tool_body({"success": True})
+
+    client._send = send
+    caught = None
+    try:
+        result = client.call_tool("hub_call_rule", {"ruleId": [42], "action": "run"}, flat=True)
+        assert not is_error and result["success"] is False
+    except et.McpToolError as exc:
+        assert is_error
+        caught = exc
+    finally:
+        client.call_tool("hub_delete_variable", {"name": "owned"}, flat=True)
+
+    assert client.op_timings[0][0] == "hub_call_rule"
+    assert client.op_timings[0][3] is False
+    assert client.op_timings[1][3] is True
+    if is_error:
+        runner = object.__new__(et.TestRunner)
+        runner.client = client
+        assert runner._last_op_str(caught).startswith("hub_call_rule ")
+        assert runner._last_op_str(caught).endswith(" [err]")
 
 
 def test_call_tool_paces_ten_same_state_contention_rounds_and_still_completes(monkeypatch):
