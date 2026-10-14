@@ -34268,13 +34268,13 @@ def handleToolsCallLegacy(msg) {
         return _renderToolResult(msg.id, toolName, reactiveToolName, args, result,
             result instanceof Map && result.isError == true)
     } catch (IllegalArgumentException e) {
-        if (audit != null && outcome == null) outcome = [outcome: "failed", error: e.message ?: "validation error"]
+        if (audit != null && outcome == null) outcome = [outcome: "failed", error: "validation refused the call"]
         mcpLog("error", "server", "Validation error in ${reactiveToolName}: ${e.message}", null, [
             details: _toolLogDetails(reactiveToolName, toolName, args, [error: e.message])
         ])
         return _renderValidationError(msg.id, toolName, reactiveToolName, args, e.message)
     } catch (Exception e) {
-        if (audit != null && outcome == null) outcome = [outcome: "failed", error: e.message ?: e.class.simpleName]
+        if (audit != null && outcome == null) outcome = [outcome: "failed", error: "tool threw ${e.class.simpleName}".toString()]
         mcpLog("error", "server", "Tool execution error in ${reactiveToolName}: ${e.message}", null, [
             details: _toolLogDetails(reactiveToolName, toolName, args, [error: e.message]),
             stackTrace: _exceptionStack(e)
