@@ -34054,11 +34054,13 @@ def serverCapabilities() {
     ]
 }
 def handleServerDiscover(msg) {
+    String headerVersion = _requestHeader("MCP-Protocol-Version")
+    boolean modern = headerVersion == null || _modernEraVersion(headerVersion)
     return jsonRpcResult(msg.id, [
         supportedVersions: supportedProtocolVersions(),
         capabilities: serverCapabilities(),
         serverInfo: serverIdentity(),
-        instructions: serverInstructions(true),
+        instructions: serverInstructions(modern),
         ttlMs: cacheHintTtlMs(),
         cacheScope: "private",
         resultType: "complete"
