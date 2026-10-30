@@ -411,4 +411,91 @@ class HandleGatewaySpec extends ToolSpecBase {
         ex.message.contains('room')
         !ex.message.contains('sentinel_param')
     }
+
+    // -------- strict arguments: additionalProperties:false, enforced centrally in executeTool --------
+
+    def "the catalog index records the property names of every tool that declares additionalProperties false"() {
+        when:
+        Map strict = script._toolCatalogIndexes().strict
+
+        then:
+        ['hub_update_app', 'hub_update_driver', 'hub_update_library', 'hub_set_rule', 'hub_set_native_app'].every { strict.containsKey(it) }
+        strict.hub_update_library.containsAll(['libraryId', 'source', 'expectedVersion', 'confirm'])
+        strict.keySet() == script.getAllToolDefinitions().findAll { it.inputSchema?.additionalProperties == false }*.name as Set
+    }
+
+    def "_rejectUnknownArgs names the unknown keys, lists the valid ones, and exempts server keys and bestPracticeKey"() {
+        when:
+        script._rejectUnknownArgs('hub_update_library', [libraryId: '42', source: 's', zeta: 1, alpha: 2, confirm: true])
+
+        then:
+        def e = thrown(IllegalArgumentException)
+        e.message.startsWith('Unknown hub_update_library arguments: alpha, zeta. Nothing was changed. Valid arguments: libraryId, ')
+        e.message.contains('expectedVersion')
+
+        when: 'the budget clock, any double-underscore key and the guide key ride along'
+        script._rejectUnknownArgs('hub_update_library', [libraryId: '42', __reqT0: 1L, __future: true, bestPracticeKey: 'k'])
+
+        then:
+        notThrown(IllegalArgumentException)
+
+        when: 'a tool without additionalProperties:false keeps accepting extras'
+        script._rejectUnknownArgs('hub_get_room', [roomId: '1', whatever: true])
+
+        then:
+        notThrown(IllegalArgumentException)
+    }
+
+    def "a gateway call to a strict tool with an unknown argument throws before the handler runs"() {
+        given:
+        settingsMap.enableWrite = true
+        boolean reached = false
+        script.metaClass.toolUpdateLibraryCode = { Map a -> reached = true; [success: true] }
+
+        when:
+        script.handleGateway('hub_manage_code', 'hub_update_library', [libraryId: '42', source: 's', expectedVerison: 3, confirm: true])
+
+        then:
+        def e = thrown(IllegalArgumentException)
+        e.message.contains('Unknown hub_update_library argument: expectedVerison')
+        !reached
+    }
+
+    @spock.lang.Unroll
+    def "dispatch: a strict tool refuses an unknown argument and a non-strict tool ignores one (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        settingsMap.enableWrite = true
+        boolean reached = false
+        script.metaClass.toolUpdateLibraryCode = { Map a -> reached = true; [success: true, received: a.keySet().sort()] }
+
+        when:
+        def strict = mcpDriver.callTool('hub_update_library', [libraryId: '42', source: 's', bogus: 1, confirm: true])
+
+        then:
+        strict.result.isError == true
+        mcpDriver.parseInner(strict).error.contains('Unknown hub_update_library argument: bogus')
+        !reached
+
+        when: 'a tool without additionalProperties:false still receives the extra key'
+        script.metaClass.toolInstallLibrary = { Map a -> [success: true, received: a.keySet().sort()] }
+        def lenient = mcpDriver.callTool('hub_create_library', [source: 's', bogus: 1, confirm: true])
+
+        then:
+        !lenient.result.isError
+        mcpDriver.parseInner(lenient).received.contains('bogus')
+
+        when: 'the mandatory guide key is accepted on a strict tool'
+        settingsMap.enableMandatoryBPS = true
+        def keyed = mcpDriver.callTool('hub_update_library', [libraryId: '42', source: 's', confirm: true,
+            bestPracticeKey: script.hubBpsGuideKey(script._bpsSectionForTool('hub_update_library'))])
+
+        then:
+        !keyed.result.isError
+        reached
+        mcpDriver.parseInner(keyed).received.contains('bestPracticeKey')
+
+        where:
+        useGateways << [true, false]
+    }
 }

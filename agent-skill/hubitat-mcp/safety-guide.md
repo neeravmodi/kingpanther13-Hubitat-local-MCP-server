@@ -116,13 +116,13 @@ ALL destructive write tools (`confirm`+backup tier) require these steps in order
 
 #### hub_update_app / hub_update_driver
 - Source is auto-backed up before update (1-hour protection window preserves original)
-- Uses optimistic locking to prevent concurrent edit conflicts
-- Supports three modes: `source` (direct), `sourceFile` (from File Manager), `resave` (recompile)
+- Pass the version you read as `expectedVersion`: the hub refuses the save atomically (`conflict:true`, nothing written) if someone else changed the code since
+- Supports four modes: `source` (direct), `sourceFile` (from File Manager), `importUrl` (hub fetches the URL), `resave` (recompile)
 
 #### hub_update_library
 - Source is auto-backed up before update (1-hour protection window preserves original); backup failure aborts the update
-- Uses optimistic locking to prevent concurrent edit conflicts
-- Supports three modes: `source` (direct), `sourceFile` (from File Manager), `resave` (recompile)
+- Pass the version you read as `expectedVersion`: the hub refuses the save atomically (`conflict:true`, nothing written) if someone else changed the code since
+- Supports four modes: `source` (direct), `sourceFile` (from File Manager), `importUrl` (hub fetches the URL), `resave` (recompile)
 
 ---
 

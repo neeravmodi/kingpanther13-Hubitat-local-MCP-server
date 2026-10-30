@@ -2565,7 +2565,7 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
     }
 
     @spock.lang.Unroll
-    def "hub_update_app via dispatch returns isError validation result envelope when bulk-mode updates[] (useGateways=#useGateways)"() {
+    def "hub_update_app via dispatch refuses bulk-mode updates[] as an unknown argument (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -2576,10 +2576,9 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
             confirm: true
         ])
 
-        then:
+        then: 'public dispatch refuses the unknown argument; the direct-call check above keeps its own message'
         response.result.isError == true
-        mcpDriver.parseInner(response).error.contains('Bulk mode')
-        mcpDriver.parseInner(response).error.contains('hub_update_app')
+        mcpDriver.parseInner(response).error.contains('Unknown hub_update_app argument: updates')
 
         where:
         useGateways << [true, false]
@@ -4060,84 +4059,92 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
         result.type == 'library'
     }
 
-    // -------- hub_update_app: expectedVersion optimistic-lock --------
+    // -------- hub_update_app / hub_update_driver: expectedVersion, checked by the hub on save --------
 
-    def "hub_update_app with matching expectedVersion proceeds and POSTs to /app/saveOrUpdateJson"() {
+    // Stands in for /app|driver/saveOrUpdateJson: the hub refuses a save whose version is not the
+    // item's current one, writing nothing. Every POST body is recorded.
+    private Closure versionCheckingSave(Map hubVersions, List posts) {
+        return { String path, String body, int timeout = 420 ->
+            def b = new groovy.json.JsonSlurper().parseText(body)
+            posts << b
+            def cur = hubVersions[b.id?.toString()]
+            if (cur != null && b.version != cur) {
+                return [success: false, message: "Version does not match, attempting to update version ${b.version}, current version is ${cur}".toString()]
+            }
+            if (cur != null) hubVersions[b.id.toString()] = cur + 1
+            [success: true, id: b.id]
+        }
+    }
+
+    private boolean versionReadMade() {
+        hubGet.calls.any { it.path in ['/app/list/all/data', '/driver/list/data'] }
+    }
+
+    def "hub_update_app sends a matching expectedVersion as the save version with no separate version read"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 42, "source": "old source"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 42, "source": "old source"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def captured = [:]
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            captured.path = path
-            captured.body = body
-            [success: true, id: 50]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 42], posts)
 
         when:
         def result = script.toolUpdateAppCode([appId: '50', source: 'new source', expectedVersion: 42, confirm: true])
 
         then:
-        captured.path == '/app/saveOrUpdateJson'
-        new groovy.json.JsonSlurper().parseText(captured.body).version == 42
+        posts*.version == [42]
         result.success == true
         result.previousVersion == 42
+
+        and: 'the only code read is the backup; no list or extra ajax/code version read'
+        !versionReadMade()
+        hubGet.calls.count { it.path == '/app/ajax/code' } == 1
     }
 
-    def "hub_update_app with mismatching expectedVersion aborts BEFORE POST and returns conflict"() {
+    def "hub_update_app with a stale expectedVersion maps the hub's refusal to conflict and does not retry"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 50, "source": "current source"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 50, "source": "current source"}' }
         def uploads = []
         script.metaClass.uploadHubFile = { String name, byte[] content -> uploads << name }
-        def postCount = 0
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            postCount++
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 50], posts)
 
         when:
         def result = script.toolUpdateAppCode([appId: '50', source: 'stale', expectedVersion: 42, confirm: true])
 
-        then: 'no hub-update POST happens'
-        postCount == 0
+        then: 'one save, sent at the caller version and refused; never retried at the hub version'
+        posts*.version == [42]
+        !versionReadMade()
 
-        and: 'conflict result includes both versions and the conflict flag'
+        and: 'conflict result carries both versions and the conflict flag'
         result.success == false
         result.conflict == true
         result.expectedVersion == 42
         result.currentVersion == 50
         result.error.toLowerCase().contains('optimistic-lock conflict')
+        result.error.contains('retry with the new expectedVersion')
         result.appId == '50'
 
-        and: 'backup IS taken even on conflict (intentional, 1h cache makes retry free)'
+        and: 'backup IS taken even on conflict (the 1h reuse makes a retry free)'
         uploads == ['mcp-backup-app-50.groovy']
     }
 
     @spock.lang.Unroll
-    def "hub_update_app via dispatch surfaces expectedVersion conflict inside result.content text (useGateways=#useGateways)"() {
+    def "hub_update_app via dispatch surfaces the hub's stale-version refusal as a conflict (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 50, "source": "current source"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 50, "source": "current source"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def postCount = 0
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            postCount++
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 50], posts)
 
         when:
         def response = mcpDriver.callTool('hub_update_app', [appId: '50', source: 'stale', expectedVersion: 42, confirm: true])
 
-        then: 'no hub-update POST happens; conflict is a non-error successful tool response, not a JSON-RPC error'
-        postCount == 0
+        then: 'one refused save; conflict is a non-error tool response, not a JSON-RPC error'
+        posts.size() == 1
         response.error == null
         !response.result.isError
 
@@ -4152,24 +4159,19 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
         useGateways << [true, false]
     }
 
-    def "hub_update_app coerces a string expectedVersion to integer and detects mismatch (inequality-proves-coercion)"() {
+    def "hub_update_app coerces a string expectedVersion to an integer save version"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 7, "source": "current"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 7, "source": "current"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def postCount = 0
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            postCount++
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 7], posts)
 
         when: 'caller sends "8" (string) and hub is at 7'
         def result = script.toolUpdateAppCode([appId: '50', source: 's', expectedVersion: '8', confirm: true])
 
-        then: 'envelope carries Integer values (proves both sides coerced, not String compared)'
-        postCount == 0
+        then: 'the body carries the integer, and the conflict envelope Integer values'
+        posts*.version == [8]
         result.conflict == true
         result.expectedVersion == 8
         result.expectedVersion.class == Integer
@@ -4177,13 +4179,11 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
         result.currentVersion.class == Integer
     }
 
-    def "hub_update_app rejects unparseable expectedVersion with a clear message that preserves the original cause"() {
+    def "hub_update_app rejects unparseable expectedVersion before any hub call, preserving the original cause"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 1, "source": "src"}'
-        }
-        script.metaClass.uploadHubFile = { String name, byte[] content -> }
+        def uploads = []
+        script.metaClass.uploadHubFile = { String name, byte[] content -> uploads << name }
 
         when:
         script.toolUpdateAppCode([appId: '50', source: 's', expectedVersion: 'not-a-number', confirm: true])
@@ -4193,6 +4193,10 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
         ex.message.contains('expectedVersion must be an integer')
         ex.message.contains('not-a-number')   // input value preserved
         ex.message.contains('For input string')   // original NumberFormatException cause preserved
+
+        and: 'rejected before the backup or any read'
+        uploads.isEmpty()
+        !hubGet.calls.any { it.path == '/app/ajax/code' }
     }
 
     def "hub_update_app rejects explicit-null expectedVersion (silent-overwrite footgun)"() {
@@ -4205,53 +4209,44 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
         then:
         def ex = thrown(IllegalArgumentException)
         ex.message.contains('expectedVersion was supplied as null')
+        !hubGet.calls.any { it.path == '/app/ajax/code' }
     }
 
     def "hub_update_app with expectedVersion:0 against hub version 0 succeeds (no Groovy truthy short-circuit)"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 0, "source": "v0 source"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 0, "source": "v0 source"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def captured = [:]
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            captured.body = new groovy.json.JsonSlurper().parseText(body)
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 0], posts)
 
         when:
         def result = script.toolUpdateAppCode([appId: '50', source: 'v1', expectedVersion: 0, confirm: true])
 
         then:
         result.success == true
-        captured.body.version == 0
+        posts*.version == [0]
     }
 
     def "hub_update_app with expectedVersion:0 against hub version 1 returns conflict (proves containsKey is checked, not truthiness)"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 1, "source": "v1"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 1, "source": "v1"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def postCount = 0
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            postCount++
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 1], posts)
 
         when:
         def result = script.toolUpdateAppCode([appId: '50', source: 's', expectedVersion: 0, confirm: true])
 
         then:
-        postCount == 0
+        posts*.version == [0]
         result.conflict == true
         result.expectedVersion == 0
         result.currentVersion == 1
     }
 
-    def "hub_update_app with expectedVersion + resave fetches version from the resave parse (no second GET) and detects match/mismatch"() {
+    def "hub_update_app with expectedVersion + resave sends the caller version, not the resave read's"() {
         given:
         enableWrite()
         def getCount = 0
@@ -4260,11 +4255,9 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
             '{"status": "ok", "version": 7, "source": "on-hub"}'
         }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def captured = [:]
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            captured.body = new groovy.json.JsonSlurper().parseText(body)
-            [success: true]
-        }
+        def posts = []
+        def hubVersions = ['50': 7]
+        script.metaClass.hubInternalPostJson = versionCheckingSave(hubVersions, posts)
 
         when:
         def result = script.toolUpdateAppCode([appId: '50', resave: true, expectedVersion: 7, confirm: true])
@@ -4272,48 +4265,121 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
         then: 'resave-fetch + backup-fetch only; no extra version GET'
         getCount == 2
         result.success == true
-        captured.body.version == 7
+        posts*.version == [7]
 
         when:
-        getCount = 0
-        captured.clear()
+        posts.clear()
         def conflict = script.toolUpdateAppCode([appId: '50', resave: true, expectedVersion: 99, confirm: true])
 
-        then:
-        captured.isEmpty()                    // no POST
+        then: 'the hub (now at 8) refuses 99 once'
+        posts*.version == [99]
         conflict.conflict == true
         conflict.expectedVersion == 99
-        conflict.currentVersion == 7
+        conflict.currentVersion == 8
     }
 
-    def "hub_update_app with hub returning non-integer version aborts with a clear error (no silent unguarded write)"() {
+    def "hub_update_app without expectedVersion uses a backup taken in this call and skips the version read"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": "v1.2.3", "source": "src"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 12, "source": "old"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def postCount = 0
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 12], posts)
+
+        when:
+        def result = script.toolUpdateAppCode([appId: '50', source: 'new', confirm: true])
+
+        then:
+        result.success == true
+        posts*.version == [12]
+        !versionReadMade()
+        hubGet.calls.count { it.path == '/app/ajax/code' } == 1
+    }
+
+    def "hub_update_app without expectedVersion reads the list row when the backup is a reused one"() {
+        given: 'a backup from a minute ago carrying a stale version'
+        enableWrite()
+        backupIndex = [app_50: [type: 'app', id: '50', fileName: 'mcp-backup-app-50.groovy', version: 3,
+                                timestamp: 1234567890000L - 60_000L, sourceLength: 10]]
+        hubGet.register('/app/list/all/data') { params -> '[{"id": 50, "version": 9}]' }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 9], posts)
+
+        when:
+        def result = script.toolUpdateAppCode([appId: '50', source: 'new', confirm: true])
+
+        then: 'the reused version is not trusted; the cheap list read supplies the current one'
+        result.success == true
+        posts*.version == [9]
+        hubGet.calls.count { it.path == '/app/list/all/data' } == 1
+    }
+
+    def "hub_update_app without expectedVersion retries a stale save once at the hub's version (last writer wins)"() {
+        given: 'the resave read sees v4, but another save lands before ours'
+        enableWrite()
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 4, "source": "on-hub"}' }
+        script.metaClass.uploadHubFile = { String name, byte[] content -> }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 5], posts)
+
+        when:
+        def result = script.toolUpdateAppCode([appId: '50', resave: true, confirm: true])
+
+        then:
+        posts*.version == [4, 5]
+        result.success == true
+        result.previousVersion == 5
+        !result.containsKey('conflict')
+    }
+
+    def "hub_update_app without expectedVersion reports a conflict when the retry is refused too"() {
+        given:
+        enableWrite()
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 4, "source": "on-hub"}' }
+        script.metaClass.uploadHubFile = { String name, byte[] content -> }
+        def posts = []
         script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            postCount++
-            [success: true]
+            posts << new groovy.json.JsonSlurper().parseText(body)
+            [success: false, message: "Version does not match, attempting to update version 1, current version is ${posts.size() + 4}".toString()]
         }
 
         when:
-        script.toolUpdateAppCode([appId: '50', source: 's', expectedVersion: 1, confirm: true])
+        def result = script.toolUpdateAppCode([appId: '50', resave: true, confirm: true])
+
+        then: 'exactly one retry'
+        posts*.version == [4, 5]
+        result.success == false
+        result.conflict == true
+        result.expectedVersion == 5
+        result.currentVersion == 6
+    }
+
+    def "hub_update_app does not retry a stale refusal that names no current version"() {
+        given:
+        enableWrite()
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 4, "source": "on-hub"}' }
+        script.metaClass.uploadHubFile = { String name, byte[] content -> }
+        int posts = 0
+        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
+            posts++
+            [success: false, message: 'VERSION DOES NOT MATCH']
+        }
+
+        when:
+        def result = script.toolUpdateAppCode([appId: '50', resave: true, confirm: true])
 
         then:
-        def ex = thrown(IllegalArgumentException)
-        ex.message.contains('non-integer current version')
-        postCount == 0
+        posts == 1
+        result.conflict == true
+        result.expectedVersion == 4
+        !result.containsKey('currentVersion')
+        result.error.contains('the hub reports a different version')
     }
 
     def "hub_update_app propagates POST failure with a clean envelope -- no conflict:true leakage on non-conflict failures"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 1, "source": "old"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 1, "source": "old"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
         script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
             [success: false, message: 'compile failed']
@@ -4335,21 +4401,17 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
     def "hub_update_driver single-mode expectedVersion conflict carries driverId (not appId)"() {
         given:
         enableWrite()
-        hubGet.register('/driver/ajax/code') { params ->
-            '{"status": "ok", "version": 9, "source": "drv"}'
-        }
+        hubGet.register('/driver/ajax/code') { params -> '{"status": "ok", "version": 9, "source": "drv"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def postCount = 0
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            postCount++
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['77': 9], posts)
 
         when:
         def result = script.toolUpdateDriverCode([driverId: '77', source: 's', expectedVersion: 8, confirm: true])
 
         then:
-        postCount == 0
+        posts*.version == [8]
+        !versionReadMade()
         result.conflict == true
         result.driverId == '77'
         !result.containsKey('appId')
@@ -4368,13 +4430,8 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
             if (id == '103') return '{"status": "ok", "version": 30, "source": "c"}'
             null
         }
-
-        and: 'every update POST that does happen returns success'
-        def postedIds = []
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            postedIds << new groovy.json.JsonSlurper().parseText(body).id?.toString()
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['101': 10, '102': 20, '103': 30], posts)
 
         when: 'caller asserts wrong version on the middle entry only'
         def result = script.toolUpdateDriverCode([
@@ -4386,8 +4443,8 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
             confirm: true
         ])
 
-        then: 'only the two non-conflicting drivers were POSTed'
-        postedIds.sort() == ['101', '103']
+        then: 'each item saved once at its own version; the middle one was refused and not retried'
+        posts.collect { [it.id, it.version] } == [[101, 10], [102, 99], [103, 30]]
 
         and: 'overall bulk reports partial; per-item carries conflict shape for the failed entry only'
         result.success == false
@@ -4459,9 +4516,8 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
             if (id == '203') return '{"status": "ok", "version": 8, "source": "c"}'   // success
             null
         }
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['201': 5, '203': 8], posts)
 
         when: 'item 0 conflicts, item 1 has no driverId (throws), item 2 succeeds'
         def result = script.toolUpdateDriverCode([
@@ -4488,30 +4544,23 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
     def "hub_update_app accepts Long expectedVersion (common JSON parser output)"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 5, "source": "src"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 5, "source": "src"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
-        def captured = [:]
-        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 ->
-            captured.body = new groovy.json.JsonSlurper().parseText(body)
-            [success: true]
-        }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingSave(['50': 5], posts)
 
         when: 'caller passes a Long (e.g. parser produced Long for an integer JSON literal)'
         def result = script.toolUpdateAppCode([appId: '50', source: 's', expectedVersion: 5L, confirm: true])
 
         then:
         result.success == true
-        captured.body.version == 5
+        posts*.version == [5]
     }
 
     def "hub_update_app rejects non-coercible Map expectedVersion (exercises ClassCastException leg of the union catch)"() {
         given:
         enableWrite()
-        hubGet.register('/app/ajax/code') { params ->
-            '{"status": "ok", "version": 1, "source": "src"}'
-        }
+        hubGet.register('/app/ajax/code') { params -> '{"status": "ok", "version": 1, "source": "src"}' }
         script.metaClass.uploadHubFile = { String name, byte[] content -> }
 
         when:
@@ -4521,6 +4570,38 @@ class ToolAppDriverCodeSpec extends ToolSpecBase {
         def ex = thrown(IllegalArgumentException)
         ex.message.contains('expectedVersion must be an integer')
         ex.message.contains('Cannot coerce a map')   // ClassCastException cause preserved
+    }
+
+    // -------- strict arguments (additionalProperties: false) --------
+
+    @spock.lang.Unroll
+    def "#tool rejects an unknown argument before any hub call (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+        int posts = 0
+        script.metaClass.hubInternalPostJson = { String path, String body, int timeout = 420 -> posts++; [success: true] }
+
+        when: 'a misspelled lock that would otherwise be dropped silently'
+        def response = mcpDriver.callTool(tool, args + [expectedVerison: 3, confirm: true])
+
+        then:
+        response.result.isError == true
+        def error = mcpDriver.parseInner(response).error
+        error.contains("Unknown ${tool} argument: expectedVerison")
+        error.contains('Valid arguments:')
+        error.contains('expectedVersion')
+        posts == 0
+        !hubGet.calls.any { it.path.contains('ajax/code') || it.path.contains('/library/') }
+
+        where:
+        tool                 | args                             | useGateways
+        'hub_update_app'     | [appId: '50', source: 's']       | true
+        'hub_update_app'     | [appId: '50', source: 's']       | false
+        'hub_update_driver'  | [driverId: '77', source: 's']    | true
+        'hub_update_driver'  | [driverId: '77', source: 's']    | false
+        'hub_update_library' | [libraryId: '42', source: 's']   | true
+        'hub_update_library' | [libraryId: '42', source: 's']   | false
     }
 
     // -------- hub_update_app: self-update guard --------

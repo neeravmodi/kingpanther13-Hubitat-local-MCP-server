@@ -6436,18 +6436,37 @@ private Map _toolCatalogIndexes() {
     def cached = _toolMetadataGet("catalogIndexes")
     if (cached != null) return cached as Map
     def required = [:]
+    def strict = [:]
     def names = [] as Set
     getAllToolDefinitions().each { tool ->
         String name = tool.name as String
         names << name
         def req = tool?.inputSchema?.required
         if (req instanceof List && !req.isEmpty()) required.put(name, req.collect { it as String })
+        if (tool?.inputSchema?.additionalProperties == false) {
+            strict.put(name, ((tool.inputSchema.properties ?: [:]) as Map).keySet().collect { it as String })
+        }
     }
-    return _toolMetadataPut("catalogIndexes", [required: required, names: names]) as Map
+    return _toolMetadataPut("catalogIndexes", [required: required, strict: strict, names: names]) as Map
 }
 
 def requiredParamsByTool() {
     return _toolCatalogIndexes().required
+}
+
+// A tool whose inputSchema declares additionalProperties:false refuses arguments outside its
+// properties, before any side effect, in gateway and flat mode alike (both reach executeTool), so
+// a misspelled guard such as expectedVersion fails instead of being silently dropped. Exempt:
+// bestPracticeKey (every write tool takes it for the mandatory guide gate) and the server's own
+// double-underscore keys (the __reqT0 budget clock).
+def _rejectUnknownArgs(toolName, args) {
+    def allowed = _toolCatalogIndexes().strict[toolName as String]
+    if (allowed == null || !(args instanceof Map)) return
+    def unknown = (args as Map).keySet().collect { it as String }.findAll {
+        !allowed.contains(it) && it != "bestPracticeKey" && !it.startsWith("__")
+    }
+    if (!unknown) return
+    throw new IllegalArgumentException("Unknown ${_externalToolName(toolName as String)} argument${unknown.size() == 1 ? '' : 's'}: ${unknown.sort().join(', ')}. Nothing was changed. Valid arguments: ${allowed.join(', ')}.")
 }
 
 // hub_call_device_replace(list_options: true) short-circuits to a candidate READ before any
@@ -6552,6 +6571,7 @@ def executeTool(toolName, args, boolean bpsChecked = false) {
             throw new IllegalArgumentException("${toolName} is not available in read-only mode. The Custom Rule Engine toggle is OFF. Turn it ON in MCP Rule Server settings to use create/delete/export/import/clone operations. NOTE: the custom MCP rule engine is legacy -- for new rule work prefer hub_manage_native_rules_and_apps.")
         }
     }
+    _rejectUnknownArgs(toolName, args)
     if (deviceReadContext != null && _mrtrSnapshotReadTools().contains(toolName?.toString())) {
         return _deviceReadSnapshot(toolName.toString(), args as Map, deviceReadContext)
     }
@@ -8525,7 +8545,7 @@ def _latestLocalHubBackupEpoch(String kind = "any") {
  * Metadata (timestamp, version, etc.) is indexed in the File Manager file ITEM_BACKUP_INDEX_FILE.
  * Files are accessible at http://<HUB_IP>/local/<filename> even if MCP fails.
  * If a non-pending backup of this item exists within the last hour, reuses it (preserving the
- * pre-edit original) and repairs an over-budget index.
+ * pre-edit original) and repairs an over-budget index. A backup taken by this call carries fresh: true.
  * Returns the manifest entry on success, or throws if the source cannot be retrieved
  * or the manifest cannot be published.
  */
@@ -8573,7 +8593,8 @@ private Map _backupItemSourceLocked(String type, String id) {
     ]
     _publishUploadedItemBackup(key.toString(), entry)
     mcpLog("info", "hub-admin", "Backed up ${type} ID ${id} source code to File Manager: ${fileName} (version ${parsed.version}, ${parsed.source.length()} chars)")
-    return entry
+    // fresh marks a backup read by this call, so its version is current; a reused one is not.
+    return entry + [fresh: true]
 }
 
 String _stateOwnerKey() { app?.id?.toString() ?: "unidentified" }
@@ -11372,7 +11393,7 @@ The radio firmware-flash `action` values (the bullet above summarizes these as "
 - **Self-update guard rationale:** the tool refuses to overwrite the MCP server's own app source or OAuth unless Developer Mode is on because a bad self-update bricks the MCP loop — the server app's own OAuth backs the live `/mcp` token.
 - **A self-update does not wait for the compile.** The save POST is given 20 s; the hub finishes the compile on its own (a 2.6 MB parent takes minutes, past the platform's 300 s request cap). The result then carries `status: "saving"` with `assumed: true`, and `hub_get_info.lastSelfDeploy` settles it: `status` disappears and `confirmedVersion` appears once the App Code version passes `startedVersion`; a record still saving after 20 minutes becomes `success: false`. Do not resend the update while it is saving.
 - **`backup`** (default true): the current source is backed up to File Manager before the save (`hub_list_backups` scope=source). Pass `backup: false` to skip it. `importUrl` mode never takes one: the item's history lives where that URL is published. Same on hub_update_driver and hub_update_library.
-- **`triggerUpdated`:** OPTIONAL post-save lifecycle refresh. Set it to the running instance appId to fire `updated()` so subscriptions/schedules re-initialize. UI Save does NOT fire `updated()`, so this is opt-in only.
+- **`triggerUpdated`:** OPTIONAL post-save lifecycle refresh. Set it to the running instance appId to fire `updated()` so subscriptions, schedules and atomicState re-initialize. UI Save does NOT fire `updated()`, so this is opt-in only. It submits the instance's mainPage Done form, re-sending every input from its live settings; if those cannot be read the submit is refused so device selections are not cleared. A protected instance requires Developer Mode. On a refusal or failure the new code stays deployed: `success:true, partial:true, updatedFired:false` plus `repairHints`.
 - **`oauth` param shape:** `{enabled (bool, default true), client_id?, client_secret?, refresh_secret? (bool, regenerate the secret)}`. Omit `client_id`/`client_secret` to preserve current values; if they are unreadable the tool refuses (`success:false`) rather than blanking them. Resulting credentials return under `result.oauth`.
 - **OAuth leg:** works alone (no source mode needed) or together with a source update. If the source saved but the OAuth leg failed, the result is `success:false, partial:true`. The app's source must declare OAuth (an `oauth` block in `definition` plus `mappings`) before OAuth can be enabled.
 
@@ -11391,13 +11412,13 @@ The radio firmware-flash `action` values (the bullet above summarizes these as "
 - hub_create_driver bulk mode: `installs=[{source|sourceFile|importUrl}, ...]`, which cannot be combined with the single-item fields. Items run in order and continue past failures. Each item reports its own `driverId`, `success` and `error`, and the top-level `success` is true only when every item succeeded. If the call stops at the time budget, it returns `status:"in_progress"` with `installsRemaining`; send only those again.
 
 
-### hub_update_app / hub_update_driver — expectedVersion (optimistic-lock guard)
+### hub_update_app / hub_update_driver / hub_update_library — expectedVersion (optimistic lock)
 
-`expectedVersion` aborts the write with `conflict:true` on a version mismatch. Stringified integers are coerced; an explicit null is rejected. In bulk driver updates, put `expectedVersion` inside each `updates[]` entry.
+`expectedVersion` rides the save, and the hub checks it atomically: if the code has moved on, the hub refuses the save, nothing is written, and the result is `conflict:true` with `expectedVersion` and, when the hub reports it, `currentVersion`. Re-read the source, then retry with the new version. Stringified integers are coerced; an explicit null is rejected. Without it, the save uses the version this call read and retries once at the hub's version if another save landed first (last writer wins). These tools reject arguments outside their schema, so a misspelled lock fails instead of being dropped.
 
-Use it when a read-modify-write spans turns, or when another agent may edit the same code. A conflict result echoes `expectedVersion` and `currentVersion`: re-read the source, then retry with the new version. The source backup is still taken on a conflict. It is not taken in importUrl mode (the item's history lives where that URL is published); inline source and sourceFile updates keep it.
+Use it when a read-modify-write spans turns, or when another agent may edit the same code. The source backup is still taken on a conflict. It is not taken in importUrl mode (the item's history lives where that URL is published); inline source and sourceFile updates keep it.
 
-hub_update_driver bulk mode: `updates=[{driverId, sourceFile|source|importUrl|resave, expectedVersion?}, ...]`. It cannot be combined with the single-driver fields, including a top-level `expectedVersion`. Items run in order and continue past failures. A lock mismatch on one item gives `conflict:true` with both versions, and a thrown error gives `error` plus `errorClass`. The top-level `success` is true only when every item succeeded. If the call stops at the time budget, it returns `status:"in_progress"` with `updatesRemaining`; send only those again, in the same order.
+hub_update_driver bulk mode: `updates=[{driverId, sourceFile|source|importUrl|resave, expectedVersion?}, ...]`. It cannot be combined with the single-driver fields, including a top-level `expectedVersion`. Items run in order and continue past failures. A lock mismatch on one item gives that item `conflict:true`, and a thrown error gives `error` plus `errorClass`. The top-level `success` is true only when every item succeeded. If the call stops at the time budget, it returns `status:"in_progress"` with `updatesRemaining`; send only those again, in the same order.
 
 ### hub_update_app / hub_update_driver / hub_update_library — source modes and large sources
 

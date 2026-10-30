@@ -3570,7 +3570,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def response = mcpDriver.callTool('hub_set_native_app', [appId: 100, settings: [origLabel: 'x'], confirm: true])
         then:
         response.result.isError == true
-        mcpDriver.parseInner(response).error.contains('Unknown hub_set_native_app property; use operation, app_id, args and confirm')
+        mcpDriver.parseInner(response).error.contains('Unknown hub_set_native_app arguments: appId, settings. Nothing was changed. Valid arguments: operation, app_id, args, confirm, bestPracticeKey.')
         where:
         useGateways << [true, false]
     }

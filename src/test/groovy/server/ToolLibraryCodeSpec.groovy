@@ -1291,6 +1291,130 @@ def helperMethod() { return "ok" }
         useGateways << [true, false]
     }
 
+    // -------- hub_update_library expectedVersion, checked by the hub on save --------
+
+    // Stands in for /library/saveOrUpdateJson refusing a stale version with no write.
+    private Closure versionCheckingLibrarySave(Map hub, List posts) {
+        return { String path, String body, int timeout = 420 ->
+            def b = new groovy.json.JsonSlurper().parseText(body)
+            posts << b
+            if (b.version != hub.version) {
+                return [success: false, message: "Version does not match, attempting to update version ${b.version}, current version is ${hub.version}".toString()]
+            }
+            hub.version = hub.version + 1
+            [success: true, message: '', id: b.id, version: hub.version]
+        }
+    }
+
+    private void recentLibraryBackup(int version) {
+        backupIndex = [library_42: [type: 'library', id: '42', version: version,
+                                    timestamp: 1234567890000L - 60_000L,
+                                    fileName: 'mcp-backup-library-42.groovy', sourceLength: 10]]
+    }
+
+    def "hub_update_library sends expectedVersion as the save version without reading the library"() {
+        given: 'a reused backup, so nothing else in this call reads the library'
+        enableWrite()
+        recentLibraryBackup(1)
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingLibrarySave([version: 7], posts)
+
+        when:
+        def result = script.toolUpdateLibraryCode([libraryId: '42', source: SAMPLE_SOURCE, expectedVersion: 7, confirm: true])
+
+        then:
+        posts*.version == [7]
+        !hubGet.calls.any { it.path.startsWith('/library/') }
+        result.success == true
+        result.previousVersion == 7
+        result.newVersion == 8
+    }
+
+    @spock.lang.Unroll
+    def "hub_update_library with a stale expectedVersion returns the hub's conflict without retrying (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+        recentLibraryBackup(1)
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingLibrarySave([version: 9], posts)
+
+        when:
+        def response = mcpDriver.callTool('hub_update_library', [libraryId: '42', source: SAMPLE_SOURCE, expectedVersion: 7, confirm: true])
+
+        then:
+        posts*.version == [7]
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == false
+        inner.conflict == true
+        inner.expectedVersion == 7
+        inner.currentVersion == 9
+        inner.libraryId == '42'
+        inner.error.contains('retry with the new expectedVersion')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "hub_update_library without expectedVersion retries a stale save once at the hub's version"() {
+        given: 'the resave read sees v3, but another save lands before ours'
+        enableWrite()
+        recentLibraryBackup(1)
+        hubGet.register('/library/list/single/data/42') { params -> SAMPLE_RESPONSE_JSON.replace('"version":1', '"version":3') }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingLibrarySave([version: 4], posts)
+
+        when:
+        def result = script.toolUpdateLibraryCode([libraryId: '42', resave: true, confirm: true])
+
+        then:
+        posts*.version == [3, 4]
+        result.success == true
+        result.previousVersion == 4
+        result.newVersion == 5
+    }
+
+    def "hub_update_library uses the version of a backup taken in this call with no second read"() {
+        given:
+        enableWrite()
+        hubGet.register('/library/list/single/data/42') { params -> SAMPLE_RESPONSE_JSON.replace('"version":1', '"version":5') }
+        script.metaClass.uploadHubFile = { String name, byte[] content -> }
+        def posts = []
+        script.metaClass.hubInternalPostJson = versionCheckingLibrarySave([version: 5], posts)
+
+        when:
+        def result = script.toolUpdateLibraryCode([libraryId: '42', source: SAMPLE_SOURCE, confirm: true])
+
+        then:
+        posts*.version == [5]
+        hubGet.calls.count { it.path == '/library/list/single/data/42' } == 1
+        result.success == true
+    }
+
+    @spock.lang.Unroll
+    def "hub_update_library rejects expectedVersion #label before any hub call"() {
+        given:
+        enableWrite()
+        def uploads = []
+        script.metaClass.uploadHubFile = { String name, byte[] content -> uploads << name }
+
+        when:
+        script.toolUpdateLibraryCode([libraryId: '42', source: SAMPLE_SOURCE, expectedVersion: value, confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains(message)
+        uploads.isEmpty()
+        hubGet.calls.isEmpty()
+
+        where:
+        label            | value   | message
+        'explicit null'  | null    | 'expectedVersion was supplied as null'
+        'non-integer'    | 'v2'    | 'expectedVersion must be an integer'
+    }
+
     def "hub_update_library (sourceFile mode) reads source from File Manager"() {
         given:
         enableWrite()

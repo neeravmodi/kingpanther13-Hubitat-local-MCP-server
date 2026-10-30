@@ -2332,6 +2332,12 @@ def test_driver_lifecycle_uses_logical_write_helper_for_create():
             if (name, tool) == ("hub_read_apps_code", "hub_get_source"):
                 return next(reads)
             if (name, tool) == ("hub_manage_code", "hub_update_driver"):
+                args = arguments["args"]
+                if "expectedVerison" in args:
+                    raise et.McpToolError(tool, "Unknown hub_update_driver argument: expectedVerison")
+                if "expectedVersion" in args:
+                    return {"success": False, "conflict": True,
+                            "expectedVersion": args["expectedVersion"], "currentVersion": 2}
                 return {
                     "success": False,
                     "error": "unable to resolve class ClassThatDoesNotExistBatE2eDrv",

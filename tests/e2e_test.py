@@ -10297,8 +10297,8 @@ def updated() {}
     # test_update_app_code_lifecycle: one throwaway code class for update/error/conflict/OAuth:
     # a real round-trip edit (success + version advance + source landed), the
     # hub's verbatim compile error on broken Groovy (not our generic fallback),
-    # the client-side expectedVersion optimistic lock (refused, no write), a
-    # OAuth fold (asserted as a hard success -- it covers /app/updateOAuth reached with a
+    # the expectedVersion optimistic lock (the hub refuses a stale version, no write),
+    # the strict-argument refusal of a misspelled lock, the OAuth fold (asserted as a hard success -- it covers /app/updateOAuth reached with a
     # query MAP, which only a live hub can prove: the old embedded-querystring form 404s
     # that exact route).
     #
@@ -10378,18 +10378,36 @@ def updated() {}
                 f"error text is not the hub's compiler output: {err!r}"
 
             print("    [PHASE] APP_CODE_UPDATE version conflict")
-            # Leg 3: optimistic lock -- a stale expectedVersion must be refused client-side
-            # with conflict:true, before anything is written.
+            # Leg 3: optimistic lock -- the pre-edit version is now stale. The save carries it
+            # and the hub refuses it atomically: conflict:true, nothing written, no retry.
             source_v3 = source_v2.replace("UPDATE-LEG-MARKER-V2", "UPDATE-LEG-MARKER-V3")
             conflicted = self.client.call_tool("hub_manage_code", {
                 "tool": "hub_update_app",
                 "args": {"appId": code_app_id, "source": source_v3,
-                         "expectedVersion": 99999, "confirm": True},
+                         "expectedVersion": version_before, "confirm": True},
             })
             assert conflicted.get("success") is False, \
                 f"stale expectedVersion was accepted: {conflicted}"
             assert conflicted.get("conflict") is True, \
                 f"conflict flag missing on optimistic-lock refusal: {conflicted}"
+            assert conflicted.get("expectedVersion") == version_before, \
+                f"conflict does not echo the stale version: {conflicted}"
+            if conflicted.get("currentVersion") is not None:
+                assert int(conflicted["currentVersion"]) == version_after, \
+                    f"conflict reports the wrong current version: {conflicted}"
+
+            # Leg 3b: strict arguments -- a misspelled lock is refused before any write
+            # instead of being dropped (which would let the save through unguarded).
+            try:
+                self.client.call_tool("hub_manage_code", {
+                    "tool": "hub_update_app",
+                    "args": {"appId": code_app_id, "source": source_v3,
+                             "expectedVerison": version_before, "confirm": True},
+                })
+                raise AssertionError("hub_update_app accepted an unknown argument")
+            except (McpToolError, McpError) as exc:
+                assert "expectedVerison" in str(exc), \
+                    f"unknown-argument refusal does not name the argument: {exc}"
 
             # One re-read proves NEITHER refused leg wrote anything: still V2, no V3 marker,
             # version unchanged since the round-trip edit.
@@ -10430,7 +10448,7 @@ def updated() {}
             assert ob.get("enabled") is True, "OAuth reported success but not enabled"
             assert ob.get("clientId"), "OAuth enabled but no clientId returned"
 
-            print(f"    APP_CODE_UPDATE ok -- v{version_before}->v{version_after}; compile error + lock conflict both refused with no write; OAuth leg checked")
+            print(f"    APP_CODE_UPDATE ok -- v{version_before}->v{version_after}; compile error, lock conflict and unknown argument all refused with no write; OAuth leg checked")
         finally:
             if code_app_id:
                 try:
@@ -10763,7 +10781,8 @@ def updated() {}
     # GROUP 4e: driver_code_update (1 test) -- the hub_update_driver code-deploy
     # path (POST /driver/saveOrUpdateJson), mirroring the app leg above: one
     # throwaway driver code class, a round-trip edit (success + version advance +
-    # source landed) and the hub's verbatim compile error on broken Groovy.
+    # source landed), the hub's verbatim compile error on broken Groovy, a stale
+    # expectedVersion refused by the hub, and an unknown argument refused.
     # -----------------------------------------------------------------------
 
     @test("driver_code_update")
@@ -10832,19 +10851,45 @@ def updated() {}
             assert "unable to resolve" in err.lower() or "ClassThatDoesNotExistBatE2eDrv" in err, \
                 f"error text is not the hub's compiler output: {err!r}"
 
-            # One re-read proves the refused leg wrote nothing: still V2, no broken
-            # marker, version unchanged since the round-trip edit.
+            # Leg 3: optimistic lock -- the pre-edit version is stale; the hub refuses the
+            # save that carries it, writing nothing.
+            source_v3 = source_v2.replace("DRIVER-LEG-MARKER-V2", "DRIVER-LEG-MARKER-V3")
+            conflicted = self.client.call_tool("hub_manage_code", {
+                "tool": "hub_update_driver",
+                "args": {"driverId": driver_id, "source": source_v3,
+                         "expectedVersion": version_before, "confirm": True},
+            })
+            assert conflicted.get("success") is False and conflicted.get("conflict") is True, \
+                f"stale driver expectedVersion was not refused as a conflict: {conflicted}"
+            assert conflicted.get("expectedVersion") == version_before, \
+                f"driver conflict does not echo the stale version: {conflicted}"
+
+            # Leg 4: strict arguments -- an unknown argument is refused before any write.
+            try:
+                self.client.call_tool("hub_manage_code", {
+                    "tool": "hub_update_driver",
+                    "args": {"driverId": driver_id, "source": source_v3,
+                             "expectedVerison": version_before, "confirm": True},
+                })
+                raise AssertionError("hub_update_driver accepted an unknown argument")
+            except (McpToolError, McpError) as exc:
+                assert "expectedVerison" in str(exc), \
+                    f"unknown-argument refusal does not name the argument: {exc}"
+
+            # One re-read proves the refused legs wrote nothing: still V2, no broken or
+            # V3 marker, version unchanged since the round-trip edit.
             final = self.client.call_tool("hub_read_apps_code", {
                 "tool": "hub_get_source",
                 "args": {"type": "driver", "id": driver_id},
             })
             final_src = final.get("source") or ""
-            assert "DRIVER-LEG-MARKER-V2" in final_src and "ClassThatDoesNotExistBatE2eDrv" not in final_src, \
+            assert "DRIVER-LEG-MARKER-V2" in final_src and "ClassThatDoesNotExistBatE2eDrv" not in final_src \
+                and "DRIVER-LEG-MARKER-V3" not in final_src, \
                 f"a refused driver update mutated the stored source: {final}"
             assert int(final["version"]) == version_after, \
                 f"a refused driver update advanced the version ({version_after} -> {final.get('version')})"
 
-            print(f"    DRIVER_CODE_UPDATE ok -- v{version_before}->v{version_after}; compile error refused with the hub's verbatim text")
+            print(f"    DRIVER_CODE_UPDATE ok -- v{version_before}->v{version_after}; compile error, lock conflict and unknown argument refused with no write")
         finally:
             if driver_id:
                 try:
