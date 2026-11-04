@@ -4,7 +4,7 @@
  * A native MCP (Model Context Protocol) server that runs directly on Hubitat
  * with a built-in custom rule engine for creating automations via Claude.
  *
- * Version: 5.1.4 - Enriched list_devices summary + server-side filter (disabled, enabled, stale:N)
+ * Version: 5.1.6 - Enriched list_devices summary + server-side filter (disabled, enabled, stale:N)
  *
  * Installation:
  * 1. Go to Hubitat > Apps Code > New App
@@ -1022,6 +1022,7 @@ def _getAllToolDefinitions_partDashboards() {
                     name: [type: "string", description: "Display name."],
                     type: [type: "string", enum: ["easy", "legacy"], description: "Dashboard kind: 'easy' (default) or 'legacy' Hubitat® Dashboard."],
                     deviceIds: [type: "array", description: "Device ids. Required (>=1, runtime-enforced) for an Easy Dashboard; for a legacy dashboard these are its authorized devices (optional).", items: [type: "string"]],
+                    version: [type: "string", description: "Easy-only: dashboard version sent on create. Default 2.0."],
                     options: [type: "object", description: "Easy-only optional config; see hub_get_tool_guide(section='dashboards'). Rejected for type='legacy'."]
                 ],
                 required: ["name"]
@@ -6451,10 +6452,6 @@ private TimeZone _hubTimeZone() {
 def toolGetHubLogs(args) {
     Map modeArgs = _logsModeArgs()
     List allModeArgs = modeArgs.values().flatten().unique()
-    List unknown = args.keySet()*.toString().findAll(this.&_logsUnknownArg.curry(allModeArgs))
-    if (unknown) {
-        throw new IllegalArgumentException("Unknown parameter${unknown.size() == 1 ? '' : 's'} for hub_get_logs: ${unknown.join(', ')}. Search a row's name and text with pattern, and scope with deviceId or appId.")
-    }
     List modes = args.mode instanceof List ? args.mode*.toString().unique() : [args.mode == null ? "past" : args.mode.toString()]
     if (!modes) throw new IllegalArgumentException("mode must name at least one tab")
     for (m in modes) {
@@ -6575,9 +6572,6 @@ def toolGetHubLogs(args) {
 }
 private boolean _argPresent(Map args, key) {
     return args[key] != null
-}
-private boolean _logsUnknownArg(List allowed, String key) {
-    return !(key in allowed) && key != "mode" && !key.startsWith("__")
 }
 private boolean _logsHasFetchSnapshot(r) {
     return r.snapshot instanceof Map && r.snapshot.background != null
@@ -9999,18 +9993,11 @@ private Set _selectedAndChildIds(List children) {
 private Set _mcpAuthorizedIds(List children) {
     return _bypassEnabled() ? null : _selectedAndChildIds(children)
 }
-private List _listDevicesArgNames() {
-    ["scope", "format", "labelFilter", "capabilityFilter", "roomFilter", "disabled", "staleHours",
-     "changedSince", "stateFilter", "attributeNames", "fields", "limit", "cursor"]
-}
 private List _listDeviceFieldNames() {
     ["id", "label", "name", "driver", "room", "roomId", "disabled", "deviceNetworkId", "lastActivity", "protocol",
      "parentDeviceId", "mcpManaged", "linked", "tags", "notes", "source", "currentStates", "capabilities", "attributes", "commands"]
 }
 private Map _listDevicesOptions(Map args) {
-    List known = _listDevicesArgNames()
-    def unknown = args.keySet().findAll { !it.toString().startsWith("__") && !(it in known) }
-    if (unknown) throw new IllegalArgumentException("Unknown argument: ${unknown.join(', ')}. Valid arguments: ${known.join(', ')}")
     if (args.scope != null && !(args.scope in ["authorized", "all", "owned"])) {
         throw new IllegalArgumentException("scope must be one of: authorized, all, owned (got: '${args.scope}')")
     }
@@ -12670,8 +12657,6 @@ private Map _resolveDeviceRoom(String room, boolean byId = false) {
 def toolUpdateDevice(args) {
     def deviceId = _canonicalDeviceIdArg(args.deviceId)
     if (deviceId == null) throw new IllegalArgumentException("deviceId is required")
-    def unknown = args.keySet().findAll { !(it in ['deviceId', 'fields', 'preferences', 'confirm', 'bestPracticeKey']) }
-    if (unknown) throw new IllegalArgumentException("Unknown argument ${unknown.join(', ')}; device fields go in fields and driver preferences in preferences")
     def fieldsArg = args.get('fields')
     if (fieldsArg != null && !(fieldsArg instanceof Map)) throw new IllegalArgumentException("fields must be an object keyed by editable field name")
     if (args.preferences != null && !(args.preferences instanceof Map)) throw new IllegalArgumentException("preferences must be an object keyed by declared preference name")
@@ -13841,6 +13826,7 @@ If no exact device match: suggest similar devices and get user confirmation befo
                         ]
                     ],
                     parameters: [type: "array", description: "Ordered command arguments as an array of strings, in the order the command declares them, e.g. [\"75\"] for setLevel[[FLAT_TRIM]] or [\"#FF0000\"] for setColor[[/FLAT_TRIM]].", items: [type: "string"]],
+                    includeState: [type: "boolean", description: "false skips the state read-back after the command. Default true."],
                     waitFor: [type: "object", description: "Optional: after firing the command, block-poll an attribute for an expected value; check waitFor.converged to confirm the resulting state.[[FLAT_TRIM]] The native `state` snapshot is read after dispatch and any poll. Without waitFor it is an immediate read that may show the prior or resulting value.[[/FLAT_TRIM]]", properties: [
                         attribute: [type: "string", description: "Attribute to poll until it converges, e.g. \"switch\". NOT checked before the command fires (native metadata lists reported attributes only): a name the device never reports times out with neverReported after the command has already executed."],
                         expectedValue: [type: "string", description: "Awaited value: eq/ne in-set, or gt/gte/lt/lte numeric threshold."],
@@ -16510,8 +16496,6 @@ private List _nameFiltered(List rows, filter) {
     return rows.findAll { it instanceof Map && (stripAppConfigHtml(it.name) ?: "").toLowerCase().contains(f) }
 }
 def toolListHubDrivers(args) {
-    def unknown = ((args ?: [:]).keySet() - ["include", "cursor", "nameFilter"]).sort()
-    if (unknown) throw new IllegalArgumentException("hub_list_drivers does not take ${unknown.join(', ')}. Valid arguments: include, nameFilter, cursor.")
     def cursor = args?.cursor
     def include = (args?.include ?: "user").toString().toLowerCase()
     if (!(include in ["user", "all"])) throw new IllegalArgumentException("include must be 'user' or 'all' (got '${args.include}').")
@@ -16787,6 +16771,8 @@ def toolGetAppConfig(args) {
         }
         def summaryResult = [:]
         summaryResult.putAll(summaryParsed)
+        try { summaryResult.namespace = getAppByAppId(appIdStr as Long)?.appType?.namespace?.toString() }
+        catch (Exception lookup) { mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: type namespace unreadable: ${lookup.message}") }
         summaryResult.success = true
         summaryResult.endpoint = summaryPath
         return summaryResult
@@ -16831,68 +16817,85 @@ def toolGetAppConfig(args) {
         id: parsed.app.id,
         label: stripAppConfigHtml(parsed.app.trueLabel ?: parsed.app.label),
         name: parsed.app.name,
-        appType: appTypeRaw instanceof Map ? [system: appTypeRaw.system == true, menu: appTypeRaw.menu] : null,
+        appType: appTypeRaw instanceof Map ? [namespace: appTypeRaw.namespace, name: appTypeRaw.name, system: appTypeRaw.system == true, menu: appTypeRaw.menu] : null,
         disabled: parsed.app.disabled == true,
         parentAppId: parsed.app.parentAppId,
         installed: parsed.app.installed == true
     ]
-    def redactedPw = _appConfigRedactedMarker()
-    def passwordInputNames = [] as Set
     boolean isRmRule = _rmIsRuleAppType((appTypeRaw instanceof Map ? appTypeRaw.name : null)?.toString()) ||
         _rmIsRuleAppType(parsed.app.name?.toString())
+    boolean rmHasDisabled = isRmRule
+    if (isRmRule && [appTypeRaw instanceof Map ? appTypeRaw.name : null, parsed.app.name].any { it?.toString() in ['Rule-5.1', 'Button Rule-5.1'] }) {
+        try {
+            Map rmState = _nrState(appIdStr as Long)
+            rmHasDisabled = [rmState.disabledActions, rmState.disabledTriggers].any { it instanceof Collection && !it.isEmpty() }
+        } catch (Exception unreadable) {
+            mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: rule state unreadable (${unreadable.class.simpleName}: ${unreadable.message}); disabled rows read from the page")
+        }
+    }
+    Map formFields = null
+    Map form = null
+    String formError = null
+    try {
+        form = _nfPublic(_nfContext(appIdStr as Long, parsed as Map), [])
+        formFields = form.get('fields').collectEntries { [(it.name): it] }
+    } catch (IllegalStateException unmodelled) {
+        mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: page form unreadable: ${unmodelled.message}")
+        formError = unmodelled.message
+    } catch (Exception unexpected) {
+        mcpLogError("hub-admin", "hub_get_app_config app ${appIdStr}: page form read failed", unexpected)
+        formError = "${unexpected.class.simpleName}: ${unexpected.message}".toString()
+    }
+    def passwordInputNames = [] as Set
     def sections = []
+    def pageHrefs = []
     for (s in parsed.configPage.sections) {
         if (!(s instanceof Map)) continue
-        def section = [
-            title: stripAppConfigHtml(s.title),
-            inputs: []
-        ]
-        for (i in (s.input ?: [])) {
-            if (!(i instanceof Map)) continue
-            def input = [
-                name: i.name,
-                type: i.type,
-                title: stripAppConfigHtml(i.title)
-            ]
-            if (i.multiple == true) input.multiple = true
-            if (i.required == true) input.required = true
-            def desc = stripAppConfigHtml(i.description)
-            if (desc && desc != "Click to set") input.description = desc
-            if (i.options) input.options = stripOptionsHtml(i.options)
-            if (i.defaultValue != null && (i.defaultValue != true || i.type == "bool")) input.value = i.defaultValue
-            else if (i.value != null && (i.value != true || i.type == "bool")) input.value = i.value
-            String inputType = i.type?.toString() ?: ""
-            if (!inputType.startsWith("capability") && !inputType.startsWith("device.") && parsed.settings instanceof Map && parsed.settings[i.name] != null) input.value = parsed.settings[i.name]
-            if (i.type == "password" && i.name) passwordInputNames << i.name.toString()
-            if (input.containsKey("value") && _appConfigMasksSetting(i.name, i.type, input.value)) input.value = redactedPw
-            else if (input.containsKey("value") && _redactsAccessTokens() && input.value instanceof CharSequence &&
-                     i.name?.toString() ==~ /(?i)access_?token/) input.value = _accessTokenRedactedMarker()
-            section.inputs << input
-        }
+        def section = [title: stripAppConfigHtml(s.title), inputs: []]
         def paragraphs = []
-        for (b in (s.body ?: [])) {
+        def components = []
+        List elements = (s.body instanceof List ? s.body : []) + (s.input instanceof List ? s.input.findAll { it instanceof Map && (it.element ?: 'input') == 'input' } : [])
+        Set seen = [] as Set
+        for (b in elements) {
             if (!(b instanceof Map)) continue
-            def rawHtml = (b.description ?: b.title)?.toString()
-            def text = stripAppConfigHtml(rawHtml)
-            if (!text || text == "Click to set") continue
-            List disabled = []
-            if (isRmRule) {
-                def rows = rawHtml =~ /(?is)<span\s+style=['"]\s*color:\s*red;?\s*['"]\s*>\s*<i>(.*?)<\/i>\s*<\/span>/
-                while (rows.find()) {
-                    String row = stripAppConfigHtml(rows.group(1))?.trim()
-                    if (row && !(row ==~ /(?i)Disabled Actions?/)) disabled << row
-                }
+            String element = b.element?.toString() ?: 'input'
+            if (element == 'input' && b.name && b.type != 'button') {
+                if (!seen.add(b.name.toString())) continue
+                if (b.type == 'password') passwordInputNames << b.name.toString()
+                section.inputs << _appConfigInput(b, formFields?.get(b.name.toString()), parsed.settings)
+            } else if (element in ['label', 'mode']) {
+                Map appField = formFields?.get(element == 'mode' ? 'mode[mode]' : 'label')
+                if (appField) section.inputs << appField
+            } else if (element == 'component' && b.name) {
+                components << [name: b.name, title: stripAppConfigHtml(b.title), description: stripAppConfigHtml(b.description)].findAll { k, v -> v }
+            } else if (element == 'href' && (b.page || b.url)) {
+                Map link = b.url ? [url: b.url.toString()] : [page: b.page.toString()]
+                link.title = _uiPlainTitle(b.title)
+                def description = _appConfigShownText(b.description)
+                if (description) link.description = description
+                List disabled = rmHasDisabled ? _appConfigDisabledRows(b.description) : []
+                if (disabled) link.disabled = disabled
+                pageHrefs << link
+            } else if (element == 'paragraph') {
+                def rawHtml = (b.description ?: b.title)?.toString()
+                def text = _appConfigShownText(rawHtml)
+                if (!text) continue
+                List disabled = rmHasDisabled ? _appConfigDisabledRows(rawHtml) : []
+                paragraphs << (disabled ? [text: text, disabled: disabled] : text)
             }
-            paragraphs << (disabled ? [text: text, disabled: disabled] : text)
         }
         if (paragraphs) section.paragraphs = paragraphs
+        if (components) section.components = components
         sections << section
     }
-    def children = []
-    for (c in (parsed.childApps ?: [])) {
-        if (!(c instanceof Map)) continue
-        children << [id: c.id, label: stripAppConfigHtml(c.label ?: c.name), name: c.name]
+    def children = (parsed.childApps instanceof List ? parsed.childApps : []).findAll { it instanceof Map }.collect { c ->
+        [id: c.id, label: stripAppConfigHtml(c.label ?: c.name), name: c.name]
     }
+    def childDevices = (parsed.childDevices instanceof List ? parsed.childDevices : []).findAll { it instanceof Map }.collect { d ->
+        [id: d.id, name: stripAppConfigHtml(d.label ?: d.name)]
+    }
+    Map modeNames = parsed.modeMap instanceof Map ? parsed.modeMap : [:]
+    appObj.restrictedModes = _nfAppValue(parsed as Map, true).collect { id -> [value: id, label: modeNames.get(id)?.toString()] }
     def result = [
         success: true,
         app: appObj,
@@ -16904,20 +16907,21 @@ def toolGetAppConfig(args) {
             sections: sections
         ],
         childApps: children,
+        childDevices: childDevices,
         endpoint: path
     ]
     if (parsed.configPage.error) result.configPageError = parsed.configPage.error
-    def pageHrefs = _rmPageHrefs(parsed.configPage as Map)
     if (pageHrefs) result.page.hrefs = pageHrefs
     if (pageName && parsed.configPage.name != null && parsed.configPage.name.toString() != pageName) {
         String formTool = isRmRule ? "hub_set_rule" : "hub_set_native_app"
         result.pageNote = "The hub rendered '${parsed.configPage.name}' instead of '${pageName}'; this app reaches that page only through its own link: open it with ${formTool}(operation:'form') and activate the href.".toString()
     }
-    try {
-        result.controls = _nfPublic(_nfContext(appIdStr as Long, parsed as Map), []).controls
-    } catch (Exception unreadable) {
-        mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: page controls unreadable: ${unreadable.message}")
-        result.controlsError = unreadable.message
+    if (form != null) {
+        result.controls = form.get('controls')
+        if (form.get('unsupported')) result.unsupported = form.get('unsupported')
+    } else {
+        result.formError = formError
+        result.note = _appConfigNote("Input values and controls are withheld: ${formError}. Read the stored values with includeSettings=true")
     }
     int settingsCount = (parsed.settings instanceof Map) ? parsed.settings.size() : 0
     result.settingsKeyCount = settingsCount
@@ -16937,6 +16941,7 @@ def toolGetAppConfig(args) {
                 mcpLog("warn", "hub-admin", "hub_get_app_config: statusJson for app ${appIdStr} types none of ${untyped}; raw settings withheld")
                 result.settingsNote = "Raw settings withheld: /installedapp/statusJson/${appIdStr} carries no type for ${untyped.take(5).join(', ')}${untyped.size() > 5 ? " and ${untyped.size() - 5} more" : ''}, so a password among them could not be told apart. Retry; the config page above is unaffected.".toString()
             } else {
+                def redactedPw = _appConfigRedactedMarker()
                 def redacted = [:]
                 rawSettings.each { k, v ->
                     String key = k?.toString()
@@ -16951,6 +16956,30 @@ def toolGetAppConfig(args) {
         result.settingsNote = "Raw settings omitted; pass includeSettings=true to include them."
     }
     return result
+}
+private List _appConfigDisabledRows(Object html) {
+    List disabled = []
+    if (!html) return disabled
+    def rows = html.toString() =~ /(?is)<span\s+(?:style=['"]\s*color:\s*red;?\s*['"]|class=['"]text-hubitat-danger['"])\s*>\s*<i>(.*?)<\/i>\s*<\/span>/
+    while (rows.find()) {
+        String row = stripAppConfigHtml(rows.group(1))?.trim()
+        if (row && !(row ==~ /(?i)Disabled (?:Action|Trigger)s?/)) disabled << row
+    }
+    return disabled
+}
+private String _appConfigShownText(Object html) {
+    String text = stripAppConfigHtml(html)
+    return (text && !(text in ["Click to set", "Click to show"])) ? text : null
+}
+private Map _appConfigInput(Map element, Map field, Object storedSettings) {
+    if (field == null) return [name: element.name, type: element.type, title: stripAppConfigHtml(element.title)]
+    Map input = [:] + field
+    def description = _appConfigShownText(field.description)
+    if (description) input.description = description
+    else input.remove('description')
+    def stored = storedSettings instanceof Map ? storedSettings.get(field.name) : null
+    if (_nrIsDeviceType(field.type?.toString()) && stored instanceof Map) input.selected = stored.collect { id, label -> [value: id.toString(), label: stripAppConfigHtml(label)] }
+    return input
 }
 private Map _appConfigSettingTypes(Integer appId) {
     def status
@@ -17091,7 +17120,7 @@ private Map _submitAppDoneForm(Integer instanceId, String pageName, boolean requ
             if (i instanceof Map && i.name) {
                 def nm = i.name.toString()
                 if (i.value != null) pageValues.put(nm, i.value)
-                else if (i.defaultValue != null) pageValues.put(nm, i.defaultValue)
+                else if (i.defaultValue != null && i.type != "menu" && !_isDevicePickerType(i.type)) pageValues.put(nm, i.defaultValue)
             }
         }
     }
@@ -17603,8 +17632,7 @@ private Map toolUpdateItemCodeInner(String type, String idParam, args, Map packa
         }
     }
     if (noBackupReason) mcpLog("info", "hub-admin", "Pre-update source backup skipped for ${type} ID ${itemId}: ${noBackupReason}")
-    def sentVersion = expectedVersion
-    if (sentVersion == null) sentVersion = freshVersion
+    def sentVersion = freshVersion
     if (sentVersion == null && itemBackup?.fresh == true) sentVersion = itemBackup.version
     if (sentVersion == null) sentVersion = _itemRowVersion(type, itemId)
     if (sentVersion == null) {
@@ -17614,10 +17642,13 @@ private Map toolUpdateItemCodeInner(String type, String idParam, args, Map packa
         } catch (Exception vErr) {
             mcpLog("warn", "hub-admin", "Could not read the current version of ${type} ID ${itemId}: ${vErr.message}")
         }
-        if (sentVersion == null) sentVersion = itemBackup?.version
+        if (sentVersion == null && expectedVersion == null && !isSelfUpdate) sentVersion = itemBackup?.version
     }
     if (sentVersion == null) {
         throw new IllegalArgumentException("Could not determine current version for ${type} ID ${itemId}. The ${type} may not exist.")
+    }
+    if (expectedVersion != null && sentVersion.toString() != expectedVersion.toString()) {
+        return _versionConflictResult(type, idParam, itemId, expectedVersion, sentVersion)
     }
     if (type == "app" && selfClassIdUnavailable && sourceCode.length() > 500000) {
         mcpLog("warn", "hub-admin", "hub_update_app: large app-source update to id ${itemId} but the self app-class lookup returned null -- if this IS the MCP server, #237 self-deploy error capture is disabled for this deploy.")
@@ -17627,12 +17658,6 @@ private Map toolUpdateItemCodeInner(String type, String idParam, args, Map packa
     try {
         def parsed = _postItemSave(type, itemIdInt, sourceCode, sentVersion, isSelfUpdate, itemId)
         def stale = _staleVersionRejection(parsed)
-        if (stale != null && expectedVersion == null && stale.currentVersion != null) {
-            mcpLog("info", "hub-admin", "${type} ID ${itemId}: version ${sentVersion} was stale, retrying the save at the hub's version ${stale.currentVersion}")
-            sentVersion = stale.currentVersion
-            parsed = _postItemSave(type, itemIdInt, sourceCode, sentVersion, isSelfUpdate, itemId)
-            stale = _staleVersionRejection(parsed)
-        }
         sourceCode = null
         if (stale != null) return _versionConflictResult(type, idParam, itemId, sentVersion, stale.currentVersion)
         def success = false
@@ -17768,7 +17793,7 @@ private Map toolUpdateItemCodeInner(String type, String idParam, args, Map packa
                 note: "Check the Groovy source code for syntax errors or compilation issues.",
                 lastBackup: formatTimestamp(state.lastBackupTimestamp)
             ]
-            if (_isConcurrentSaveRefusal(errorMsg)) {
+            if (_isConcurrentSaveRefusal(type, errorMsg)) {
                 out.note = _concurrentSaveNote(type)
                 out.retryable = true
             }
@@ -17805,14 +17830,14 @@ private Map toolUpdateItemCodeInner(String type, String idParam, args, Map packa
 }
 private Integer _expectedVersionArg(args) {
     if (!(args instanceof Map) || !args.containsKey('expectedVersion')) return null
-    if (args.expectedVersion == null) {
+    def version = args.expectedVersion
+    if (version == null) {
         throw new IllegalArgumentException("expectedVersion was supplied as null. Omit the field entirely to skip the optimistic-lock check, or pass an integer.")
     }
-    try {
-        return args.expectedVersion as Integer
-    } catch (NumberFormatException | ClassCastException coerceErr) {
-        throw new IllegalArgumentException("expectedVersion must be an integer (got '${args.expectedVersion}'): ${coerceErr.message}")
+    if (!(version instanceof Integer || version instanceof Long) || version < 0 || version > 2147483647L) {
+        throw new IllegalArgumentException("expectedVersion must be an integer (got '${version}'): pass the version number hub_get_source returned, unchanged.")
     }
+    return version as Integer
 }
 private _postItemSave(String type, Integer itemIdInt, String sourceCode, version, boolean isSelfUpdate, itemId) {
     String savePath = type == "app" ? "/app/saveOrUpdateJson" : "/driver/saveOrUpdateJson"
@@ -17833,21 +17858,26 @@ private Map _staleVersionRejection(parsed) {
     def m = msg =~ /(?i)current version is (\d+)/
     return [currentVersion: m.find() ? (m.group(1) as Integer) : null]
 }
-private boolean _isConcurrentSaveRefusal(msg) {
-    return msg != null && (msg.toString() =~ /SQLException/).find()
+private boolean _isConcurrentSaveRefusal(String type, msg) {
+    String text = msg?.toString()?.trim()
+    if (!text) return false
+    if (type == "driver") return text == "java.sql.SQLException: Failed to update device type"
+    return type == "app" && text ==~ /\.\/appTargetDir\/user_app_.+_\d+\.groovy/
 }
 private String _concurrentSaveNote(String type) {
-    return "The hub's database refused the save, which happens when another save of this ${type} runs at the same moment; the source itself was not rejected. Wait a moment, re-read the ${type} (its version may have changed), then retry. Send saves of the same ${type} one at a time.".toString()
+    return "This is the hub's answer when another save of this ${type} runs at the same moment; the source itself was not rejected. Wait a moment, re-read the ${type} (its version may have changed), then retry. Send saves of the same ${type} one at a time. See ${_codeGuidePointer()}.".toString()
 }
+private String _codeGuidePointer() { "hub_get_tool_guide(section='hub_admin_write_code')" }
 private Map _versionConflictResult(String type, String idParam, itemId, sentVersion, currentVersion) {
     String hubSide = currentVersion != null ? "hub has ${currentVersion}" : "the hub reports a different version"
-    mcpLog("warn", "hub-admin", "${type} update ID ${itemId} refused by the hub: version ${sentVersion} is stale (${hubSide}); nothing was written")
+    mcpLog("warn", "hub-admin", "${type} update ID ${itemId} refused: version ${sentVersion} is stale (${hubSide}); nothing was written")
     def out = [
         success: false,
         error: "Optimistic-lock conflict: expected ${type} version ${sentVersion} but ${hubSide}. Nothing was written. Re-read the source and retry with the new expectedVersion.".toString(),
         (idParam): itemId,
         expectedVersion: sentVersion,
         conflict: true,
+        note: "Another save changed this ${type}. Read it again with hub_get_source, reapply your change to that source, and pass its version as expectedVersion. See ${_codeGuidePointer()}.".toString(),
         lastBackup: formatTimestamp(state.lastBackupTimestamp)
     ]
     if (currentVersion != null) out.currentVersion = currentVersion
@@ -17992,7 +18022,7 @@ def toolUpdateDriverCode(args) {
         if (args.updates.isEmpty()) {
             throw new IllegalArgumentException("'updates' array must not be empty.")
         }
-        def bulkEntryKeys = ["driverId", "sourceFile", "source", "importUrl", "resave", "backup", "expectedVersion"]
+        List bulkEntryKeys = _toolCatalogIndexes().updateEntryArgs.hub_update_driver
         def itemResults = []
         def allSucceeded = true
         for (int idx = 0; idx < args.updates.size(); idx++) {
@@ -18010,7 +18040,7 @@ def toolUpdateDriverCode(args) {
             }
             def unknownKeys = item.keySet().collect { it as String }.findAll { !(it in bulkEntryKeys) }
             if (unknownKeys) {
-                itemResults << [driverId: item.driverId.toString(), success: false, error: "Unknown updates[] argument${unknownKeys.size() == 1 ? '' : 's'}: ${unknownKeys.sort().join(', ')}. Nothing was changed for this driver. Valid arguments: ${bulkEntryKeys.join(', ')}."]
+                itemResults << [driverId: item.driverId.toString(), success: false, error: "Unknown updates[] argument${unknownKeys.size() == 1 ? '' : 's'}: ${unknownKeys.sort().join(', ')}. Nothing was changed for this driver. Valid arguments: ${bulkEntryKeys.join(', ')}.", note: "Correct or remove the key and send this entry again. See ${_codeGuidePointer()}.".toString()]
                 allSucceeded = false
                 continue
             }
@@ -18030,6 +18060,7 @@ def toolUpdateDriverCode(args) {
                 } else {
                     entry.error = r.error ?: "Update failed"
                     if (r.note) entry.note = r.note
+                    if (r.retryable) entry.retryable = true
                     if (r.lastBackup) entry.lastBackup = r.lastBackup
                     if (r.conflict) {
                         entry.conflict = true
@@ -18419,8 +18450,7 @@ def toolUpdateLibraryCode(args) {
             return unavailable + [libraryId: libraryId]
         }
     }
-    def sentVersion = expectedVersion
-    if (sentVersion == null) sentVersion = freshVersion
+    def sentVersion = freshVersion
     if (sentVersion == null && backupEntry?.fresh == true) sentVersion = backupEntry.version
     def versionFetchError = null
     if (sentVersion == null) {
@@ -18432,36 +18462,28 @@ def toolUpdateLibraryCode(args) {
             versionFetchError = vErr.message ?: vErr.toString()
             mcpLog("warn", "hub-admin", "Could not read the current version of library ID ${libraryId}: ${versionFetchError}")
         }
-        if (sentVersion == null) sentVersion = backupEntry?.version
+        if (sentVersion == null && expectedVersion == null) sentVersion = backupEntry?.version
     }
     if (sentVersion == null) {
-        throw new IllegalArgumentException("Could not determine current version for library ID ${libraryId} -- version fetch failed (${versionFetchError ?: 'unknown'}) and no backup has a version. Check that the library exists.")
+        throw new IllegalArgumentException("Could not determine current version for library ID ${libraryId} -- version fetch failed (${versionFetchError ?: 'unknown'}) and no usable backup has a version. Check that the library exists.")
+    }
+    if (expectedVersion != null && sentVersion.toString() != expectedVersion.toString()) {
+        return _versionConflictResult("library", "libraryId", libraryId, expectedVersion, sentVersion)
     }
     mcpLog("info", "hub-admin", "Updating library ID: ${libraryId} (version: ${sentVersion}, mode: ${sourceMode}, sourceLength: ${sourceCode.length()})")
     try {
         def result = _postLibrarySave(libraryId, sourceCode, sentVersion)
         def stale = _staleVersionRejection(result)
-        if (stale != null && expectedVersion == null && stale.currentVersion != null) {
-            mcpLog("info", "hub-admin", "library ID ${libraryId}: version ${sentVersion} was stale, retrying the save at the hub's version ${stale.currentVersion}")
-            sentVersion = stale.currentVersion
-            result = _postLibrarySave(libraryId, sourceCode, sentVersion)
-            stale = _staleVersionRejection(result)
-        }
         if (stale != null) return _versionConflictResult("library", "libraryId", libraryId, sentVersion, stale.currentVersion)
         if (result?.success == false) {
             def msg = result?.message ?: "Hub returned failure"
             mcpLog("warn", "hub-admin", "Library update failed: ${msg}")
-            def out = [
+            return [
                 success: false,
                 error: "Library update failed: ${msg}",
                 libraryId: libraryId,
                 note: "Check the Groovy source code for syntax errors or compilation issues."
             ]
-            if (_isConcurrentSaveRefusal(msg)) {
-                out.note = _concurrentSaveNote("library")
-                out.retryable = true
-            }
-            return out
         }
         mcpLog("info", "hub-admin", "Library ID ${libraryId} updated successfully (mode: ${sourceMode})")
         def successResult = [
@@ -18998,14 +19020,14 @@ A transport drop can lose the response while the hub still commits this write; v
         ],
         [
             name: "hub_get_app_config",
-            description: """Read an installed classic app's page as the Hubitat UI renders it: the app's identity, the page's sections with each input's current value, and its child apps. The pages it links to are listed in page.hrefs. controls lists the page's buttons and links with the control_id that hub_set_native_app or hub_set_rule(operation:'form') activates, and pageNote says when the hub rendered another page than pageName. Secret values are redacted unless Hide passwords and credentials is off (always for a per-client token).""",
+            description: """Read an installed classic app's page as the Hubitat UI renders it: the app's identity, the page's sections with each input as hub_set_native_app(operation:'form') returns it, and its child apps and devices. The pages it links to are listed in page.hrefs. controls lists the page's buttons and links with the control_id that hub_set_native_app or hub_set_rule(operation:'form') activates, and pageNote says when the hub rendered another page than pageName. Secret values are redacted unless Hide passwords and credentials is off (always for a per-client token).""",
             inputSchema: [
                 type: "object",
                 properties: [
                     appId: [type: "string", description: "Installed-app ID (decimal). From hub_list_apps (scope='instances'), hub_list_rules, or the numeric id in the Hubitat UI URL (/installedapp/configure/<id>)."],
                     pageName: [type: "string", description: "The page to read instead of the default page: a page.hrefs[].page name from a page of this app already read."],
                     includeSettings: [type: "boolean", description: "Include the raw app-internal settings key-value map (default false). Set true only for power-user inspection.", default: false],
-                    summary: [type: "boolean", description: "Fast identity-only read: returns the thin app record (id, name, type, disabled, user), no config page; pageName/includeSettings ignored.", default: false]
+                    summary: [type: "boolean", description: "Fast identity-only read: returns the thin app record (id, name, type, disabled, user) and the type's namespace, no config page; pageName/includeSettings ignored.", default: false]
                 ],
                 required: ["appId"]
             ]
@@ -21050,15 +21072,23 @@ private Map _rmRestoreViaNativeImport(Map snapshot, Integer savedId, boolean exi
         return [fallback: "device(s) ${deadDevices.join(', ')} named by the App Cloner export no longer exist".toString()]
     }
     Integer hint = exists ? savedId : null
+    Integer seed = null
     if (hint == null) {
         try {
-            def kids = _appClonerSnapshotChildren(_discoverParentAppId(snapshot?.appType ?: "rule_machine"))
+            def parentId = _discoverParentAppId(snapshot?.appType ?: "rule_machine")
+            def kids = _appClonerSnapshotChildren(parentId)
+            if (kids?.isError) throw new IllegalStateException(kids.error?.toString())
             hint = (kids?.ids ?: []).collect { it.toString() }.find { it.isInteger() }?.toInteger()
+            if (hint == null) {
+                _requireUnprotectedAppMutation(parentId, "restore a child app under")
+                String seedType = (_appTypeRegistry()[snapshot?.appType ?: "rule_machine"]?.appName ?: "Rule-5.1").toString()
+                seed = hint = _rmCreateChildApp(parentId as Integer, "hubitat", seedType)
+            }
         } catch (Exception e) {
-            mcpLog("warn", "rm-native", "Restore of app ${savedId}: finding a Rule Machine rule to seed the import failed (${e.message})")
+            mcpLog("warn", "rm-native", "Restore of app ${savedId}: finding or creating a Rule Machine rule to seed the import failed (${e.message})")
             hint = null
         }
-        if (hint == null) return [fallback: "no Rule Machine rule was found to seed the App Cloner import"]
+        if (hint == null) return [fallback: "no Rule Machine rule was found or could be created to seed the App Cloner import"]
     }
     if (exists) {
         try { _requireUnprotectedAppDeletion(savedId) } catch (IllegalArgumentException protExc) {
@@ -21072,6 +21102,11 @@ private Map _rmRestoreViaNativeImport(Map snapshot, Integer savedId, boolean exi
     } catch (Exception impExc) {
         mcpLog("error", "rm-native", "Restore of app ${savedId}: the App Cloner import threw (${impExc.message})")
         imp = [success: false, clonerAppId: -1, error: impExc.message ?: impExc.toString()]
+    } finally {
+        if (seed != null) {
+            try { _rmForceDeleteApp(seed) }
+            catch (Exception seedExc) { mcpLog("warn", "rm-native", "Restore of app ${savedId}: the empty seed rule ${seed} could not be deleted (${seedExc.message}); delete it with hub_delete_native_app") }
+        }
     }
     Integer newId = imp?.newAppId as Integer
     if (newId == null) {
@@ -21297,7 +21332,11 @@ private void _rmNativeRestoreFlags(Long id, Map savedState) {
     if ((live.paused == true) != (savedState.paused == true)) _nrHandle(id).appButtonHandler('pausRule')
 }
 private String _rmLabelName(label) {
-    (label?.toString() ?: '').replaceAll(/\s*<span style='color:[a-z]+'>[^<]*<\/span>/, '')
+    (label?.toString() ?: '').replaceAll(/(?:\s*<span\b[^>]*>\s*(?:\*BROKEN\*|\((?:Not Installed|Stopped|Paused|Required Expression false|Repeating)\))\s*<\/span>)+\s*$/, '')
+}
+private boolean _rmLabelCarriesName(label, String name) {
+    String live = label?.toString() ?: ''
+    live == name || (live.startsWith(name) && _rmLabelName(live.substring(name.length())).trim().isEmpty())
 }
 private String _rmRestoredRuleName(List plan, Map identity) {
     def name = plan.find { it.name == 'origLabel' }?.value
@@ -21383,7 +21422,7 @@ private Map _rmRestoreNativeEdit(Map snapshot, String sourceBackupKey) {
         if (_rmNativeComparable(actualLocals) != _rmNativeComparable(_rmNativeLocalSignature(expectedState))) throw new IllegalStateException('Native local variables differ from recovery')
         if (_rmNativeComparable(_rmNativeSettingsSignature(_rmUnredactedSettings(id, redacted))) != _rmNativeComparable(_rmNativeSettingsSignature(data.appSettings))) throw new IllegalStateException('Native rebuild changed restored settings')
         if ((actual.stopped == true) != (expectedState.stopped == true) || (actual.paused == true) != (expectedState.paused == true) ||
-            _rmLabelName(_nrHandle(id).label) != restoredName) throw new IllegalStateException('Native label or lifecycle state differs from recovery')
+            !_rmLabelCarriesName(_nrHandle(id).label, restoredName)) throw new IllegalStateException('Native label or lifecycle state differs from recovery')
         Map restored = [success: true, type: 'rm-rule', ruleId: id, originalRuleId: id, restoredVia: 'nativeStateReplay', backup: undo,
          stateVerified: true, settingsVerified: true, localVariablesVerified: true, broken: rebuilt.broken, stopped: rebuilt.stopped, paused: rebuilt.paused,
          eventSubscriptions: rebuilt.eventSubscriptions, scheduledJobs: rebuilt.scheduledJobs]
@@ -23478,7 +23517,7 @@ private Map _rmDecodeRuleExport(Integer ruleId, Object raw) {
 }
 Map _rmBackupRuleSnapshot(Integer ruleId, String reason, boolean requireNativeExport = false, String protectedKey = null, String activePage = null) {
     def built = requireNativeExport ? _rmBuildNativeEditSnapshot(ruleId, reason, _rmCaptureRuleExport(ruleId)) : _rmBuildRuleSnapshot(ruleId, reason, activePage)
-    return _withBackupLock("rule ${ruleId} snapshot (${reason})") { _rmWriteRuleSnapshotLocked(ruleId, reason, built.snapshot as Map, built.config as Map, protectedKey) }
+    return _withBackupLock("rule ${ruleId} snapshot (${reason})") { _rmWriteRuleSnapshotLocked(ruleId, reason, built.snapshot as Map, protectedKey) }
 }
 private Set _rmRedactSnapshotPasswords(Map config, Map status) {
     Set names = [] as Set
@@ -23530,7 +23569,7 @@ private Map _rmBuildNativeEditSnapshot(Integer ruleId, String reason, String cap
         nativeExport: nativeExport, configJson: config,
         statusJson: [appSettings: settingRows, appState: data.state.collect { key, value -> [name: key, value: value] }]]
     if (redacted) snapshot.redactedSettings = redacted.toList().sort()
-    [snapshot: snapshot, config: config]
+    [snapshot: snapshot]
 }
 private Map _rmBuildRuleSnapshot(Integer ruleId, String reason, String activePage = null) {
     def config
@@ -23634,9 +23673,9 @@ private Map _rmBuildRuleSnapshot(Integer ruleId, String reason, String activePag
         }
     }
     if (redacted) snapshot.redactedSettings = redacted.toList().sort()
-    return [snapshot: snapshot, config: config]
+    return [snapshot: snapshot]
 }
-private Map _rmWriteRuleSnapshotLocked(Integer ruleId, String reason, Map snapshot, Map config, String protectedKey = null) {
+private Map _rmWriteRuleSnapshotLocked(Integer ruleId, String reason, Map snapshot, String protectedKey = null) {
     def ts = new Date(now()).format("yyyyMMdd-HHmmss-SSS")
     String namePrefix = "mcp-rm-backup-${ruleId}-"
     String nameExt = ".json"
@@ -23681,7 +23720,6 @@ private Map _rmWriteRuleSnapshotLocked(Integer ruleId, String reason, Map snapsh
     _publishUploadedItemBackup(backupKey, entry, protectedKey)
     mcpLog("info", "rm-native", "Backed up rule ${ruleId} (${reason}) to ${fileName} (${jsonBytes.length} bytes)")
     return [backupKey: backupKey,
-            brokenBefore: (config == null ? null : _rmConfigHasBrokenMarkers(config)),
             baselineReused: false,
             rollbackScope: "Restoring this baseline returns rule ${ruleId} to its state at ${formatTimestamp(snapshot.timestamp as Long)}."] +
         entry + [retentionNote: _itemBackupRetentionNote()]
@@ -23722,20 +23760,6 @@ private Map _rmReadLocalVarsMap(Integer appId) {
         if (n?.startsWith("lv_") && e.value instanceof Map) live.put(n.substring(3), e.value)
     }
     return [ok: true, vars: (raw instanceof Map) ? raw : [:], live: live]
-}
-private boolean _rmConfigHasBrokenMarkers(config) {
-    if (!(config instanceof Map)) return false
-    def sections = config?.configPage?.sections ?: []
-    def texts = (sections as List).collectMany { sect ->
-        def fromBody = (sect?.body ?: [])
-            .findAll { b -> b instanceof Map && (b.element == "paragraph" || b.element == "href") }
-            .collect { it.description?.toString() ?: "" }
-        def fromParagraphs = (sect?.paragraphs ?: []).collect { it?.toString() ?: "" }
-        fromBody + fromParagraphs
-    }
-    return texts.any { text ->
-        ["**Broken Trigger**", "**Broken Action**", "**Broken Condition**"].any { text.contains(it) }
-    }
 }
 Set _rmCollectPageInputNames(Integer appId, String pageName, Map cache = null) {
     def cfg = _rmFetchConfigJson(appId, pageName, cache)
@@ -24401,13 +24425,16 @@ private boolean _rmReusableBackupFileMatches(Map entry, Integer ruleId) {
     }
 }
 Map _rmBackupBeforeEdit(Integer ruleId, String reason, String activePage = null) {
-    def reused = _withBackupLock("rule ${ruleId} baseline (${reason})") { _rmBackupBeforeEditLocked(ruleId, reason, activePage) }
+    def reused = _withBackupLock("rule ${ruleId} baseline (${reason})") { _rmBackupBeforeEditLocked(ruleId, reason) }
     return reused ?: _rmBackupRuleSnapshot(ruleId, reason, false, null, activePage)
 }
-private Map _rmBackupBeforeEditLocked(Integer ruleId, String reason, String activePage = null) {
+private Map _rmBackupBeforeEditLocked(Integer ruleId, String reason) {
     if (_effectiveBackupSetting('backupEveryRuleWrite') == 'true') return null
     def mfst = _itemBackupManifest()
     def recent = _rmRecentRuleBackup(mfst, ruleId, now())
+    if (recent != null && getAppByAppId(ruleId as Long) == null) {
+        throw new IllegalArgumentException("No rule/app with id ${ruleId} exists on this hub. Nothing was changed. Use hub_list_rules for valid ids. See hub_get_tool_guide(section='builtin_app_tools_crud').")
+    }
     if (recent != null && !_rmReusableBackupFileMatches(recent.value as Map, ruleId)) {
         def staleFile = recent.value?.fileName?.toString()
         mcpLog("warn", "rm-native", "Recent backup ${recent.key} for rule ${ruleId} is missing or does not match its manifest; discarding the stale handle and taking a fresh baseline")
@@ -24417,22 +24444,8 @@ private Map _rmBackupBeforeEditLocked(Integer ruleId, String reason, String acti
     }
     if (recent != null) {
         _repairItemBackupRetention(mfst, recent.key.toString(), recent.value as Map)
-        def config = null
-        try {
-            config = activePage ? _rmFetchConfigJson(ruleId, activePage) : _rmFetchConfigJson(ruleId)
-        } catch (Exception e) {
-            def vrbFallback = null
-            try { vrbFallback = _vrbDetect(ruleId) } catch (Exception ignored) { }
-            if (vrbFallback == null) {
-                if (e.message?.contains("404")) {
-                    throw new IllegalArgumentException("No rule/app with id ${ruleId} exists on this hub (configure/json returned 404). Nothing was changed. Use hub_list_rules for valid ids. See hub_get_tool_guide(section='builtin_app_tools_crud').")
-                }
-                mcpLog("warn", "rm-native", "Could not read rule ${ruleId} before reusing backup '${recent.key}' (${e.message ?: e}); continuing without the internal brokenBefore diagnostic")
-            }
-        }
         mcpLog("info", "rm-native", "Reusing recent backup ${recent.key} for rule ${ruleId} (${reason}); restoring it reverts every edit since ${formatTimestamp(recent.value.timestamp as Long)}")
         return [backupKey: recent.key,
-                brokenBefore: (config == null ? null : _rmConfigHasBrokenMarkers(config)),
                 baselineReused: true,
                 rollbackScope: "Restoring this baseline reverts every edit to rule ${ruleId} since ${formatTimestamp(recent.value.timestamp as Long)}."] +
             new LinkedHashMap(recent.value as Map)
@@ -24450,7 +24463,6 @@ private Map _naOperationSchema(String operation) {
     throw new IllegalArgumentException('Unknown native app operation; use create, update or form')
 }
 Map toolSetNativeApp(Map request) {
-    if (request.keySet().any { !(it in ['operation', 'app_id', 'args', 'confirm', 'bestPracticeKey']) }) throw new IllegalArgumentException('Unknown hub_set_native_app property; use operation, app_id, args and confirm')
     if (request.containsKey('confirm') && !(request.confirm instanceof Boolean)) throw new IllegalArgumentException('confirm must be boolean')
     if (request.containsKey('app_id')) _ndValidateSchema(request.app_id, [type: 'integer', minimum: 1], 'app_id', true)
     if (request.containsKey('args') && !(request.args instanceof Map)) throw new IllegalArgumentException('args must be an object')
@@ -25008,21 +25020,18 @@ private Object _nrComparableSetting(String type, Object value) {
     }
     value.toString()
 }
-boolean _nrIsDeviceType(String type) { type == 'capability' || type?.startsWith('capability.') == true }
+boolean _nrIsDeviceType(String type) { type == 'capability' || type?.startsWith('capability.') == true || type?.startsWith('device.') == true }
 private void _nrCheckSettingRow(Object row) {
-    if (!(row instanceof Map) || !(row.name instanceof String) || !row.name || !(row.type instanceof String) || !row.containsKey('value') || row.keySet().any { !(it in ['name', 'type', 'value']) }) {
+    if (!(row instanceof Map) || !(row.name instanceof String) || !row.name || !(row.type instanceof String) || !row.type.trim() || !row.containsKey('value') || row.keySet().any { !(it in ['name', 'type', 'value']) }) {
         throw new IllegalArgumentException('Each setting requires name, type and value')
     }
-    boolean device = _nrIsDeviceType(row.type)
-    if (!(row.type in ['text', 'textarea', 'password', 'enum', 'mode', 'bool', 'number', 'decimal', 'time']) && !device) throw new IllegalArgumentException('Unsupported native setting type')
     if (row.value == null) throw new IllegalArgumentException('Null setting values are unsupported; they do not reliably clear native settings')
     if (row.value instanceof List) {
-        if (!device && !(row.type in ['enum', 'mode'])) throw new IllegalArgumentException('Lists require enum, mode or capability type')
         if (row.value.any { !(it instanceof String || it instanceof Number || it instanceof Boolean) }) throw new IllegalArgumentException('Setting lists require scalar values')
     } else if (!(row.value instanceof String || row.value instanceof Number || row.value instanceof Boolean)) {
         throw new IllegalArgumentException('Unsupported native setting value')
     }
-    if (device && (row.value instanceof List ? row.value : [row.value]).any { !it.toString().isLong() || it.toString().toLong() <= 0L }) throw new IllegalArgumentException('Capability settings require positive device IDs')
+    if (_nrIsDeviceType(row.type) && (row.value instanceof List ? row.value : [row.value]).any { !it.toString().isLong() || it.toString().toLong() <= 0L }) throw new IllegalArgumentException('Device picker settings require positive device IDs')
 }
 Map _nrWriteSettings(Long ruleId, List rows) {
     if (rows == null) throw new IllegalArgumentException('Setting rows are required')
@@ -25128,6 +25137,12 @@ private void _nrValidateScalar(Map field, Object value, boolean allowClear = fal
         catch (Exception ignored) { throw new IllegalArgumentException("Invalid native time for ${field.name}") }
     }
     if (field.type in ['number', 'decimal'] && !(allowClear && value.toString() == '') && !value.toString().isBigDecimal()) throw new IllegalArgumentException("Numeric value required for ${field.name}")
+    if (field.type == 'date' && !(allowClear && value == '')) {
+        boolean valid = value instanceof String && value ==~ /\d{4}-\d{2}-\d{2}/
+        try { valid = valid && Date.parse('yyyy-MM-dd', value).format('yyyy-MM-dd') == value }
+        catch (Exception ignored) { valid = false }
+        if (!valid) throw new IllegalArgumentException("Date required as yyyy-MM-dd for ${field.name}")
+    }
 }
 private void _nrValidateInput(Map field, Object value, boolean allowClear = false) {
     if (value == null) throw new IllegalArgumentException("Use an empty string or list to clear ${field.name}")
@@ -25135,9 +25150,9 @@ private void _nrValidateInput(Map field, Object value, boolean allowClear = fals
     List values = value instanceof List ? value : [value]
     if (values.any { !(it instanceof String || it instanceof Number || it instanceof Boolean) }) throw new IllegalArgumentException("Scalar values are required for ${field.name}")
     if (field.required && (!values || values.any { it.toString() == '' })) throw new IllegalArgumentException("Required field: ${field.name}")
-    boolean device = _nrIsDeviceType(field.type) || field.type.startsWith('device.')
+    boolean device = _nrIsDeviceType(field.type)
     List options = device ? _nrDeviceChoices(field).collect { it.id.toString() } : (field.containsKey('option_keys') ? field.option_keys : _nrChoiceKeys(field.options))
-    if ((device || field.type in ['enum', 'mode']) && options == null) throw new IllegalArgumentException("Native choices are unavailable for ${field.name}")
+    if ((device || field.type in ['enum', 'mode', 'menu']) && options == null) throw new IllegalArgumentException("Native choices are unavailable for ${field.name}")
     if (options != null && values.any { !(allowClear && it.toString() == '') && !(it.toString() in options) }) throw new IllegalArgumentException("Invalid native choice for ${field.name}")
     _nrValidateScalar(field, value, allowClear)
     if (field.type in ['number', 'decimal'] && !(allowClear && value.toString() == '')) {
@@ -25162,17 +25177,7 @@ private List _nmFields(List fields, String id) {
         if (!(row instanceof Map) || !(row.name instanceof String) || !row.name.contains('#') || !(row.type instanceof String) || !row.containsKey('value') || row.keySet().any { !(it in ['name', 'type', 'value']) }) {
             throw new IllegalArgumentException('Fields require native name templates containing #, type and value')
         }
-        boolean device = row.type == 'capability' || row.type.startsWith('capability.')
-        if (!(row.type in ['text', 'textarea', 'password', 'enum', 'mode', 'bool', 'number', 'decimal', 'time']) && !device) throw new IllegalArgumentException('Unsupported native setting type')
-        if (row.value == null) throw new IllegalArgumentException('Null native setting values are unsupported')
-        if (row.value instanceof List) {
-            if (!device && !(row.type in ['enum', 'mode'])) throw new IllegalArgumentException('Setting lists require enum, mode or capability type')
-            if (row.value.any { !(it instanceof String || it instanceof Number || it instanceof Boolean) }) throw new IllegalArgumentException('Setting lists require scalar values')
-        } else if (!(row.value instanceof String || row.value instanceof Number || row.value instanceof Boolean)) throw new IllegalArgumentException('Native settings require scalar values')
-        if (device) {
-            List ids = row.value instanceof List ? row.value : [row.value]
-            if (ids.any { !it.toString().isLong() || it.toString().toLong() <= 0L }) throw new IllegalArgumentException('Capability settings require positive device IDs')
-        }
+        _nrCheckSettingRow(row)
         [name: row.name.replace('#', id), type: row.type, value: row.value]
     }
     if (result.collect { it.name }.unique().size() != result.size()) throw new IllegalArgumentException('Native inputs must not be repeated')
@@ -25202,7 +25207,7 @@ Map _nmValidateInputs(Object page, List fields) {
             else if (!descriptor.containsKey('multiple') && row.value instanceof List) reason = 'native list cardinality is not exposed'
             else if (descriptor.containsKey('multiple') && descriptor.multiple != (row.value instanceof List)) reason = descriptor.multiple ? 'native input requires a list' : 'native input requires a scalar'
             else if (descriptor.required == true && (row.value == null || (row.value instanceof List && row.value.isEmpty()) || (row.value instanceof String && !row.value.trim()))) reason = 'required native input is empty'
-            else if (descriptor.type in ['text', 'textarea', 'password', 'time'] && !(row.value instanceof String)) reason = 'native text input requires a string value'
+            else if (!(descriptor.type in ['bool', 'number', 'decimal', 'enum', 'mode', 'menu']) && !_nrIsDeviceType(descriptor.type) && !(row.value instanceof String)) reason = 'native text input requires a string value'
             else {
                 try { _nrValidateInput([:] + descriptor + [multiple: descriptor.multiple == true], row.value) }
                 catch (Exception failure) { reason = failure.message ?: 'native descriptor validation failed' }
@@ -25383,7 +25388,7 @@ private void _nmRestoreSettings(Long ruleId, Map savedSettings) {
         if (current.get(name) != original) {
             if (current.get(name)?.type != original.type) _nrHandle(ruleId).removeSetting(name)
             def value = original.value
-            if (original.type == 'capability' || original.type?.startsWith('capability.')) {
+            if (_nrIsDeviceType(original.type)) {
                 List devices = original.deviceList instanceof Map ? original.deviceList.keySet().collect { it.toString() } : []
                 value = original.multiple == true ? devices : (devices ? devices.get(0) : null)
             } else if (original.multiple == true && value instanceof String) value = new groovy.json.JsonSlurper().parseText(value)
@@ -25404,13 +25409,17 @@ private void _nmRefreshHealth(Long ruleId, Map baseline) {
 }
 private boolean _nmActionLabel(Long ruleId, String id) {
     Map before = _nrState(ruleId)
-    List keys = ['actLabelIndent', 'nestedLabel', 'inIf', 'inRepeat']
+    List keys = ['actLabelIndent', 'nestedLabel', 'inIf', 'inRepeat', 'broken']
     Map format = before.findAll { key, value -> key in keys }
     if (format.nestedLabel instanceof List) format.put('nestedLabel', new ArrayList(format.nestedLabel))
     def label
-    try { label = _nrHandle(ruleId).thisActionLabel(id) }
-    finally { _nrStatePatch(ruleId, format, keys.findAll { !format.containsKey(it) }) }
-    label instanceof String && label.trim() && !(label =~ /(?is)<span\b[^>]*color\s*:\s*red[^>]*>[^<]*\*\*Broken [^*]+\*\*/)
+    boolean broken
+    try {
+        _nrStatePatch(ruleId, [broken: false])
+        label = _nrHandle(ruleId).thisActionLabel(id)
+        broken = _nrState(ruleId).broken == true
+    } finally { _nrStatePatch(ruleId, format, keys.findAll { !format.containsKey(it) }) }
+    label instanceof String && label.trim() && !broken && !(label =~ /<span\b[^>]*>\s*\*\*Broken [^*]+\*\*\s*<\/span>/).find()
 }
 private Map _nmRejectEdit(Long ruleId, String id, Map baseline, Map savedSettings, List keys, Map entries, Closure cancel, Map failure) {
     String cleanupError = null
@@ -25516,7 +25525,7 @@ Map _nmUpsertCondition(Long ruleId, boolean trigger, Map row) {
         def label = _nmEntry(after.get(collection) instanceof Map ? after.get(collection) : [:], id)
         Map echoed = _nrSettings(ruleId, settings.collect { it.name })
         boolean persisted = settings.every { echoed.get(it.name)?.type?.toString() == it.type && _nrComparableSetting(it.type, echoed.get(it.name)?.value) == _nrComparableSetting(it.type, it.value) }
-        String bare = label instanceof String ? label.replaceAll(/\(?<span style='color:black'>\(?[^<]*\)?<\/span>\)?/, '') : null
+        String bare = label instanceof String ? label.replaceAll(/\(?<span (?:style='color:black'|class='text-color')>\(?[^<]*\)?<\/span>\)?/, '') : null
         boolean compiled = bare?.trim() && !bare.contains('null') && !bare.contains('BROKEN')
         if (!(compiled && persisted && membership)) return _nmRejectCondition(ruleId, trigger, editing, id, baseline, savedSettings, settings, render,
             [error: compiled ? 'Native input persistence failed' : 'Native row did not compile a valid label', compiledLabel: label?.toString()])
@@ -25899,10 +25908,6 @@ private List _ndPageIssues(Object node) {
     def issues = []
     if (node instanceof List) node.each { child -> issues.addAll(_ndPageIssues(child)) }
     else if (node instanceof Map) {
-        if ((node.type ?: node.element) in ['paragraph', 'href']) {
-            def description = node.description?.toString() ?: ''
-            if (description =~ /(?is)<span\b[^>]*color\s*:\s*red[^>]*>[^<]*\*\*Broken [^*]+\*\*/) issues << 'Native editor reports a broken condition, trigger or action'
-        }
         if (node.error || node.errors) issues << 'Native editor returned an error'
         ['sections', 'body', 'children'].each { key -> if (node.get(key) != null) issues.addAll(_ndPageIssues(node.get(key))) }
     }
@@ -26213,6 +26218,11 @@ private Map _ndApply(Long id, List changes, boolean created) {
         Map renderedState = _nrState(id) + (health instanceof Map ? health : [:])
         def structuralIssues = _ndStructuralIssues(renderedState, _nrHandle(id).getSetting('useST') == true)
         structuralIssues.addAll(_nmValidateStructure(id, renderedState).structuralIssues ?: [])
+        Map renderedActions = renderedState.actions instanceof Map ? renderedState.actions : [:]
+        (renderedState.actionList instanceof List ? renderedState.actionList : []).collect { it.toString() }.each { actionId ->
+            def row = _nmEntry(renderedActions, actionId)
+            if (row instanceof Map && row.cond && !_nmActionLabel(id, actionId)) structuralIssues << "Native action ${actionId} is broken: its condition renders nothing".toString()
+        }
         if (structuralIssues) throw new IllegalStateException(structuralIssues.join('; '))
         if (!(health instanceof Map) || health.broken != false) return [success: false, partial: true, rule_id: id, created: created, results: outcomes, broken: health instanceof Map ? health.broken : null, error: 'Native rule health is broken or unverified', note: _ndFailureNote(true, created)]
         def done = hubInternalPostFormRaw('/installedapp/update/json', 'id=' + id.toString() + '&_action_update=Done&_cancellable=true')
@@ -26369,7 +26379,6 @@ private void _ndValidateSchema(Object value, Map schema, String path, boolean co
     } else if (schema.minimum != null && value < schema.minimum) throw new IllegalArgumentException("Invalid ${path}")
 }
 Map toolSetRule(Map request) {
-    if (request.keySet().any { !(it in ['operation', 'rule_id', 'args', 'confirm', 'bestPracticeKey']) }) throw new IllegalArgumentException('Unknown hub_set_rule property')
     if (request.containsKey('confirm') && !(request.confirm instanceof Boolean)) throw new IllegalArgumentException('confirm must be boolean')
     if (request.containsKey('rule_id')) _ndValidateSchema(request.rule_id, [type: 'integer', minimum: 1], 'rule_id', true)
     if (request.containsKey('args') && !(request.args instanceof Map)) throw new IllegalArgumentException('args must be an object')
@@ -26439,11 +26448,11 @@ Example changes: [{part:"action",value:{type:"messageActs",subtype:"getLogMsg",f
 
 hub_set_rule(operation:"form",rule_id,args:{steps:[{kind:"open"}]},confirm:true) operates an enabled Rule-5.1 or Button Rule-5.1 rule, or its Rule Machine parent; hub_set_native_app(operation:"form",app_id,...) runs the same steps on any other classic app. Read action variants, input names and option values from the returned forms instead of guessing them. Even open renders execute app code and can change state or cause side effects. An open's optional page names a registered native page, and from names the page that links to it, so a sub-page opened directly offers its Done back to that parent. Follow returned controls for page parameters and breadcrumbs. A create_child control creates the parent's native child type, returns created_app_id and closes the parent context; open the child separately to configure it. Apps are deleted with hub_delete_native_app.
 
-Submit with {kind:"submit",expect_page:"last returned page",fields:{"native field name":value},activate:"returned control_id"}; without activate it saves the fields and refreshes the page. Control IDs tell apart native buttons that share a name, such as editing and deleting the same variable. With Hide passwords and credentials on (the default), form results mask password-typed fields and fields whose names look like credentials (API keys, tokens, passwords, PINs, lock codes) with the same marker hub_get_app_config uses; with it off they read as stored, except for a per-client token. A page with both a next page and a done page renders its Done as the _action_done control, which the hub answers by saving the page and rendering that same page again. An app without pages also shows the hub's default fields, label (the app's name) and mode[mode] (a list of mode IDs from its options), and a page's own label and mode elements are the same two fields; the hub does not always keep the label posted with mode[mode], so after such a submit the label is checked and posted again on its own when the hub put back an older one (label_restored). Native enum keys, device IDs, booleans and single/multiple cardinality are checked before the request. Each submit posts the supplied settings and, as the browser does, the shown default of every other input with no stored value; a password's default is never posted, and page code can still change its own settings. args.options_for:["device field name"] expands device choices on the final returned page.
+Submit with {kind:"submit",expect_page:"last returned page",fields:{"native field name":value},activate:"returned control_id"}; without activate it saves the fields and refreshes the page. Control IDs tell apart native buttons that share a name, such as editing and deleting the same variable. With Hide passwords and credentials on (the default), form results mask password-typed fields and fields whose names look like credentials (API keys, tokens, passwords, PINs, lock codes) with the same marker hub_get_app_config uses; with it off they read as stored, except for a per-client token. A page with both a next page and a done page renders its Done as the _action_done control, which the hub answers by saving the page and rendering that same page again. An app without pages also shows the hub's default fields, label (the app's name) and mode[mode] (a list of mode IDs from its options), and a page's own label and mode elements are the same two fields; the hub does not always keep the label posted with mode[mode], so after such a submit the label is checked and posted again on its own when the hub put back an older one (label_restored). Native enum keys, device IDs, booleans and single/multiple cardinality are checked before the request. A file-text input takes the file's text, not a path. Each submit posts the supplied settings and, as the browser does, the shown default of every other input with no stored value; a password's default is never posted, and page code can still change its own settings. args.options_for:["device field name"] expands device choices on the final returned page.
 
 A batch holds 1 through 16 steps, each using the form the step before it returned, so dependent fields require another submit after they appear. A button handler runs before its step's fields are saved, as in the browser: submit the fields it needs in an earlier step. A button without submitOnChange reloads and needs a separate field submission.
 
-The context expires after five minutes or an app reload and keeps no field values, messages or option labels; limits are 24 KiB of descriptors per app, 96 KiB in all, and eight caller workflows. Opening another app replaces only that caller's context; reopen the previous app before submitting it again. expect_page guards the caller's latest context, not edits in a browser, so avoid editing concurrently. After an error, completed operations stay and the last can be uncertain: inspect the app and reopen instead of replaying buttons. Terminal navigation closes the context without following redirects; a local link or script navigation to the same app or its direct child returns navigated_app_id and navigated_page with closed:true, to open separately. No script is evaluated: app JavaScript, custom HTML inputs, uploads, external links and other unsupported browser controls are listed in unsupported. Success means the native form operation returned, not that the app's intended runtime behavior was independently verified.'''
+The context expires after five minutes or an app reload and keeps no field values, messages or option labels; limits are 24 KiB of descriptors per app, 96 KiB in all, and eight caller workflows. Opening another app replaces only that caller's context; reopen the previous app before submitting it again. expect_page guards the caller's latest context, not edits in a browser, so avoid editing concurrently. After an error, completed operations stay and the last can be uncertain: inspect the app and reopen instead of replaying buttons. Terminal navigation closes the context without following redirects; a local link or script navigation to the same app or its direct child returns navigated_app_id and navigated_page with closed:true, to open separately. No script is evaluated: app JavaScript, custom HTML inputs, external links and other unsupported browser controls are listed in unsupported. Success means the native form operation returned, not that the app's intended runtime behavior was independently verified.'''
 }
 @groovy.transform.Field static final Map NATIVE_FORM_CONTEXTS = new java.util.concurrent.ConcurrentHashMap()
 @groovy.transform.Field static final Map NATIVE_FORM_BUSY = new java.util.concurrent.ConcurrentHashMap()
@@ -26601,28 +26610,39 @@ private void _nfWalk(Object node, Map fields, Map controls, List messages, List 
             _nfControl(controls, [name: name, kind: 'button', title: _nfText(node.title), stateAttribute: node.state, disabled: _nfTrue(node.disabled),
                                   submit_on_change: _nfTrue(node.submitOnChange)])
         } else {
-            boolean device = type == 'capability' || type.startsWith('capability.') || type.startsWith('device.')
-            boolean supported = type in ['text', 'textarea', 'password', 'enum', 'mode', 'bool', 'number', 'decimal', 'time', 'email', 'phone'] || device
+            boolean device = _nrIsDeviceType(type)
+            boolean supported = type != 'download-text'
             Map field = [name: name, title: _nfText(node.title), type: type, multiple: _nfTrue(node.multiple), required: _nfTrue(node.required),
-                         submit_on_change: _nfTrue(node.submitOnChange), supported: supported, device: device, disabled: _nfTrue(node.disabled)]
-            ['range', 'min', 'max', 'step', 'description'].each { key -> if (node.containsKey(key)) field[key] = node[key] }
-            def stored = model.settings instanceof Map ? model.settings.get(name) : null
-            boolean exists = model.settings instanceof Map && model.settings.containsKey(name)
-            def current = exists ? stored : node.defaultValue
-            if (device && current instanceof Map) current = current.keySet().collect { it.toString() }
-            if (device && !field.multiple && current instanceof List) current = current ? current[0] : null
-            if (type == 'password') field.has_value = current != null && current != ''
-            if (type != 'password' || (exists && !_redactsCredentials())) { field.value = current; field.value_source = exists ? 'stored' : 'default' }
-            if (!exists && type != 'password' && current != null && current != '' && !(current instanceof Collection && current.isEmpty())) field.default_value = current
-            field.present = exists && current != null && current != '' && (!(current instanceof Collection) || !current.empty)
-            field.options = _nfOptions(type == 'mode' ? model.modeMap : node.options)
-            if (device) {
-                field.capability = type
-                field.ignore = (node.ignoreDevices instanceof List ? node.ignoreDevices : (node.ignoreDevices?.toString()?.tokenize(',') ?: [])).collect { it.toString() }
+                         submit_on_change: type == 'menu' || _nfTrue(node.submitOnChange), supported: supported, device: device, disabled: _nfTrue(node.disabled)]
+            if (!supported) {
+                field.filename = node.filename
+                field.value = node.filecontent
+            } else {
+                ['range', 'min', 'max', 'step', 'pattern', 'description'].each { key -> if (node.containsKey(key)) field[key] = node[key] }
+                def stored = model.settings instanceof Map ? model.settings.get(name) : null
+                boolean exists = model.settings instanceof Map && model.settings.containsKey(name)
+                def current = exists ? stored : ((device || type == 'menu') ? null : node.defaultValue)
+                if (device && current instanceof Map) current = current.keySet().collect { it.toString() }
+                if (device && !field.multiple && current instanceof List) current = current ? current[0] : null
+                if (type == 'password') field.has_value = current != null && current != ''
+                if (type != 'password' || (exists && !_redactsCredentials())) { field.value = current; field.value_source = exists ? 'stored' : 'default' }
+                if (!exists && type != 'password' && current != null && current != '' && !(current instanceof Collection && current.isEmpty())) field.default_value = current
+                field.present = exists && current != null && current != '' && (!(current instanceof Collection) || !current.empty)
+                if (field.present && !device) {
+                    Map checks = [:], storedValue = [:]
+                    checks.put(name, [type: type, range: field.range, pattern: node.pattern])
+                    storedValue.put(name, current)
+                    List problems = _uiNavigationViolations(checks, storedValue)
+                    if (problems) field.nav_problem = _appConfigIsSecretSetting(name, type, current) ? 'the stored value fails the page check' : problems[0].problem.toString().take(200)
+                }
+                field.options = _nfOptions(type == 'mode' ? model.modeMap : node.options)
+                if (device) {
+                    field.capability = type
+                    field.ignore = (node.ignoreDevices instanceof List ? node.ignoreDevices : (node.ignoreDevices?.toString()?.tokenize(',') ?: [])).collect { it.toString() }
+                }
             }
             if (fields.containsKey(name) && fields[name] != field) throw new IllegalStateException('Native form contains ambiguous fields')
             fields.put(name, field)
-            if (!supported) unsupported << "Input type: ${type}"
         }
     } else if (node.element == 'app' && node.namespace == 'hubitat' && node.appName instanceof String && node.appName && node.name && node.appId?.toString() == model.app?.id?.toString()) {
         _nfControl(controls, [name: node.name.toString(), value: node.appName, kind: 'create_child', title: _nfText(node.title)])
@@ -26672,7 +26692,6 @@ private Map _nfContext(Long id, Map model, String from = null) {
     if (model.paramsForPage instanceof Map) envelope.paramsForPage = _nfEncode(groovy.json.JsonOutput.toJson(model.paramsForPage))
     Map context = [app_id: id, page: [name: page.name ?: '', title: _nfText(page.title)], fields: fields, controls: controls, messages: messages.unique(),
                    unsupported: unsupported.unique(), envelope: envelope, expires: now() + 300000L]
-    if (fields.size() > 256 || controls.size() > 256) throw new IllegalStateException('Native form exceeds 256 fields or controls')
     context
 }
 private String _nfReloadPath(Long id, Map context) {
@@ -26683,10 +26702,11 @@ private String _nfReloadPath(Long id, Map context) {
     "/installedapp/configure/json/${id}" + (pages ? '/' + pages.collect { _nfEncode(it) }.join('/') : '')
 }
 private void _nfCache(String key, Map context) {
+    if (context.get('fields').size() > 256 || context.controls.size() > 256) throw new IllegalStateException('Native form exceeds 256 fields or controls')
     Map cached = [app_id: context.app_id, page: [name: context.page.name], envelope: context.envelope, expires: context.expires,
                   fields: [:], controls: [:], backup: context.backup]
     context.get('fields').each { name, field ->
-        Map descriptor = field.findAll { k, v -> k in ['name', 'type', 'multiple', 'required', 'supported', 'device', 'disabled', 'present', 'capability', 'ignore', 'range', 'min', 'max', 'step', 'default_value', 'app_field', 'sidecars', 'hub_default'] }
+        Map descriptor = field.findAll { k, v -> k in ['name', 'type', 'multiple', 'required', 'supported', 'device', 'disabled', 'present', 'capability', 'ignore', 'range', 'min', 'max', 'step', 'pattern', 'default_value', 'app_field', 'sidecars', 'hub_default', 'nav_problem'] }
         descriptor.option_keys = field.options == null ? null : field.options*.value
         if (field.app_field && name == 'label') descriptor.value = field.value
         cached.get('fields').put(name, descriptor)
@@ -26722,7 +26742,7 @@ private String _nfValue(Map field, Object value) {
     List values = value instanceof List ? value : [value]
     if (field.device) return values.collect { it.toString() }.join(',')
     if (field.multiple) return groovy.json.JsonOutput.toJson(values.collect { it.toString() })
-    if (!(field.type in ['bool', 'enum', 'mode'])) {
+    if (!(field.type in ['bool', 'enum', 'mode', 'menu', 'file-text'])) {
         String text = value.toString(), prior = null
         while (text != prior) { prior = text; text = text.replaceAll(/(?is)<!--.*?-->|<script\b[^>]*>.*?<\/script\s*>|<style\b[^>]*>.*?<\/style\s*>|<\/?[a-z](?:[^"'>]|"[^"]*"|'[^']*')*>/, '') }
         return text.replace('<', '&lt;')
@@ -26732,7 +26752,7 @@ private String _nfValue(Map field, Object value) {
 private Map _nfPublic(Map context, List optionsFor) {
     List fields = context.get('fields').values().collect { field ->
         Map result = [:] + field
-        ['device', 'ignore', 'capability', 'present', 'default_value', 'app_field', 'sidecars', 'hub_default'].each { result.remove(it) }
+        ['device', 'ignore', 'capability', 'present', 'default_value', 'app_field', 'sidecars', 'hub_default', 'nav_problem'].each { result.remove(it) }
         if (field.type == 'password' && _redactsCredentials()) result.redacted = true
         else if (field.name ==~ /(?i)access_?token/ && result.value instanceof CharSequence && result.value && _redactsAccessTokens()) result.value = _accessTokenRedactedMarker()
         else if (_appConfigMasksSetting(field.name, field.type, result.value)) { result.value = _appConfigRedactedMarker(); result.redacted = true }
@@ -26802,11 +26822,20 @@ private Map _nfPrepare(Long id, Map context, Map supplied, String activate, Stri
         if (control.kind == 'button' && !control.submit_on_change && supplied) throw new IllegalArgumentException('Submit fields separately before a button that reloads the native page')
         if (control.kind == 'button' && !control.submit_on_change) reloadPath = _nfReloadPath(id, context)
         if (control.kind in ['href', 'navigation'] && control.value != 'Cancel') {
-            List missing = context.get('fields').values().findAll { field ->
+            Map schema = [:], values = [:]
+            List stored = []
+            context.get('fields').each { name, field ->
                 String key = _nfWire(field, '').keySet().first()
-                field.required && !field.disabled && !(body.containsKey(key) ? !(body[key] in ['', '[]']) : field.present)
-            }*.name
-            if (missing) throw new IllegalArgumentException("Complete required native fields before navigating: ${missing.join(', ')}")
+                if (!body.containsKey(key) && field.present) {
+                    if (field.nav_problem && !field.disabled) stored << [name: name, problem: field.nav_problem]
+                    return
+                }
+                schema.put(name, [type: field.type, required: field.required, range: field.range, pattern: field.pattern, disabled: field.disabled])
+                values.put(name, body.containsKey(key) ? body[key] : null)
+            }
+            List problems = _uiNavigationViolations(schema, values) + stored
+            if (problems && problems.every { it.problem == 'required but empty' }) throw new IllegalArgumentException("Complete required native fields before navigating: ${problems*.name.join(', ')}")
+            if (problems) throw new IllegalArgumentException("Fix native fields before navigating: ${problems.collect { "${it.name}: ${it.problem}" }.join('; ')}")
         }
     }
     [body: body, control: control, reload: reloadPath, defaults: defaults, rejected: rejected, envelope: context.envelope, relabel: relabel]
@@ -30648,17 +30677,14 @@ private void _mrtrCleanupRecord(Map rec) {
         _cleanupError("mrtr", "Could not clean temporary appCloner ${clonerId}: ${_cleanupFailureDetail(e)}")
     }
 }
-private def _publicToolResultValue(value, boolean backupMetadata = false) {
+private def _publicToolResultValue(value) {
     if (value instanceof Map) {
         def copy = new LinkedHashMap()
-        (value as Map).each { key, child ->
-            if (backupMetadata && key?.toString() == "brokenBefore") return
-            copy.put(key, _publicToolResultValue(child, key?.toString() == "backup"))
-        }
+        (value as Map).each { key, child -> copy.put(key, _publicToolResultValue(child)) }
         return copy
     }
     if (value instanceof List) {
-        return (value as List).collect { child -> _publicToolResultValue(child, false) }
+        return (value as List).collect { child -> _publicToolResultValue(child) }
     }
     return value
 }
@@ -31862,30 +31888,34 @@ private Map _toolCatalogIndexes() {
     def cached = _toolMetadataGet("catalogIndexes")
     if (cached != null) return cached as Map
     def required = [:]
-    def strict = [:]
+    def argNames = [:]
+    def updateEntryArgs = [:]
     def names = [] as Set
     getAllToolDefinitions().each { tool ->
         String name = tool.name as String
         names << name
         def req = tool?.inputSchema?.required
         if (req instanceof List && !req.isEmpty()) required.put(name, req.collect { it as String })
-        if (tool?.inputSchema?.additionalProperties == false) {
-            strict.put(name, ((tool.inputSchema.properties ?: [:]) as Map).keySet().collect { it as String })
-        }
+        if (!_argCheckFrozen(name)) argNames.put(name, ((tool?.inputSchema?.properties ?: [:]) as Map).keySet().collect { it as String })
+        def entryProps = tool?.inputSchema?.properties?.updates?.items?.properties
+        if (entryProps instanceof Map) updateEntryArgs.put(name, entryProps.keySet().collect { it as String })
     }
-    return _toolMetadataPut("catalogIndexes", [required: required, strict: strict, names: names]) as Map
+    return _toolMetadataPut("catalogIndexes", [required: required, argNames: argNames, updateEntryArgs: updateEntryArgs, names: names]) as Map
 }
 def requiredParamsByTool() {
     return _toolCatalogIndexes().required
 }
+private boolean _argCheckFrozen(String name) {
+    return name.endsWith("_custom_rule") || name in ["hub_list_captured_states", "hub_delete_captured_state"]
+}
 def _rejectUnknownArgs(toolName, args) {
-    def allowed = _toolCatalogIndexes().strict[toolName as String]
+    def allowed = _toolCatalogIndexes().argNames[toolName as String]
     if (allowed == null || !(args instanceof Map)) return
     def unknown = (args as Map).keySet().collect { it as String }.findAll {
         !allowed.contains(it) && it != "bestPracticeKey" && !it.startsWith("__")
     }
     if (!unknown) return
-    throw new IllegalArgumentException("Unknown ${_externalToolName(toolName as String)} argument${unknown.size() == 1 ? '' : 's'}: ${unknown.sort().join(', ')}. Nothing was changed. Valid arguments: ${allowed.join(', ')}.")
+    throw new IllegalArgumentException("Unknown ${_externalToolName(toolName as String)} argument${unknown.size() == 1 ? '' : 's'}: ${unknown.sort().join(', ')}. Nothing was changed. ${allowed ? "Valid arguments: ${allowed.join(', ')}." : 'This tool takes no arguments.'}")
 }
 def _isDeviceReplaceOptionsOnlyCall(toolName, args) {
     return toolName == 'hub_call_device_replace' && (args instanceof Map) && args.list_options == true
@@ -31955,7 +31985,7 @@ def executeTool(toolName, args, boolean bpsChecked = false) {
     switch (toolName) {
         case "hub_list_devices": return toolListDevices(args)
         case "hub_get_device": return toolGetDevice(args.deviceId, args.mode ?: "summary", args.sections, args.get("fields"), args.cursor)
-        case "hub_call_device_command": return toolSendCommand(args.deviceId, args.command, args.parameters, args.waitFor, args.commands, args.__reqT0)
+        case "hub_call_device_command": return toolSendCommand(args.deviceId, args.command, args.parameters, args.waitFor, args.commands, args.__reqT0, args.includeState != false)
         case "hub_call_device_swap": return toolCallDeviceSwap(args)
         case "hub_call_device_replace": return toolCallDeviceReplace(args)
         case "hub_list_device_events":
@@ -34651,22 +34681,11 @@ private Map _rmCollectInputSchema(Map configPage) {
     }
     return schema
 }
-private List _rmPageHrefs(Map configPage) {
-    def out = []
-    for (s in (configPage?.sections ?: [])) {
-        for (b in (s?.body ?: [])) {
-            if (b instanceof Map && b.element == "href" && b.page) {
-                out << [page: b.page.toString(), title: _uiPlainTitle(b.title)]
-            }
-        }
-    }
-    return out
-}
 private List _uiNavigationViolations(Map schema, Map values) {
     def problems = []
     schema?.each { rawName, meta ->
         def name = rawName.toString()
-        if (meta?.disabled == true || meta?.type == "button") return
+        if (meta?.disabled == true || meta?.type in ["button", "menu", "file-text", "download-text"]) return
         def v = _uiValueOrDefault(values?.get(name), meta as Map)
         def empty = _uiValueIsEmpty(v, meta as Map)
         def title = _uiPlainTitle(meta?.title) ?: name
@@ -34691,10 +34710,13 @@ private List _uiNavigationViolations(Map schema, Map values) {
             if ((n - base).remainder(step).compareTo(BigDecimal.ZERO) != 0) {
                 problems << [name: name, title: title, problem: (t == "number" ? "${v} is not a whole number" : "${v} has more than two decimal places").toString()]
             }
-        } else if (meta?.pattern) {
+        } else if (meta?.pattern && !(t in ["textarea", "date", "time", "color", "bool", "enum", "mode"]) && !_isDevicePickerType(t)) {
             def matched
             try { matched = (v.toString() ==~ meta.pattern.toString()) }
-            catch (Exception badPattern) { matched = true }
+            catch (Exception badPattern) {
+                mcpLog("debug", "hub-admin", "pattern of ${name} not checked: ${badPattern.message}")
+                matched = true
+            }
             if (!matched) problems << [name: name, title: title, problem: "'${v}' does not match the required format".toString()]
         } else if (t == "email" && !(v.toString() ==~ _uiEmailPattern())) {
             problems << [name: name, title: title, problem: "'${v}' is not a valid email address".toString()]
@@ -34706,6 +34728,7 @@ private String _uiEmailPattern() {
     return '[a-zA-Z0-9.!#\$%&\'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*'
 }
 private _uiValueOrDefault(v, Map meta) {
+    if (meta?.type == "menu" || _isDevicePickerType(meta?.type)) return v
     return (_uiValueIsEmpty(v, meta) && meta?.defaultValue != null) ? meta.defaultValue : v
 }
 private boolean _uiValueIsEmpty(v, Map meta = null) {
@@ -34713,15 +34736,14 @@ private boolean _uiValueIsEmpty(v, Map meta = null) {
     if (v instanceof Collection) return v.findAll { it != null && it.toString().trim() }.isEmpty()
     if (v instanceof Map) return v.isEmpty()
     def t = meta?.type?.toString()
-    if (t != null && t != "enum" && !_isDevicePickerType(t)) {
+    if (t != null && !(t in ["enum", "mode"]) && !_isDevicePickerType(t)) {
         return (t in ["number", "decimal"]) ? v.toString().trim().isEmpty() : v.toString().isEmpty()
     }
     def s = v.toString().trim()
     return s.isEmpty() || s == "[]" || s == "null"
 }
 private boolean _isDevicePickerType(type) {
-    def t = type?.toString()
-    return t != null && (t.startsWith("capability.") || t.startsWith("device."))
+    return _nrIsDeviceType(type?.toString())
 }
 private _devicePickerIds(v) {
     if (v instanceof Map) return v.keySet().collect { it?.toString() }
@@ -34856,7 +34878,7 @@ private Map _rmForceDeleteApp(Integer appId) {
     return resp
 }
 def currentVersion() {
-    return "5.1.4"
+    return "5.1.6"
 }
 def hubBpsGuideKey(String section, Long atMs = null) {
     long bucket = ((atMs != null ? atMs : now()) as long).intdiv(3600000L)
@@ -34946,6 +34968,7 @@ def _guideSectionForTool(toolName) {
               'hub_create_device']) return 'hub_admin_write_devices'
     if (t in ['hub_delete_device', 'hub_delete_room', 'hub_delete_item', 'hub_reboot', 'hub_shutdown',
               'hub_update_firmware', 'hub_call_destructive_ops']) return 'hub_admin_write_destructive'
+    if (t in ['hub_update_app', 'hub_update_driver', 'hub_update_library', 'hub_create_app', 'hub_update_package']) return 'hub_admin_write_code'
     if (t == 'hub_get_device_attribute') return 'device_authorization'
     if (t == 'hub_report_issue') return 'performance_diagnostics'
     return null
@@ -35020,6 +35043,11 @@ If you are calling one of these tools, you must read its section for that sectio
 - hub_update_dashboard -> dashboards
 - hub_delete_file -> file_manager
 - hub_write_file -> file_manager
+- hub_create_app -> hub_admin_write_code
+- hub_update_app -> hub_admin_write_code
+- hub_update_driver -> hub_admin_write_code
+- hub_update_library -> hub_admin_write_code
+- hub_update_package -> hub_admin_write_code
 - hub_call_destructive_ops -> hub_admin_write_destructive
 - hub_delete_device -> hub_admin_write_destructive
 - hub_delete_item -> hub_admin_write_destructive
@@ -35192,7 +35220,13 @@ The radio firmware-flash `action` values (the bullet above summarizes these as "
 
 ### hub_update_app / hub_update_driver / hub_update_library — expectedVersion (optimistic lock)
 
-`expectedVersion` rides the save, and the hub checks it atomically: if the code has moved on, the hub refuses the save, nothing is written, and the result is `conflict:true` with `expectedVersion` and, when the hub reports it, `currentVersion`. Re-read the source, then retry with the new version. Stringified integers are coerced; an explicit null is rejected. Without it, the save uses the version this call read and retries once at the hub's version if another save landed first (last writer wins). These tools reject arguments outside their schema, so a misspelled lock fails instead of being dropped.
+`expectedVersion` is checked before saving: the call reads the code's current version and, if it differs, posts nothing and returns `conflict:true` with `expectedVersion`, `currentVersion` and a `note`. Re-read the source, then retry with the new version. It must be a whole number: 2.9, strings and an explicit null are refused. If the current version cannot be read, the call is refused before saving.
+
+Every save carries the version, and the hub refuses one that is no longer current. So a save beaten by another save after the check also comes back `conflict:true`, and without `expectedVersion` the save uses the version this call read and fails the same way. Nothing is re-posted: re-read, reapply your change, and save again.
+
+Overlapping saves of one item can instead fail with a collision answer: `java.sql.SQLException: Failed to update device type` for a driver, or an error that is only the compile path (`./appTargetDir/user_app_<namespace>_<name>_<id>.groovy`) for an app. These carry `retryable:true` (bulk entries too) and the source was not rejected. Wait a moment, re-read, then retry, and send saves of one item one at a time. Every other failure keeps the syntax-error note.
+
+Every tool rejects arguments outside its schema, so a misspelled lock fails instead of being dropped.
 
 Use it when a read-modify-write spans turns, or when another agent may edit the same code. The source backup is still taken on a conflict. It is not taken in importUrl mode (the item's history lives where that URL is published); inline source and sourceFile updates keep it.
 
@@ -35912,12 +35946,13 @@ A single tool can also be switched off under **Advanced: Per-tool Overrides**. A
 - **hub_list_apps(scope='types')** lists community types (Apps Code, first) and built-in types. Each row adds `system`/`isBuiltIn` (true for built-in) and `menu`, the Apps/Automations/Integrations tab the type declares, null when it declares none or for a community type outside the hub's apps catalog (a child-app template). If the catalog read fails, community types still list, with `menu` null, no built-ins and a note.
 - **hub_list_device_dependents** — check it before deleting, disabling or replacing a device. `appsUsing` rows carry id, name (the app type), label, trueLabel and disabled.
 - **hub_get_app_config** renders one page as opening it in the UI does, which runs the app's page code.
-  - The pages a page links to are in `page.hrefs` as `{page, title}`; a sub-page's own links are in its `page.hrefs` (Room Lighting's optionsOnPage is linked from onMeansPage). A linked page's inputs are not in `sections`: read them with `pageName`.
+  - The page's links are in `page.hrefs`: `{page, title}` for a sub-page, `{url, title}` for an external link, with the summary the page prints under a link as `description`. A sub-page's own links are in its `page.hrefs` (Room Lighting's optionsOnPage is linked from onMeansPage). A linked page's inputs are not in `sections`: read them with `pageName`.
   - `controls` are the page's buttons and links as hub_set_rule(operation='form') (Rule Machine) or hub_set_native_app(operation='form') returns them; activate one there by its control_id after opening the same page.
-  - On a Rule Machine rule a paragraph holding a disabled action or trigger reads `{text, disabled: [...]}`, listing the text of each disabled row it holds. On selectActions (Button Rule: selectActionsX) a disabled action's `disable<N>` control reads 'Enable Action', and the control named `<N>.0.<bool>` carries that action's text; N is the action index, not the row position. The button toggles: never replay a click whose response was lost. hub_set_app_disabled disables the whole app.
+  - On a Rule Machine rule a paragraph holding a disabled action or trigger reads `{text, disabled: [...]}`, listing the text of each disabled row it holds; a `page.hrefs` entry whose summary holds one (the main page's action link) carries the same `disabled` list. On selectActions (Button Rule: selectActionsX) a disabled action's `disable<N>` control reads 'Enable Action', and the control named `<N>.0.<bool>` carries that action's text; N is the action index, not the row position. The button toggles: never replay a click whose response was lost. hub_set_app_disabled disables the whole app.
   - `pageNote` appears when the hub rendered another page than `pageName`: the app reaches that page only through its link, so open it in a form workflow.
-  - `appType.system` and `appType.menu` are the fields hub_list_apps(scope='types') gives for every type at once.
-  - `includeSettings=true` adds the raw settings map: 500-1000 app-encoded keys on large apps (Room Lighting stores per-device scene levels as `dm~<deviceId>~<scene>`). Secrets read `***redacted (password)***`: every setting the hub types as a password, on any page, and free-text settings with credential-shaped names (password, pass, secret, token, API key, credential, PIN, lock or alarm code, ...). OAuth accessToken settings follow the Hide access tokens setting. Page inputs are redacted the same way. With Hide passwords and credentials turned off in the MCP app's settings they read as stored. When the setting types cannot be read the map is withheld and `settingsNote` says why.
+  - Each input is the field hub_set_native_app(operation='form') returns; a device picker adds `selected`, its devices with labels. `unsupported` lists page parts a form cannot drive, such as a community app's create button. When the page cannot be modelled, `formError` says why: inputs carry no values and there are no controls.
+  - `appType.namespace` and `appType.name` name the type; `appType.system` and `appType.menu` are the fields hub_list_apps(scope='types') gives for every type at once.
+  - `includeSettings=true` adds the raw settings map: 500-1000 app-encoded keys on large apps (Room Lighting stores per-device scene levels as `dm~<deviceId>~<scene>`). Secrets read `***redacted (password)***`: every setting the hub types as a password, on any page, and free-text settings with credential-shaped names (password, pass, secret, token, API key, credential, PIN, lock or alarm code, ...). OAuth accessToken settings follow the Hide access tokens setting. Page inputs read as in the form tools: a password input carries no value and `redacted: true`; a credential-named input reads the marker. With Hide passwords and credentials turned off in the MCP app's settings they read as stored. When the setting types cannot be read the map is withheld and `settingsNote` says why.
   - A type='mode' input's `value` is its stored setting. Day Lights uses ten of them for per-mode levels, gated by `useModeOverrides`; most apps use one as an "only during these modes" restriction.
   - **Mode gating in the built-in apps.** The hub has no "modes in use by" list, so read each app; resolve mode IDs with hub_list_modes.
     - **Notifier** — `modes` (mode ids) on `moreOptions`; restricts.
