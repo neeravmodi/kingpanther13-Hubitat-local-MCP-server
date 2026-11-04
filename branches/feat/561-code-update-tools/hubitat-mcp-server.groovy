@@ -29574,6 +29574,8 @@ private void _mrtrValidateAccess(outerToolName, leafToolName, Map outerArgs, boo
     }
     String clientDenial = _clientToolDenial(leaf, leafArgs)
     if (clientDenial != null) throw new IllegalArgumentException(clientDenial)
+    if (outer != leaf) _rejectUnknownArgs(outer, outerArgs)
+    _rejectUnknownArgs(leaf, leafArgs)
     if (checkKey && !readLeaf && settings.enableMandatoryBPS != false) {
         String bpsSection = _bpsSectionForTool(leaf)
         def bpsKey = hubBpsKeyFromArgs(leafArgs)
