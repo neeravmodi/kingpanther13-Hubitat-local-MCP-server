@@ -17662,7 +17662,7 @@ private Map toolUpdateItemCodeInner(String type, String idParam, args, Map packa
         def parsed = _postItemSave(type, itemIdInt, sourceCode, sentVersion, isSelfUpdate, itemId)
         def stale = _staleVersionRejection(parsed)
         sourceCode = null
-        if (stale != null) return _versionConflictResult(type, idParam, itemId, sentVersion, stale.currentVersion)
+        if (stale != null) return _versionConflictResult(type, idParam, itemId, sentVersion, stale.currentVersion, expectedVersion != null)
         def success = false
         def errorMsg = null
         if (parsed instanceof Map) {
@@ -17871,18 +17871,21 @@ private String _concurrentSaveNote(String type) {
     return "This is the hub's answer when another save of this ${type} runs at the same moment; the source itself was not rejected. Wait a moment, re-read the ${type} (its version may have changed), then retry. Send saves of the same ${type} one at a time. See ${_codeGuidePointer()}.".toString()
 }
 private String _codeGuidePointer() { "hub_get_tool_guide(section='hub_admin_write_code')" }
-private Map _versionConflictResult(String type, String idParam, itemId, sentVersion, currentVersion) {
+private Map _versionConflictResult(String type, String idParam, itemId, sentVersion, currentVersion, boolean callerLocked = true) {
     String hubSide = currentVersion != null ? "hub has ${currentVersion}" : "the hub reports a different version"
     mcpLog("warn", "hub-admin", "${type} update ID ${itemId} refused: version ${sentVersion} is stale (${hubSide}); nothing was written")
+    String error = callerLocked ?
+        "Optimistic-lock conflict: expected ${type} version ${sentVersion} but ${hubSide}. Nothing was written. Re-read the source and retry with the new expectedVersion." :
+        "Another save of this ${type} landed while this one was being sent, so the hub refused it (${hubSide}). Nothing was written. Re-read the source and send your change again."
     def out = [
         success: false,
-        error: "Optimistic-lock conflict: expected ${type} version ${sentVersion} but ${hubSide}. Nothing was written. Re-read the source and retry with the new expectedVersion.".toString(),
+        error: error.toString(),
         (idParam): itemId,
-        expectedVersion: sentVersion,
         conflict: true,
         note: "Another save changed this ${type}. Read it again with hub_get_source, reapply your change to that source, and pass its version as expectedVersion. See ${_codeGuidePointer()}.".toString(),
         lastBackup: formatTimestamp(state.lastBackupTimestamp)
     ]
+    if (callerLocked) out.expectedVersion = sentVersion
     if (currentVersion != null) out.currentVersion = currentVersion
     return out
 }
@@ -18067,8 +18070,8 @@ def toolUpdateDriverCode(args) {
                     if (r.lastBackup) entry.lastBackup = r.lastBackup
                     if (r.conflict) {
                         entry.conflict = true
-                        entry.expectedVersion = r.expectedVersion
-                        entry.currentVersion = r.currentVersion
+                        if (r.containsKey('expectedVersion')) entry.expectedVersion = r.expectedVersion
+                        if (r.currentVersion != null) entry.currentVersion = r.currentVersion
                     }
                     allSucceeded = false
                 }
@@ -18477,7 +18480,7 @@ def toolUpdateLibraryCode(args) {
     try {
         def result = _postLibrarySave(libraryId, sourceCode, sentVersion)
         def stale = _staleVersionRejection(result)
-        if (stale != null) return _versionConflictResult("library", "libraryId", libraryId, sentVersion, stale.currentVersion)
+        if (stale != null) return _versionConflictResult("library", "libraryId", libraryId, sentVersion, stale.currentVersion, expectedVersion != null)
         if (result?.success == false) {
             def msg = result?.message ?: "Hub returned failure"
             mcpLog("warn", "hub-admin", "Library update failed: ${msg}")
@@ -34990,8 +34993,21 @@ def _reactiveBpsWarning(toolName, args, errorText) {
 }
 def _applyReactiveBpsWarning(toolName, args, result) {
     if (!(result instanceof Map) || result.containsKey('bp_warning')) return
+    if (_resultCitesGuide(result)) return
     def w = _reactiveBpsWarning(toolName, args, (result.error ?: result.note ?: '').toString())
     if (w) result.bp_warning = w
+}
+private boolean _resultCitesGuide(Map result) {
+    if (_entryCitesGuide(result)) return true
+    for (v in result.values()) {
+        if (!(v instanceof List)) continue
+        for (entry in v) { if (_entryCitesGuide(entry)) return true }
+    }
+    return false
+}
+private boolean _entryCitesGuide(entry) {
+    if (!(entry instanceof Map)) return false
+    return entry.error?.toString()?.contains('get_tool_guide') || entry.note?.toString()?.contains('get_tool_guide')
 }
 def getToolGuideSections() {
     return [
