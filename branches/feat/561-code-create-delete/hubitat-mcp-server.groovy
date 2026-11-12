@@ -3844,7 +3844,7 @@ private _listSourceItemBackups(args) {
             storageBudget: _itemBackupBudgetUsage(manifest),
             retentionPolicy: _itemBackupRetentionNote(),
             storage: "Backups are stored as .groovy files in the hub's File Manager. You can access them at http://<HUB_IP>/local/<filename> or via Hubitat > Settings > File Manager.",
-            howToRestore: "Use 'hub_get_backup' to retrieve source code, then 'hub_restore_backup' to restore (apps/drivers). For deleted apps, drivers or libraries, use 'hub_create_item' with the backup source."
+            howToRestore: "Use 'hub_get_backup' to retrieve source code, then 'hub_restore_backup' to restore (apps/drivers). For deleted apps or drivers, use 'hub_create_app' or 'hub_create_driver' with the backup source. For deleted libraries, use 'hub_create_library' with the backup source."
         ]
     }
     def backupList = manifest.collect { key, entry ->
@@ -4045,7 +4045,7 @@ private Map _toolRestoreSourceBackup(args) {
         if (entry.type == "library") {
             return [
                 success: false,
-                error: "Library backups cannot be restored via hub_restore_backup -- use hub_create_item(type='library') or hub_update_library with the backup source from '${entry.fileName}' instead.",
+                error: "Library backups cannot be restored via hub_restore_backup -- use hub_create_library or hub_update_library with the backup source from '${entry.fileName}' instead.",
                 backupKey: args.backupKey,
                 type: "library",
                 backupFile: entry.fileName,
@@ -17014,42 +17014,42 @@ def toolGetSource(args) {
     def idParam = (type == "app") ? "appId" : "driverId"
     return toolGetItemSource(type, idParam, args + [(idParam): id])
 }
+private String _appInstanceCreateHint(Integer codeAppId, status) {
+    switch (status) {
+        case 401:
+        case 403:
+            return "Hub Security authentication failed (status ${status}). Verify MCP credentials and Hub Security state.".toString()
+        case 404:
+            return "codeAppId ${codeAppId} does not exist in Apps Code.".toString()
+        case 500:
+            return "Hub returned a server error (status 500). codeAppId ${codeAppId} may not exist in Apps Code (check hub_list_apps(scope='types')), or its code may be in a compile-error state (inspect via hub_get_source(type='app')).".toString()
+        case 200:
+            return "Hub returned the configure page without redirect (status 200). codeAppId ${codeAppId} may be a driver/library, or an already-instantiated app.".toString()
+        default:
+            return "Hub returned unexpected status ${status}. The codeAppId may not exist or may not be a user app.".toString()
+    }
+}
 private Map _createUserAppInstance(Integer codeAppId) {
     def result
     try {
         result = hubInternalGetRaw("/installedapp/create/${codeAppId}")
     } catch (Exception e) {
         mcpLog("error", "hub-admin", "_createUserAppInstance(${codeAppId}): ${e.toString()}")
+        def statusMatch = (e.toString() =~ /status code:?\s*(\d{3})/)
+        Integer thrownStatus = statusMatch.find() ? (statusMatch.group(1) as Integer) : null
         return [
             success: false,
-            error: "User app instantiation failed: ${e.toString()}",
-            codeAppId: codeAppId
+            error: thrownStatus != null ? _appInstanceCreateHint(codeAppId, thrownStatus) : "User app instantiation failed: ${e.message ?: e.toString()}".toString(),
+            codeAppId: codeAppId,
+            status: thrownStatus
         ]
     }
     if (result?.status != 302 || !result.location) {
         def status = result?.status
-        def hint
-        switch (status) {
-            case 401:
-            case 403:
-                hint = "Hub Security authentication failed (status ${status}). Verify MCP credentials and Hub Security state."
-                break
-            case 404:
-                hint = "codeAppId ${codeAppId} does not exist in Apps Code."
-                break
-            case 500:
-                hint = "Hub returned a server error (status 500). Code ${codeAppId} may be in a compile-error state -- inspect via hub_get_source(type='app')."
-                break
-            case 200:
-                hint = "Hub returned the configure page without redirect (status 200). codeAppId ${codeAppId} may be a driver/library, or an already-instantiated app."
-                break
-            default:
-                hint = "Hub returned unexpected status ${status}. The codeAppId may not exist or may not be a user app."
-        }
         mcpLog("warn", "hub-admin", "_createUserAppInstance(${codeAppId}): non-302 (status=${status})")
         return [
             success: false,
-            error: hint,
+            error: _appInstanceCreateHint(codeAppId, status),
             codeAppId: codeAppId,
             status: status,
             hubResponse: result?.data?.toString()?.take(500)
@@ -17113,7 +17113,7 @@ private Map _createUserAppInstance(Integer codeAppId) {
     if (commit.note) out.note = commit.note
     return out
 }
-private Map _submitAppDoneForm(Integer instanceId, String pageName, boolean requireLiveSettings = false) {
+private Map _submitAppDoneForm(Integer instanceId, String pageName, boolean requireLiveSettings = false, boolean readLiveSettings = true) {
     def cfg = _rmFetchConfigJson(instanceId, pageName)
     def page = pageName ?: (cfg?.configPage?.name?.toString()) ?: "mainPage"
     def schema = _rmCollectInputSchema(cfg?.configPage)
@@ -17129,7 +17129,7 @@ private Map _submitAppDoneForm(Integer instanceId, String pageName, boolean requ
     }
     def liveSettings = [:]
     boolean liveSettingsUnavailable = false
-    try {
+    if (readLiveSettings) try {
         liveSettings = _rmLiveSettingsFromStatus(_rmFetchStatusJson(instanceId)) ?: [:]
     } catch (Exception statusErr) {
         liveSettingsUnavailable = true
@@ -17207,7 +17207,7 @@ def _settingShapeName(v) {
     return "non-scalar"
 }
 private Map _commitUserAppInstall(Integer instanceId, String pageName) {
-    def submit = _submitAppDoneForm(instanceId, pageName, false)
+    def submit = _submitAppDoneForm(instanceId, pageName, false, false)
     if (submit.uiBlocked) {
         return [
             success: false,
@@ -17258,9 +17258,6 @@ private Map _commitUserAppInstall(Integer instanceId, String pageName) {
     if (post == null) {
         notes << "The post-commit statusJson read failed, so scheduledJobCount/eventSubscriptionCount are reported as 0 rather than measured -- they are not evidence that initialize() registered nothing."
     }
-    if (submit?.liveSettingsUnavailable) {
-        notes << "The instance's live settings could not be read before the Done submit, so the form carried this page's defaults. Harmless on a fresh install (there was nothing configured yet), but re-check the instance if it was pre-seeded."
-    }
     if (submit?.shapeRejections) {
         notes << "${submit.shapeRejections} setting(s) had a shape that cannot be form-encoded and fell back to the page default; see the hub log for their names."
     }
@@ -17274,7 +17271,9 @@ private Map _resolveCodeSource(args) {
     }
     if (args.sourceFile) {
         mcpLog("info", "hub-admin", "Reading code source from File Manager: ${args.sourceFile}")
-        def bytes = downloadHubFile(args.sourceFile)
+        def bytes = null
+        try { bytes = downloadHubFile(args.sourceFile) }
+        catch (Exception e) { mcpLog("warn", "hub-admin", "Reading ${args.sourceFile} from File Manager failed: ${e.message}") }
         if (bytes == null) throw new IllegalArgumentException("Source file '${args.sourceFile}' not found in File Manager")
         String code = new String(bytes, "UTF-8")
         mcpLog("info", "hub-admin", "Read ${code.length()} chars from ${args.sourceFile}")
@@ -17298,6 +17297,62 @@ private Map _codeCreateFailure(String type, String error, String note) {
 private String _codeCreateUnknownOutcomeNote(String type) {
     return "Whether the ${type} was saved is unknown. Check ${_codeListCall(type)} before retrying: a retry can create a duplicate at a new id.".toString()
 }
+private String _hubMessageText(msg) {
+    String text = msg?.toString()
+    if (text == null) return null
+    return text.replaceAll(/<\/?[A-Za-z!][^>]*>/, "").trim()
+}
+private Map _driverDefinitionName(String source) {
+    def block = (source =~ /(?s)\bdefinition\s*\((.*?)\)/)
+    if (!block.find()) return null
+    String params = block.group(1)
+    def name = (params =~ /\bname\s*:\s*(["'])(.*?)\1/)
+    if (!name.find()) return null
+    def namespace = (params =~ /\bnamespace\s*:\s*(["'])(.*?)\1/)
+    return [name: name.group(2), namespace: namespace.find() ? namespace.group(2) : null]
+}
+private Map _settleRefusedDriverCreate(String sourceCode, String hubMsg, String sourceMode) {
+    String error = "Driver installation failed: ${hubMsg}".toString()
+    Map unknown = _codeCreateFailure("driver", error, _codeCreateUnknownOutcomeNote("driver"))
+    Map definition = _driverDefinitionName(sourceCode)
+    if (definition == null) return unknown
+    def exact = []
+    try {
+        def txt = hubInternalGet("/hub2/userDeviceTypes", null, 30)
+        def rows = txt ? new groovy.json.JsonSlurper().parseText(txt) : null
+        if (!(rows instanceof List)) return unknown
+        def named = rows.findAll { it instanceof Map && it.name?.toString() == definition.name &&
+            (definition.namespace == null || it.namespace?.toString() == definition.namespace) }
+        if (named.size() > 3) return unknown
+        for (row in named) {
+            def codeText = hubInternalGet("/driver/ajax/code", [id: row.id?.toString()])
+            def code = codeText ? new groovy.json.JsonSlurper().parseText(codeText) : null
+            if (!(code instanceof Map) || code.status == "error" || code.source == null) return unknown
+            if (code.source.toString() == sourceCode) exact << [id: row.id?.toString(), version: code.version]
+        }
+    } catch (Exception e) {
+        mcpLog("warn", "hub-admin", "Driver reads after a refused create failed: ${e.message}")
+        return unknown
+    }
+    if (exact.isEmpty()) {
+        return _codeCreateFailure("driver", error, "No driver on the hub holds this source. A compile error means nothing was saved: fix the source and retry. If other saves were running at the same time, check hub_list_drivers before retrying: the hub can finish a refused save later.")
+    }
+    if (exact.size() > 1) return unknown
+    def match = exact[0]
+    mcpLog("info", "hub-admin", "Driver create was refused (${hubMsg}) but driver ${match.id} holds the sent source")
+    return [
+        success: true,
+        message: "Driver installed: the hub refused the save, but a driver with this exact source is on the hub.",
+        driverId: match.id,
+        version: match.version,
+        foundAfterRefusal: true,
+        hubMessage: hubMsg,
+        sourceMode: sourceMode,
+        sourceLength: sourceCode.length(),
+        note: "The hub refused the save ('${hubMsg}'), but driver ${match.id} on the hub holds exactly this source, so it was saved. Do not retry.".toString(),
+        lastBackup: formatTimestamp(state.lastBackupTimestamp)
+    ]
+}
 private Map _createCodeItem(String type, args) {
     Map resolved = _resolveCodeSource(args)
     String sourceCode = resolved.code
@@ -17312,17 +17367,13 @@ private Map _createCodeItem(String type, args) {
         return _codeCreateFailure(type, "${label} installation failed: ${e.message}".toString(), _codeCreateUnknownOutcomeNote(type))
     }
     if (parsed instanceof Map && parsed.success == false) {
-        def hubMsg = parsed.message ?: parsed.errorMessage ?: "the hub refused the source"
+        String hubMsg = _hubMessageText(parsed.message ?: parsed.errorMessage) ?: "the hub refused the source"
         mcpLog("warn", "hub-admin", "${label} create refused: ${hubMsg}")
+        if (type == "driver") return _settleRefusedDriverCreate(sourceCode, hubMsg, sourceMode)
         String note = type == "library" ?
-            "The source needs a library() block with name, namespace, author and description. Fix the reported issue and retry." :
-            "The hub compiles the source on save. Fix the reported issue -- a Groovy compile error, or a required definition() field (apps need a non-empty iconUrl and iconX2Url) -- and retry."
-        def failure = _codeCreateFailure(type, "${label} installation failed: ${hubMsg}".toString(), note)
-        if (_isConcurrentSaveRefusal(type, hubMsg)) {
-            failure.note = "This is the hub's answer when other saves run at the same moment; the source itself was not rejected and nothing was created. Wait a moment, then retry. See ${_codeGuidePointer()}.".toString()
-            failure.retryable = true
-        }
-        return failure
+            "The source needs a library() block with name, namespace, author and description. Fix the source and retry." :
+            "Fix the source and retry."
+        return _codeCreateFailure(type, "${label} installation failed: ${hubMsg}".toString(), note)
     }
     def newItemId = (parsed instanceof Map && parsed.success == true) ? parsed.id?.toString() : null
     if (!newItemId) {
@@ -17357,7 +17408,7 @@ private Map _createDriversBulk(args) {
     if (args.installs.isEmpty()) {
         throw new IllegalArgumentException("'installs' array must not be empty.")
     }
-    List bulkEntryKeys = _toolCatalogIndexes().installEntryArgs.hub_create_item
+    List bulkEntryKeys = _toolCatalogIndexes().installEntryArgs.hub_create_driver
     def itemResults = []
     def allSucceeded = true
     for (int idx = 0; idx < args.installs.size(); idx++) {
@@ -17386,10 +17437,14 @@ private Map _createDriversBulk(args) {
                 entry.version = r.version
                 entry.sourceMode = r.sourceMode
                 entry.sourceLength = r.sourceLength
+                if (r.foundAfterRefusal) {
+                    entry.foundAfterRefusal = true
+                    entry.hubMessage = r.hubMessage
+                    entry.note = r.note
+                }
             } else {
                 entry.error = r.error ?: "Install failed"
                 if (r.note) entry.note = r.note
-                if (r.retryable) entry.retryable = true
                 if (r.lastBackup) entry.lastBackup = r.lastBackup
                 allSucceeded = false
             }
@@ -17409,25 +17464,15 @@ private Map _createDriversBulk(args) {
         lastBackup: formatTimestamp(state.lastBackupTimestamp)
     ]
 }
-def toolCreateItem(args) {
-    String type = args.type?.toString()
-    if (!(type in ["app", "driver", "library"])) {
-        throw new IllegalArgumentException("type is required and must be one of: app, driver, library")
-    }
-    if (args.codeAppId != null && type != "app") {
-        throw new IllegalArgumentException("codeAppId applies to type='app' only: it instantiates installed app code (got type='${type}').")
-    }
-    if (args.installs != null && type != "driver") {
-        throw new IllegalArgumentException("Bulk mode ('installs' array) is not supported for ${type}s, only for type='driver'. Install each ${type} individually.")
-    }
+def toolCreateApp(args) {
     requireDestructiveConfirm(args.confirm)
     if (args.codeAppId != null) {
         if (args.source || args.sourceFile || args.importUrl) {
             throw new IllegalArgumentException(
                 "codeAppId is mutually exclusive with source/sourceFile/importUrl. " +
-                "Use two calls: (1) hub_create_item(type:'app', source|sourceFile|importUrl, confirm:true) " +
+                "Use two calls: (1) hub_create_app(source|sourceFile|importUrl, confirm:true) " +
                 "to install the code, then " +
-                "(2) hub_create_item(type:'app', codeAppId:<codeAppId>, confirm:true) " +
+                "(2) hub_create_app(codeAppId:<codeAppId>, confirm:true) " +
                 "to create the running instance."
             )
         }
@@ -17441,8 +17486,16 @@ def toolCreateItem(args) {
         }
         return _createUserAppInstance(codeAppId)
     }
+    return _createCodeItem("app", args)
+}
+def toolCreateDriver(args) {
+    requireDestructiveConfirm(args.confirm)
     if (args.installs != null) return _createDriversBulk(args)
-    return _createCodeItem(type, args)
+    return _createCodeItem("driver", args)
+}
+def toolCreateLibrary(args) {
+    requireDestructiveConfirm(args.confirm)
+    return _createCodeItem("library", args)
 }
 def toolUpdateItemCode(String type, String idParam, args) {
     requireDestructiveConfirm(args.confirm)
@@ -17620,7 +17673,7 @@ private Map toolUpdateItemCodeInner(String type, String idParam, args, Map packa
                 success = false
                 errorMsg = "Hub reported success but saved to ${type} id ${parsed.id} instead of the targeted id ${itemIdInt} -- a duplicate code entry may have been created. Check Apps Code / Drivers Code before retrying."
             } else if (!success) {
-                errorMsg = parsed.message ?: parsed.errorMessage ?: "hub response lacked success=true: ${parsed.toString().take(200)}"
+                errorMsg = _hubMessageText(parsed.message ?: parsed.errorMessage) ?: "hub response lacked success=true: ${parsed.toString().take(200)}"
             }
         } else if (parsed == null) {
             success = isSelfUpdate
@@ -18045,10 +18098,34 @@ def toolUpdateDriverCode(args) {
 private boolean _isMissingAppBackupFailure(Exception e) {
     return e instanceof IllegalArgumentException && e.message?.contains("no source code returned")
 }
-private String _deleteRefusedNote(String type) {
-    if (type == "library") return "If the library is in use, remove the #include references from apps and drivers first."
-    if (type == "driver") return "If the driver is in use, switch its devices to another driver first."
-    return "If the app code is in use, remove its app instances first."
+private String _deleteInUseNote(String type) {
+    if (type == "library") return "Remove the #include references from apps and drivers first."
+    if (type == "driver") return "Switch its devices to another driver first."
+    return "Remove its app instances first."
+}
+private Map _deleteRefusal(String type, String id, hubMsg, String responseText) {
+    String listCall = _codeListCall(type)
+    Map out = [success: false, id: id, type: type, response: responseText?.take(500)]
+    String msg = hubMsg?.toString()?.trim()
+    if (!msg) {
+        out.error = "The hub refused the delete of ${type} ${id} without giving a reason. The ${type} may not exist.".toString()
+        out.note = "Check ${listCall} for the ${type} id.".toString()
+    } else if (msg =~ /(?i)\bin use\b/) {
+        out.error = msg
+        out.note = _deleteInUseNote(type)
+    } else {
+        out.error = msg
+        out.note = "Check ${listCall} for the ${type} id.".toString()
+    }
+    return out
+}
+private Integer _deleteIdArg(rawId) {
+    String raw = rawId?.toString()
+    if (raw != null && raw ==~ /\d{1,10}/) {
+        Long value = raw as Long
+        if (value > 0 && value <= Integer.MAX_VALUE) return value as Integer
+    }
+    throw new IllegalArgumentException("id is required and must be a positive integer (got: '${rawId}')")
 }
 def toolDeleteItem(args) {
     String type = args.type?.toString()
@@ -18056,10 +18133,8 @@ def toolDeleteItem(args) {
         throw new IllegalArgumentException("type is required and must be one of: app, driver, library")
     }
     requireDestructiveConfirm(args.confirm)
-    String id = args.id?.toString()
-    if (!id?.isInteger() || id.toInteger() <= 0) {
-        throw new IllegalArgumentException("id is required and must be a positive integer (got: '${args.id}')")
-    }
+    Integer idInt = _deleteIdArg(args.id)
+    String id = idInt.toString()
     String label = type.capitalize()
     boolean backupSucceeded = true
     def backupTaken = null
@@ -18078,7 +18153,7 @@ def toolDeleteItem(args) {
     String deletePath = [app: "/app/edit/deleteJsonSafe/", driver: "/driver/editor/deleteJson/", library: "/library/edit/deleteJson/"][type]
     mcpLog("warn", "hub-admin", "Deleting ${type} ID: ${id}")
     try {
-        def responseText = hubInternalGet("${deletePath}${id}".toString())
+        def responseText = hubInternalGet("${deletePath}${idInt}".toString())
         def parsed = null
         if (responseText) {
             try { parsed = new groovy.json.JsonSlurper().parseText(responseText) }
@@ -18090,9 +18165,9 @@ def toolDeleteItem(args) {
                     note: "Check ${_codeListCall(type)} to see whether the ${type} is still there.".toString()]
         }
         if (parsed.success != true && parsed.status?.toString() != "true") {
-            def hubMsg = parsed.message ?: parsed.error ?: parsed.errorMessage ?: "The hub refused the delete"
-            mcpLog("warn", "hub-admin", "Delete ${type} ${id} refused: ${hubMsg}")
-            return [success: false, error: hubMsg, id: id, type: type, response: responseText?.take(500), note: _deleteRefusedNote(type)]
+            def hubMsg = parsed.message ?: parsed.error ?: parsed.errorMessage
+            mcpLog("warn", "hub-admin", "Delete ${type} ${id} refused: ${hubMsg ?: 'no reason given'}")
+            return _deleteRefusal(type, id, hubMsg, responseText)
         }
         mcpLog("info", "hub-admin", "${label} ID ${id} deleted successfully")
         def backupEntry = (_itemBackupManifest())?.get("${type}_${id}".toString()) ?: backupTaken
@@ -18104,7 +18179,7 @@ def toolDeleteItem(args) {
             lastBackup: formatTimestamp(state.lastBackupTimestamp),
             backupFile: backupEntry?.fileName,
             backupRetentionNote: backupEntry ? _itemBackupRetentionNote() : null,
-            restoreHint: backupEntry ? "To restore: use 'hub_create_item' (type='${type}') with the backup source, or download ${backupEntry.fileName} from Hubitat > Settings > File Manager and re-install manually. ${_itemBackupRetentionNote()}".toString() : null
+            restoreHint: backupEntry ? "To restore: use '${[app: 'hub_create_app', driver: 'hub_create_driver', library: 'hub_create_library'][type]}' with the backup source, or download ${backupEntry.fileName} from Hubitat > Settings > File Manager and re-install manually. ${_itemBackupRetentionNote()}".toString() : null
         ]
         if (!backupSucceeded) result.backupWarning = "Pre-delete backup could not be created. The source code may be permanently lost."
         return result
@@ -18306,7 +18381,7 @@ def toolUpdateLibraryCode(args) {
         def stale = _staleVersionRejection(result)
         if (stale != null) return _versionConflictResult("library", "libraryId", libraryId, sentVersion, stale.currentVersion, expectedVersion != null)
         if (result?.success == false) {
-            def msg = result?.message ?: "Hub returned failure"
+            def msg = _hubMessageText(result?.message) ?: "Hub returned failure"
             mcpLog("warn", "hub-admin", "Library update failed: ${msg}")
             return [
                 success: false,
@@ -18556,7 +18631,7 @@ def _getAllToolDefinitions_partCodeManagement() {
                 type: "object",
                 properties: [
                     type: [type: "string", enum: ["app", "driver", "library"], description: "What kind of code to read."],
-                    id: [type: "string", description: "App/driver/library ID (positive integer), from hub_list_apps / hub_list_drivers / hub_list_libraries respectively (library id is also in a hub_create_item response or the Hubitat Libraries code page)."],
+                    id: [type: "string", description: "App/driver/library ID (positive integer), from hub_list_apps(scope='types') / hub_list_drivers / hub_list_libraries respectively (library id is also in a hub_create_library response or the Hubitat Libraries code page)."],
                     offset: [type: "integer", description: "Char offset to start reading from. Default: 0"],
                     length: [type: "integer", description: "Max chars (default 30000, max 64000)."]
                 ],
@@ -18564,32 +18639,52 @@ def _getAllToolDefinitions_partCodeManagement() {
             ]
         ],
         [
-            name: "hub_create_item",
-            description: """⚠️ Install app, driver or library code, or instantiate installed app code. Show the code to the user and get confirmation first.
+            name: "hub_create_app",
+            description: """⚠️ Install new app. Show code to user and get confirmation first.
 
-Set type, then supply the code via exactly one of source / sourceFile / importUrl (see each param). For >1 driver use bulk mode (installs).
+Supply the code via exactly one of source / sourceFile / importUrl (mutually exclusive; see each param).
 
-The hub compiles apps and drivers on save and returns success=false with its error; libraries are not compile-checked until an app or driver #includes them. Library source needs a library() block with name/namespace/author/description.
-
-App code runs only once instantiated, a second call: hub_create_item(type:'app', codeAppId:<appId>, confirm:true).
-
-Requires Write master + confirm + backup <24h. Returns the new id and version.
 [[FLAT_TRIM]]
-For type=driver, MCP 2026-07-28 clients automatically continue this slow write and can replay its retained terminal response. Other types and older clients can still lose the response on a transport drop; check the list tool before retrying. See hub_get_tool_guide(section='slow_ops').
+After the code installs, create a running instance with a SECOND call: hub_create_app(codeAppId: <newAppId>, confirm: true).
+[[/FLAT_TRIM]]
+
+The hub compiles on save and returns success=false with its error. Requires Write master + confirm + backup <24h. Returns the new appId and version (codeAppId: the instanceAppId).
+[[FLAT_TRIM]]
+A transport drop can lose the response while the hub still commits this write; verify current hub state before retrying. See hub_get_tool_guide(section='slow_ops').
 [[/FLAT_TRIM]]
 """,
             inputSchema: [
                 type: "object",
-                additionalProperties: false,
                 properties: [
-                    type: [type: "string", enum: ["app", "driver", "library"], description: "What kind of code to install."],
+                    source: [type: "string", description: "Inline Groovy source (stubs only)."],
+                    sourceFile: [type: "string", description: "File Manager filename (write it first via hub_write_file), e.g. my-app.groovy."],
+                    importUrl: [type: "string", description: "URL the hub fetches directly (http/https)."],
+                    codeAppId: [type: "integer", description: "Second-step mode: instantiate already-installed code (the appId from a prior call) and commit the install; not combinable with source/sourceFile/importUrl."],
+                    confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms backup was created and user approved."]
+                ],
+                required: ["confirm"]
+            ]
+        ],
+        [
+            name: "hub_create_driver",
+            description: """⚠️ Install new driver. Show code to user and get confirmation first.
+
+Supply the code via exactly one of source / sourceFile / importUrl (mutually exclusive; see each param). For >1 driver use BULK mode (the installs param).
+
+The hub compiles on save and returns success=false with its error. Requires Write master + confirm + backup <24h. Returns the new driverId and version (bulk: one result per entry).
+[[FLAT_TRIM]]
+MCP 2026-07-28 clients automatically continue this slow write and can replay its retained terminal response. Older clients can still lose the response on a transport drop; verify current hub state before retrying. See hub_get_tool_guide(section='slow_ops').
+[[/FLAT_TRIM]]
+""",
+            inputSchema: [
+                type: "object",
+                properties: [
                     source: [type: "string", description: "Inline Groovy source (stubs only)."],
                     sourceFile: [type: "string", description: "File Manager filename (write it first via hub_write_file), e.g. my-code.groovy."],
                     importUrl: [type: "string", description: "URL the hub fetches directly (http/https)."],
-                    codeAppId: [type: "integer", description: "type=app only, second step: instantiate already-installed code (the appId from a prior call) and commit the install; not combinable with source/sourceFile/importUrl."],
                     installs: [
                         type: "array",
-                        description: "type=driver only, bulk mode: one round-trip for many drivers. Each entry {source|sourceFile|importUrl}; cannot mix with single-item fields; continue-on-error.",
+                        description: "Bulk mode: one round-trip for many drivers. Each entry {source|sourceFile|importUrl}; cannot mix with single-driver fields; continue-on-error.",
                         items: [
                             type: "object",
                             additionalProperties: false,
@@ -18600,10 +18695,9 @@ For type=driver, MCP 2026-07-28 clients automatically continue this slow write a
                             ]
                         ]
                     ],
-                    confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms backup was created and user approved."],
-                    bestPracticeKey: [type: "string"]
+                    confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms backup was created and user approved."]
                 ],
-                required: ["type", "confirm"]
+                required: ["confirm"]
             ]
         ],
         [
@@ -18699,21 +18793,41 @@ For type=driver, MCP 2026-07-28 clients automatically continue this slow write a
 """,
             inputSchema: [
                 type: "object",
-                additionalProperties: false,
                 properties: [
                     type: [type: "string", enum: ["app", "driver", "library"], description: "What to delete."],
                     id: [type: "string", description: "App/driver/library code ID (positive integer), from hub_list_apps(scope='types') / hub_list_drivers / hub_list_libraries respectively."],
-                    confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms backup was created and user approved."],
-                    bestPracticeKey: [type: "string"]
+                    confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms backup was created and user approved."]
                 ],
                 required: ["type", "id", "confirm"]
+            ]
+        ],
+        [
+            name: "hub_create_library",
+            description: """⚠️ Install new Groovy library code. Libraries are #include'd by drivers/apps. Show code to user and get confirmation first.
+
+Provide exactly one of source / sourceFile / importUrl (see each param).
+
+Source must include a library() block with name/namespace/author/description (all required). The hub does NOT compile-check libraries at install -- syntax errors surface only when an app/driver #includes it. Requires Write master + confirm + backup <24h. Returns the new libraryId and version.
+[[FLAT_TRIM]]
+A transport drop can lose the response while the hub still commits this write; verify current hub state before retrying. See hub_get_tool_guide(section='slow_ops').
+[[/FLAT_TRIM]]
+""",
+            inputSchema: [
+                type: "object",
+                properties: [
+                    source: [type: "string", description: "Inline source (stubs only)."],
+                    sourceFile: [type: "string", description: "File Manager filename (write it first via hub_write_file), e.g. my-code.groovy."],
+                    importUrl: [type: "string", description: "URL the hub fetches directly (http/https)."],
+                    confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms backup was created and user approved."]
+                ],
+                required: ["confirm"]
             ]
         ],
         [
             name: "hub_update_library",
             description: """⚠️ CRITICAL: Modify existing library code. Read current source first, explain changes, get confirmation.
 
-Supply the new code via exactly one of source / sourceFile / importUrl, or resave to recompile in place (see each param). Not compile-checked at save (see hub_create_item).
+Supply the new code via exactly one of source / sourceFile / importUrl, or resave to recompile in place (see each param). Not compile-checked at save (see hub_create_library).
 
 Auto-backs up before modifying. Requires Write master + confirm + backup <24h.
 [[FLAT_TRIM]]
@@ -18779,7 +18893,7 @@ def _idempotentWriteToolNames_partCodeManagement() {
 }
 def _openWorldToolNames_partCodeManagement() {
     return [
-        "hub_create_item", "hub_update_app", "hub_update_driver", "hub_update_library"
+        "hub_create_app", "hub_create_driver", "hub_create_library", "hub_update_app", "hub_update_driver", "hub_update_library"
     ]
 }
 def _toolDisplayMeta_partCodeManagement() {
@@ -18788,9 +18902,11 @@ def _toolDisplayMeta_partCodeManagement() {
         hub_list_drivers: [title: "List Drivers", summary: "List all installed drivers."],
         hub_list_libraries: [title: "List Libraries", summary: "List installed Groovy libraries."],
         hub_get_source: [title: "Get Source Code", summary: "Read Groovy source for an app, driver, or library."],
-        hub_create_item: [title: "Create Code Item", summary: "Install an app, driver, or library from source, a file, or a URL, or instantiate installed app code."],
+        hub_create_app: [title: "Install App", summary: "Install a new app from source, a File Manager file, or a URL, or instantiate installed app code."],
+        hub_create_driver: [title: "Install Driver", summary: "Install one or more drivers from source, File Manager files, or a URL."],
         hub_update_app: [title: "Update App Code", summary: "Modify an existing app's source code, or enable/configure its OAuth (client id/secret)."],
         hub_update_driver: [title: "Update Driver Code", summary: "Modify an existing driver's source code."],
+        hub_create_library: [title: "Install Library", summary: "Install a new Groovy library."],
         hub_update_library: [title: "Update Library Code", summary: "Modify an existing library's source code."],
         hub_delete_item: [title: "Delete Code Item", summary: "Permanently delete an app, driver, or library (auto-backs up first)."],
         hub_list_device_dependents: [title: "List Device Dependents", summary: "Find all apps that reference a device."],
@@ -28995,7 +29111,7 @@ def _budgetAwareTools() {
 def _mrtrWriteTools() {
     return ["hub_set_native_app", "hub_set_rule", "hub_call_rule",
             "hub_clone_native_app", "hub_import_native_app",
-            "hub_create_item", "hub_update_driver", "hub_delete_item",
+            "hub_create_driver", "hub_update_driver", "hub_delete_item",
             "hub_manage_virtual_device", "hub_update_device",
             "hub_restore_backup", "hub_create_backup"] as Set
 }
@@ -29017,7 +29133,7 @@ def _mrtrReadContinuationActive() {
 }
 private Set _mrtrDetachedWorkerTools() {
     return ["hub_set_native_app", "hub_set_rule",
-            "hub_create_item", "hub_update_driver", "hub_delete_item",
+            "hub_create_driver", "hub_update_driver", "hub_delete_item",
             "hub_manage_virtual_device", "hub_update_device", "hub_restore_backup", "hub_create_backup"] as Set
 }
 def _mrtrEligibleCall(outerToolName, leafToolName, args) {
@@ -29033,7 +29149,6 @@ def _mrtrEligibleCall(outerToolName, leafToolName, args) {
     if (_isRuleReadCall(leaf, leafArgs)) return false
     if (leaf == 'hub_set_native_app' && _isNativeAppSchemaOnlyCall(leafArgs)) return false
     if (leaf == "hub_delete_item") return leafArgs.type?.toString() == "driver"
-    if (leaf == "hub_create_item") return leafArgs.type?.toString() == "driver"
     if (leaf == "hub_restore_backup") {
         return (leafArgs.scope == null || leafArgs.scope.toString() == "source") &&
             (leafArgs.backupKey?.toString()?.startsWith("rm-rule_") || leafArgs.containsKey('sourceFile'))
@@ -29820,7 +29935,7 @@ private Map _mrtrContinuation(String leafTool, Map executionArgs, result, Map re
         retryIds.addAll(result.remainingRuleIds)
         nextLeaf.ruleId = retryIds.unique()
         kind = "call_rule"
-    } else if (leafTool == "hub_create_item" && result.status == "in_progress" &&
+    } else if (leafTool == "hub_create_driver" && result.status == "in_progress" &&
             result.installsRemaining instanceof List && !result.installsRemaining.isEmpty()) {
         nextLeaf.installs = result.installsRemaining
         kind = "driver_installs"
@@ -30860,22 +30975,26 @@ def getGatewayConfig() {
         ],
         hub_manage_code: [
             description: "Install, update, and delete hub apps, drivers, libraries, and code bundles (install/delete/export). All operations modify hub code and require Write master. Read-only counterparts (hub_get_source, list_*) live in the hub_read_apps_code gateway.",
-            tools: ["hub_create_item", "hub_update_app", "hub_update_driver", "hub_delete_item", "hub_update_library", "hub_install_bundle", "hub_delete_bundle", "hub_export_bundle"],
+            tools: ["hub_create_app", "hub_create_driver", "hub_update_app", "hub_update_driver", "hub_delete_item", "hub_create_library", "hub_update_library", "hub_install_bundle", "hub_delete_bundle", "hub_export_bundle"],
             summaries: [
-                hub_create_item: "Install app, driver or library code, OR with type=app + codeAppId=<id> create a running instance from installed app code. Args: type (app|driver|library), source|sourceFile|importUrl, confirm=true. To save context prefer importUrl (hub fetches the source itself) or hub_write_file + sourceFile; inline source for stubs only. For >1 driver USE BULK (single round-trip: type=driver, installs=[{source|sourceFile|importUrl},...])",
+                hub_create_app: "Install new app code (source|sourceFile|importUrl), OR with codeAppId=<id> create a running instance from already-installed code (mutually exclusive). To save context prefer importUrl (hub fetches the source itself) or hub_write_file + sourceFile; inline source for stubs only. confirm=true",
+                hub_create_driver: "Install new driver. To save context prefer importUrl (hub fetches the source) or hub_write_file + sourceFile; inline source for stubs only. For 1: source|sourceFile|importUrl. For >1: USE BULK (single round-trip: installs=[{source|sourceFile|importUrl},...]). confirm=true",
                 hub_update_app: "Modify existing app code (CRITICAL), and/or enable OAuth on it. To save context prefer importUrl (hub fetches the source itself) or hub_write_file + sourceFile over inline source. Args: appId, source|sourceFile|importUrl|resave, oauth ({enabled,client_id?,client_secret?,refresh_secret?} -- enable/configure OAuth, returns the clientId/secret), confirm=true",
                 hub_update_driver: "Modify existing driver code (CRITICAL). For 1 driver: driverId+source|sourceFile|importUrl|resave. For >1 drivers: USE BULK (single round-trip: updates=[{driverId,sourceFile|importUrl},...]). To save context prefer importUrl (hub fetches) or hub_write_file + sourceFile over inline. confirm=true",
                 hub_delete_item: "Permanently delete an app/driver/library (DESTRUCTIVE, auto-backs up). Args: type (app|driver|library), id, confirm=true",
+                hub_create_library: "Install new Groovy library (#include namespace.Name). To save context prefer importUrl (hub fetches the source) or hub_write_file + sourceFile; inline source for stubs only. Args: source|sourceFile|importUrl, confirm=true",
                 hub_update_library: "Modify existing library code. To save context prefer importUrl (hub fetches) or hub_write_file + sourceFile over inline. Args: libraryId, source|sourceFile|importUrl|resave, confirm=true",
                 hub_install_bundle: "Install a code bundle (.zip) from a URL the way HPM does (hub fetches+unpacks into Libraries/Apps/Drivers Code). Args: importUrl (zip), installer?, confirm=true",
                 hub_delete_bundle: "Delete an installed code bundle container by id (DESTRUCTIVE; verifies via re-list). Code it delivered may remain in Code -- delete separately. Args: bundleId (from hub_list_bundles), confirm=true",
                 hub_export_bundle: "Export an installed bundle's .zip to the File Manager (downloadable at /local/<file>). Args: bundleId (from hub_list_bundles), saveAs?"
             ],
             searchHints: [
-                hub_create_item: "add new install application integration device handler type driver groovy library shared include namespace",
+                hub_create_app: "add new application integration groovy",
+                hub_create_driver: "add new device handler type groovy",
                 hub_update_app: "modify change edit application groovy push deploy oauth enable client id secret access token endpoint",
                 hub_update_driver: "modify change edit device handler type groovy push deploy",
                 hub_delete_item: "remove uninstall application integration device handler driver type groovy library shared",
+                hub_create_library: "add new shared groovy library include namespace",
                 hub_update_library: "modify change edit groovy library shared code push deploy",
                 hub_install_bundle: "install bundle zip package hpm hubitat package manager uploadZipFromUrl library delivery deploy code",
                 hub_delete_bundle: "delete remove uninstall bundle container bundle manager code zip package by id",
@@ -31797,10 +31916,12 @@ def executeTool(toolName, args, boolean bpsChecked = false) {
         case "hub_set_rule": return toolSetRule(args)
         case "hub_get_app_config": return toolGetAppConfig(args)
         case "hub_get_source": return toolGetSource(args)
-        case "hub_create_item": return toolCreateItem(args)
+        case "hub_create_app": return toolCreateApp(args)
+        case "hub_create_driver": return toolCreateDriver(args)
         case "hub_update_app": return toolUpdateAppCode(args)
         case "hub_update_driver": return toolUpdateDriverCode(args)
         case "hub_delete_item": return toolDeleteItem(args)
+        case "hub_create_library": return toolCreateLibrary(args)
         case "hub_update_library": return toolUpdateLibraryCode(args)
         case "hub_install_bundle": return toolInstallBundle(args)
         case "hub_list_bundles": return toolListBundles(args)
@@ -34687,7 +34808,8 @@ def _guideSectionForTool(toolName) {
               'hub_create_device']) return 'hub_admin_write_devices'
     if (t in ['hub_delete_device', 'hub_delete_room', 'hub_delete_item', 'hub_reboot', 'hub_shutdown',
               'hub_update_firmware', 'hub_call_destructive_ops']) return 'hub_admin_write_destructive'
-    if (t in ['hub_update_app', 'hub_update_driver', 'hub_update_library', 'hub_create_item', 'hub_update_package']) return 'hub_admin_write_code'
+    if (t in ['hub_update_app', 'hub_update_driver', 'hub_update_library', 'hub_create_app', 'hub_create_driver',
+              'hub_create_library', 'hub_update_package']) return 'hub_admin_write_code'
     if (t == 'hub_get_device_attribute') return 'device_authorization'
     if (t == 'hub_report_issue') return 'performance_diagnostics'
     return null
@@ -34775,7 +34897,9 @@ If you are calling one of these tools, you must read its section for that sectio
 - hub_update_dashboard -> dashboards
 - hub_delete_file -> file_manager
 - hub_write_file -> file_manager
-- hub_create_item -> hub_admin_write_code
+- hub_create_app -> hub_admin_write_code
+- hub_create_driver -> hub_admin_write_code
+- hub_create_library -> hub_admin_write_code
 - hub_update_app -> hub_admin_write_code
 - hub_update_driver -> hub_admin_write_code
 - hub_update_library -> hub_admin_write_code
@@ -34866,7 +34990,7 @@ Only run Z-Wave radio operations when the user explicitly asks for them.
 **hub_delete_room** - Devices become unassigned (not deleted). List affected devices first.
 Dashboards or automations that reference the room may need updating.
 
-**hub_delete_item (type=app|driver|library)** - Remove app instances via Hubitat UI first (apps). Change devices to different driver first (drivers). For libraries, check that no apps/drivers reference the library via #include namespace.Name before deleting -- deletion breaks any code that still includes it. Auto-backs up before deletion. `id` is the code id; deleting an app id that does not exist returns `success:false`. A reply the hub does not clearly confirm returns `success:false` with `response`; check the list tool.
+**hub_delete_item (type=app|driver|library)** - Remove app instances via Hubitat UI first (apps). Change devices to different driver first (drivers). For libraries, check that no apps/drivers reference the library via #include namespace.Name before deleting -- deletion breaks any code that still includes it. Auto-backs up before deletion. `id` is the code id (digits only). Deleting an app id that does not exist returns `success:false`, unless a backup of that id under an hour old is reused: the hub accepts the delete of a missing app, so the call then reports success. A refusal whose message says the item is in use carries a note on what to remove first; a refusal with no message means the item may not exist, so check the list tool. A reply the hub does not clearly confirm returns `success:false` with `response`; check the list tool.
 
 ### hub_call_zwave (Z-Wave lifecycle action grouping + routing)
 
@@ -34935,21 +35059,22 @@ The radio firmware-flash `action` values (the bullet above summarizes these as "
 - **`oauth` param shape:** `{enabled (bool, default true), client_id?, client_secret?, refresh_secret? (bool, regenerate the secret)}`. Omit `client_id`/`client_secret` to preserve current values; if they are unreadable the tool refuses (`success:false`) rather than blanking them. Resulting credentials return under `result.oauth`.
 - **OAuth leg:** works alone (no source mode needed) or together with a source update. If the source saved but the OAuth leg failed, the result is `success:false, partial:true`. The app's source must declare OAuth (an `oauth` block in `definition` plus `mappings`) before OAuth can be enabled.
 
-### hub_create_item (install app, driver or library code, or instantiate installed app code)
+### hub_create_app / hub_create_driver / hub_create_library (install new code; instantiate installed app code)
 
-**codeAppId second-step mode** (`type='app'` only; pass the `appId` from a prior code-install call as `codeAppId` to instantiate already-installed code AND commit the install; mutually exclusive with the code-install args):
+**hub_create_app codeAppId second-step mode** (pass the `appId` from a prior code-install `hub_create_app` call as `codeAppId` to instantiate already-installed code AND commit the install; mutually exclusive with the code-install args):
 - Submits the config page's Done, firing `installed()`/`initialize()` so the instance's schedules and event subscriptions register.
 - Works for apps whose first page installs with defaults.
 - A required first-page input with no default blocks the auto-Done (same behavior as the Hubitat UI) -- in that case the install cannot be auto-committed.
 
-**Code-install mode:**
+**Code-install mode (all three tools):**
 - Supply exactly one of `source`, `sourceFile` or `importUrl`. For large source, write it once with hub_write_file and pass the filename as `sourceFile`, so a retry does not re-send the whole source.
 - Library source needs a `library()` block with name, namespace, author and description. The hub compiles apps and drivers on save; it does not compile-check a library until an app or driver #includes it.
 - `success:true` carries the new `appId`, `driverId` or `libraryId` and `version`.
-- `success:false` with the hub's error (for example a compile error): nothing was saved. Fix the source and retry. A refusal carrying `retryable:true` came from a colliding save, not the source; retry it after a moment.
+- `success:false` with the hub's error (for example a compile error): nothing was saved. Fix the source and retry.
+- hub_create_driver only: every refusal is checked against the hub before it is reported, because concurrent creates have been refused for drivers that were saved. The tool reads the drivers with the source's definition name (and namespace) and compares each one's source with the source sent. One exact match returns `success:true` with its `driverId`, `foundAfterRefusal:true` and the hub's message in `hubMessage`; do not retry. No exact match is a refusal. After a compile error nothing was saved. When other saves were running at the same time, the hub can still finish a refused save later, so check hub_list_drivers before retrying. No definition name, more than three drivers with that name, more than one exact match, or a failed read leaves the outcome unknown.
 - `success:false` saying the install is unverified, or that the request failed: the outcome is unknown. Check hub_list_apps(scope='types'), hub_list_drivers or hub_list_libraries before retrying, because saving the same definition again creates a duplicate at a new id.
-- Bulk mode (`type='driver'` only): `installs=[{source|sourceFile|importUrl}, ...]`, which cannot be combined with the single-item fields. Items run in order and continue past failures. Each item reports its own `driverId`, `success`, `version` and `error`, and the top-level `success` is true only when every item succeeded. If the call stops at the time budget, it returns `status:"in_progress"` with `installsRemaining`; send only those again.
-- Slow writes: for `type='driver'`, MCP 2026-07-28 clients automatically continue this write and can replay its retained terminal response. Other types and older clients can lose the response on a transport drop while the hub still commits the write, so check the list tool before retrying. See the slow_ops section.
+- hub_create_driver bulk mode: `installs=[{source|sourceFile|importUrl}, ...]`, which cannot be combined with the single-item fields. Items run in order and continue past failures. Each item reports its own `driverId`, `success`, `version` and `error`, and the top-level `success` is true only when every item succeeded. An entry with an unknown key is refused alone, before anything is saved for it. If the call stops at the time budget, it returns `status:"in_progress"` with `installsRemaining`; send only those again.
+- Slow writes: MCP 2026-07-28 clients automatically continue hub_create_driver and can replay its retained terminal response. hub_create_app, hub_create_library and older clients can lose the response on a transport drop while the hub still commits the write, so check the list tool before retrying. See the slow_ops section.
 
 
 ### hub_update_app / hub_update_driver / hub_update_library — expectedVersion (optimistic lock)
@@ -36080,7 +36205,7 @@ def getToolGuideSubSections() {
                                      "hub_set_zigbee", "hub_call_matter"],
             hub_admin_write_devices: ["hub_call_device_command", "hub_call_device_swap",
                                       "hub_call_device_replace", "hub_create_device"],
-            hub_admin_write_code: ["hub_update_app", "hub_create_item", "hub_update_package"],
+            hub_admin_write_code: ["hub_update_app", "hub_create_app", "hub_update_package"],
             hub_admin_write_system: ["hub_get_info", "hub_list_modes", "hub_manage_mode",
                                      "hub_set_mode_manager", "hub_get_hsm_status",
                                      "hub_set_system_settings", "hub_update_mcp_settings",
