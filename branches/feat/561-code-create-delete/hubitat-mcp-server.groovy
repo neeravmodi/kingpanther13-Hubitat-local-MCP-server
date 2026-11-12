@@ -17272,9 +17272,16 @@ private Map _resolveCodeSource(args) {
     if (args.sourceFile) {
         mcpLog("info", "hub-admin", "Reading code source from File Manager: ${args.sourceFile}")
         def bytes = null
+        String readError = null
         try { bytes = downloadHubFile(args.sourceFile) }
-        catch (Exception e) { mcpLog("warn", "hub-admin", "Reading ${args.sourceFile} from File Manager failed: ${e.message}") }
-        if (bytes == null) throw new IllegalArgumentException("Source file '${args.sourceFile}' not found in File Manager")
+        catch (Exception e) {
+            readError = e.message ?: e.class.simpleName
+            if (readError == args.sourceFile.toString()) readError = null
+            mcpLog("warn", "hub-admin", "Reading ${args.sourceFile} from File Manager failed: ${readError}")
+        }
+        if (bytes == null) {
+            throw new IllegalArgumentException("Source file '${args.sourceFile}' not found in File Manager${readError ? " (the hub's read failed: ${readError})" : ""}".toString())
+        }
         String code = new String(bytes, "UTF-8")
         mcpLog("info", "hub-admin", "Read ${code.length()} chars from ${args.sourceFile}")
         return [code: code, mode: "sourceFile"]
@@ -18095,8 +18102,11 @@ def toolUpdateDriverCode(args) {
     }
     return toolUpdateItemCodeInner("driver", "driverId", args)
 }
-private boolean _isMissingAppBackupFailure(Exception e) {
-    return e instanceof IllegalArgumentException && e.message?.contains("no source code returned")
+private boolean _isMissingItemBackupFailure(String type, Exception e) {
+    if (!(e instanceof IllegalArgumentException)) return false
+    if (type == "app") return e.message?.contains("no source code returned")
+    if (type == "library") return e.message?.contains("library not found")
+    return false
 }
 private String _deleteInUseNote(String type) {
     if (type == "library") return "Remove the #include references from apps and drivers first."
@@ -18136,19 +18146,24 @@ def toolDeleteItem(args) {
     Integer idInt = _deleteIdArg(args.id)
     String id = idInt.toString()
     String label = type.capitalize()
-    boolean backupSucceeded = true
     def backupTaken = null
     try {
         backupTaken = (type == "library") ? backupLibrarySource(id) : backupItemSource(type, id)
     } catch (Exception backupErr) {
         Map unavailable = _itemBackupIndexUnavailableResult(backupErr)
         if (unavailable != null) return unavailable + [id: id, type: type]
-        if (type == "app" && _isMissingAppBackupFailure(backupErr)) {
-            return [success: false, error: "App ${id} does not exist".toString(), id: id, type: type,
-                    note: "Nothing was deleted. ${_codeListCall('app')} lists the app code ids.".toString()]
+        mcpLog("warn", "hub-admin", "Pre-delete backup failed for ${type} ${id}: ${backupErr.message} -- delete not sent")
+        String listCall = _codeListCall(type)
+        if (_isMissingItemBackupFailure(type, backupErr)) {
+            return [success: false, error: "${label} ${id} does not exist".toString(), id: id, type: type,
+                    note: "Nothing was deleted. ${listCall} lists the ${type} ids.".toString()]
         }
-        backupSucceeded = false
-        mcpLog("warn", "hub-admin", "Pre-delete backup failed for ${type} ${id}: ${backupErr.message} -- proceeding with delete")
+        if (backupErr.message?.contains("file upload failed")) {
+            return [success: false, error: "Pre-delete backup failed for ${type} ${id}: ${backupErr.message}".toString(), id: id, type: type,
+                    note: "Nothing was deleted. Retry once File Manager accepts writes.".toString()]
+        }
+        return [success: false, error: "Could not read the source of ${type} ${id} for the pre-delete backup: ${backupErr.message}. The ${type} may not exist.".toString(),
+                id: id, type: type, note: "Nothing was deleted. Check ${listCall} for the ${type} id.".toString()]
     }
     String deletePath = [app: "/app/edit/deleteJsonSafe/", driver: "/driver/editor/deleteJson/", library: "/library/edit/deleteJson/"][type]
     mcpLog("warn", "hub-admin", "Deleting ${type} ID: ${id}")
@@ -18173,7 +18188,7 @@ def toolDeleteItem(args) {
         def backupEntry = (_itemBackupManifest())?.get("${type}_${id}".toString()) ?: backupTaken
         def result = [
             success: true,
-            message: backupSucceeded ? "${label} deleted successfully. Source code backed up to File Manager.".toString() : "${label} deleted successfully. WARNING: Pre-delete backup failed -- source code may not be recoverable.".toString(),
+            message: "${label} deleted successfully. Source code backed up to File Manager.".toString(),
             id: id,
             type: type,
             lastBackup: formatTimestamp(state.lastBackupTimestamp),
@@ -18181,7 +18196,6 @@ def toolDeleteItem(args) {
             backupRetentionNote: backupEntry ? _itemBackupRetentionNote() : null,
             restoreHint: backupEntry ? "To restore: use '${[app: 'hub_create_app', driver: 'hub_create_driver', library: 'hub_create_library'][type]}' with the backup source, or download ${backupEntry.fileName} from Hubitat > Settings > File Manager and re-install manually. ${_itemBackupRetentionNote()}".toString() : null
         ]
-        if (!backupSucceeded) result.backupWarning = "Pre-delete backup could not be created. The source code may be permanently lost."
         return result
     } catch (Exception e) {
         mcpLogError("hub-admin", "${label} deletion failed", e)
@@ -34990,7 +35004,7 @@ Only run Z-Wave radio operations when the user explicitly asks for them.
 **hub_delete_room** - Devices become unassigned (not deleted). List affected devices first.
 Dashboards or automations that reference the room may need updating.
 
-**hub_delete_item (type=app|driver|library)** - Remove app instances via Hubitat UI first (apps). Change devices to different driver first (drivers). For libraries, check that no apps/drivers reference the library via #include namespace.Name before deleting -- deletion breaks any code that still includes it. Auto-backs up before deletion. `id` is the code id (digits only). Deleting an app id that does not exist returns `success:false`, unless a backup of that id under an hour old is reused: the hub accepts the delete of a missing app, so the call then reports success. A refusal whose message says the item is in use carries a note on what to remove first; a refusal with no message means the item may not exist, so check the list tool. A reply the hub does not clearly confirm returns `success:false` with `response`; check the list tool.
+**hub_delete_item (type=app|driver|library)** - Remove app instances via Hubitat UI first (apps). Change devices to different driver first (drivers). For libraries, check that no apps/drivers reference the library via #include namespace.Name before deleting -- deletion breaks any code that still includes it. Backs up the source to File Manager before deleting, and sends no delete when that backup fails: a missing app or library returns `<Type> N does not exist`, a source the hub cannot read (a missing driver reads this way) says the item may not exist, and a backup file that cannot be written says to retry once File Manager accepts writes. `id` is the code id (digits only). A backup of that id under an hour old is reused without a read, so a missing app then reaches the hub, which accepts the delete of a missing app, and the call reports success. A refusal whose message says the item is in use carries a note on what to remove first; a refusal with no message means the item may not exist, so check the list tool. A reply the hub does not clearly confirm returns `success:false` with `response`; check the list tool.
 
 ### hub_call_zwave (Z-Wave lifecycle action grouping + routing)
 
@@ -35070,7 +35084,7 @@ The radio firmware-flash `action` values (the bullet above summarizes these as "
 - Supply exactly one of `source`, `sourceFile` or `importUrl`. For large source, write it once with hub_write_file and pass the filename as `sourceFile`, so a retry does not re-send the whole source.
 - Library source needs a `library()` block with name, namespace, author and description. The hub compiles apps and drivers on save; it does not compile-check a library until an app or driver #includes it.
 - `success:true` carries the new `appId`, `driverId` or `libraryId` and `version`.
-- `success:false` with the hub's error (for example a compile error): nothing was saved. Fix the source and retry.
+- hub_create_app and hub_create_library: `success:false` with the hub's error (for example a compile error) means nothing was saved. Fix the source and retry.
 - hub_create_driver only: every refusal is checked against the hub before it is reported, because concurrent creates have been refused for drivers that were saved. The tool reads the drivers with the source's definition name (and namespace) and compares each one's source with the source sent. One exact match returns `success:true` with its `driverId`, `foundAfterRefusal:true` and the hub's message in `hubMessage`; do not retry. No exact match is a refusal. After a compile error nothing was saved. When other saves were running at the same time, the hub can still finish a refused save later, so check hub_list_drivers before retrying. No definition name, more than three drivers with that name, more than one exact match, or a failed read leaves the outcome unknown.
 - `success:false` saying the install is unverified, or that the request failed: the outcome is unknown. Check hub_list_apps(scope='types'), hub_list_drivers or hub_list_libraries before retrying, because saving the same definition again creates a duplicate at a new id.
 - hub_create_driver bulk mode: `installs=[{source|sourceFile|importUrl}, ...]`, which cannot be combined with the single-item fields. Items run in order and continue past failures. Each item reports its own `driverId`, `success`, `version` and `error`, and the top-level `success` is true only when every item succeeded. An entry with an unknown key is refused alone, before anything is saved for it. If the call stops at the time budget, it returns `status:"in_progress"` with `installsRemaining`; send only those again.
