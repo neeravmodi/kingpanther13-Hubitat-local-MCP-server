@@ -80,13 +80,19 @@ definition(
     singleInstance: true
 )
 def toolListDashboards(args = null) {
-    return _readDashboards().out
+    return _dashboardFlagged(_readDashboards().out)
 }
 def toolGetDashboard(args) {
     args = args ?: [:]
     String wantId = _requireDashboardId(args.dashboardId, "dashboardId", " to read")
     def read = _readDashboards()
-    return read.out.success == false ? read.out : _getDashboard(wantId, read)
+    return _dashboardFlagged(read.out.success == false ? read.out : _getDashboard(wantId, read))
+}
+private Map _dashboardFlagged(Map result) {
+    if (result?.success != false) return result
+    String guide = "See hub_get_tool_guide(section='dashboards')."
+    String note = result.note?.toString()
+    return result + [isError: true, note: !note ? guide : (note.contains(guide) ? note : note + " " + guide)]
 }
 private Map _readDashboards() {
     def page = _fetchDashboardPinToken()
@@ -317,7 +323,7 @@ private Map _dashboardConfigFromApp(String id) {
     }
 }
 def toolCreateDashboard(args) {
-    return _createDashboard(args ?: [:])
+    return _dashboardFlagged(_createDashboard(args ?: [:]))
 }
 private Map _createDashboard(Map args) {
     if (args.sourceId != null) return _copyDashboard(args)
@@ -542,7 +548,7 @@ private Map _copyLegacyDashboard(String sourceId, Map src, String name) {
     return out
 }
 def toolUpdateDashboard(args) {
-    return _updateDashboard(args ?: [:])
+    return _dashboardFlagged(_updateDashboard(args ?: [:]))
 }
 private Map _updateDashboard(Map args) {
     def updateId = _requireDashboardId(args.dashboardId, "dashboardId", " to update")
@@ -773,7 +779,7 @@ private void _warnUnauthorizedTileDevice(Map tile, Map status, List warnings) {
     }
 }
 def toolDeleteDashboard(args) {
-    return _deleteDashboard(args ?: [:])
+    return _dashboardFlagged(_deleteDashboard(args ?: [:]))
 }
 private Map _deleteDashboard(Map args) {
     requireDestructiveConfirm(args.confirm)
