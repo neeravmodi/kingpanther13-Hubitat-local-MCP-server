@@ -1099,7 +1099,7 @@ def toolListRooms(args = null) {
     return _listRoomSummaries(args?.cursor)
 }
 def toolGetRoom(args) {
-    def room = _requireRoom(args?.id).room
+    def room = _requireRoom(args?.roomId).room
     List roomIds = (room.deviceIds ?: []).collect { it.toString() }
     Map pageById = [:]
     if (roomIds) {
@@ -1158,9 +1158,9 @@ private Map _listRoomSummaries(cursor) {
     }
     return result
 }
-private Map _requireRoom(id) {
-    String rid = id?.toString()?.trim()
-    if (!rid) throw new IllegalArgumentException("id is required: the room id from hub_list_rooms.")
+private Map _requireRoom(roomId) {
+    String rid = roomId?.toString()?.trim()
+    if (!rid) throw new IllegalArgumentException("roomId is required: the room id from hub_list_rooms.")
     def rooms = (getRooms() ?: []).findAll { it != null }
     def room = rooms.find { it.id?.toString() == rid }
     if (!room) throw new IllegalArgumentException("No room has id '${rid}'. Call hub_list_rooms for room ids.")
@@ -1184,7 +1184,7 @@ private void _requireUniqueRoomName(List rooms, String name, exceptId) {
     }
 }
 private Map _roomFailure(String error, String note) {
-    return [success: false, isError: true, error: error,
+    return [success: false, error: error,
             note: "${note} See hub_get_tool_guide(section='rooms').".toString()]
 }
 private Map _saveRoom(roomId, String name, List deviceIds, String action) {
@@ -1230,7 +1230,7 @@ def toolUpdateRoom(args) {
     String newName = hasName ? args.name.toString().trim() : null
     if (hasName && !newName) throw new IllegalArgumentException("name must not be blank.")
     List newIds = hasDevices ? _roomDeviceIds(args.deviceIds) : null
-    Map found = _requireRoom(args.id)
+    Map found = _requireRoom(args.roomId)
     def room = found.room
     String roomId = room.id.toString()
     String oldName = room.name
@@ -1253,7 +1253,7 @@ def toolUpdateRoom(args) {
 }
 def toolDeleteRoom(args) {
     requireDestructiveConfirm(args.confirm)
-    def room = _requireRoom(args.id).room
+    def room = _requireRoom(args.roomId).room
     String roomId = room.id.toString()
     String roomName = room.name
     int deviceCount = room.deviceIds?.size() ?: 0
@@ -1289,9 +1289,9 @@ def _getAllToolDefinitions_partRooms() {
             inputSchema: [
                 type: "object",
                 properties: [
-                    id: [type: "string", description: "Room id from hub_list_rooms, e.g. \"5\""]
+                    roomId: [type: "string", description: "Room id from hub_list_rooms, e.g. \"5\""]
                 ],
-                required: ["id"]
+                required: ["roomId"]
             ]
         ],
         [
@@ -1309,30 +1309,30 @@ def _getAllToolDefinitions_partRooms() {
         ],
         [
             name: "hub_update_room",
-            description: "Rename a room and/or replace its device list, by id; an omitted field keeps its value. deviceIds is the FULL list: a device left out becomes unassigned, an added one leaves its previous room. Requires Write master, backup <24h, confirm=true.[[FLAT_TRIM]] Start from hub_get_room(id). After a rename, automations or dashboards that name the room may need updating. See hub_get_tool_guide(section='rooms').[[/FLAT_TRIM]]",
+            description: "Rename a room and/or replace its device list, by id; an omitted field keeps its value. deviceIds is the FULL list: a device left out becomes unassigned, an added one leaves its previous room. Requires Write master, backup <24h, confirm=true.[[FLAT_TRIM]] Start from hub_get_room(roomId). After a rename, automations or dashboards that name the room may need updating. See hub_get_tool_guide(section='rooms').[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
-                    id: [type: "string", description: "Room id, e.g. \"5\""],
+                    roomId: [type: "string", description: "Room id, e.g. \"5\""],
                     name: [type: "string", description: "New room name"],
                     deviceIds: [type: "array", description: "Complete device list, e.g. [\"12\",\"34\"]; [] empties the room.", items: [type: "string"]],
                     confirm: [type: "boolean", description: "REQUIRED: must be true. Confirms a recent backup exists and the user approved the change."]
                 ],
-                required: ["id", "confirm"]
+                required: ["roomId", "confirm"]
             ]
         ],
         [
             name: "hub_delete_room",
             description: """⚠️ DESTRUCTIVE: Permanently deletes a room by id. Its devices become unassigned (not deleted). Requires Write master, backup <24h, confirm=true.[[FLAT_TRIM]]
 
-PRE-FLIGHT: 1) Backup <24h 2) Verify the room with hub_get_room(id) 3) List affected devices to user 4) Get explicit confirmation 5) Set confirm=true[[/FLAT_TRIM]]""",
+PRE-FLIGHT: 1) Backup <24h 2) Verify the room with hub_get_room(roomId) 3) List affected devices to user 4) Get explicit confirmation 5) Set confirm=true[[/FLAT_TRIM]]""",
             inputSchema: [
                 type: "object",
                 properties: [
-                    id: [type: "string", description: "Room id, e.g. \"5\""],
+                    roomId: [type: "string", description: "Room id, e.g. \"5\""],
                     confirm: [type: "boolean", description: "REQUIRED: must be true. Confirms a recent backup exists and the user explicitly approved the deletion."]
                 ],
-                required: ["id", "confirm"]
+                required: ["roomId", "confirm"]
             ]
         ]
     ]
@@ -31029,10 +31029,10 @@ def getGatewayConfig() {
             tools: ["hub_list_rooms", "hub_get_room", "hub_create_room", "hub_delete_room", "hub_update_room"],
             summaries: [
                 hub_list_rooms: "List rooms (id, name, device ids). Args: cursor?",
-                hub_get_room: "Read one room's devices and their current states. Args: id",
+                hub_get_room: "Read one room's devices and their current states. Args: roomId",
                 hub_create_room: "Create a room, optionally with devices. Args: name, deviceIds?, confirm=true",
-                hub_delete_room: "Permanently delete a room; its devices become unassigned. Args: id, confirm=true",
-                hub_update_room: "Rename a room and/or replace its full device list. Args: id, name?, deviceIds?, confirm=true"
+                hub_delete_room: "Permanently delete a room; its devices become unassigned. Args: roomId, confirm=true",
+                hub_update_room: "Rename a room and/or replace its full device list. Args: roomId, name?, deviceIds?, confirm=true"
             ],
             searchHints: [
                 hub_list_rooms: "show all locations areas groups",
@@ -31309,7 +31309,7 @@ def getGatewayConfig() {
             tools: ["hub_list_rooms", "hub_get_room"],
             summaries: [
                 hub_list_rooms: "List rooms (id, name, device ids). Args: cursor?",
-                hub_get_room: "Read one room's devices and their current states. Args: id"
+                hub_get_room: "Read one room's devices and their current states. Args: roomId"
             ],
             searchHints: [
                 hub_list_rooms: "show all locations areas groups rooms",
@@ -35109,7 +35109,7 @@ Only run Z-Wave radio operations when the user explicitly asks for them.
 - A Hub Mesh LINKED device (a local proxy for a peer's shared device) is UNLINKED local-only: only this hub's proxy is removed, the peer's source device is untouched. The tool warns when local apps use it (appsUsing), and distinctly when it could not check (mesh read failed / row missing).
 - All details logged to MCP debug logs for audit
 
-**hub_delete_room** - Devices become unassigned (not deleted). List affected devices first with hub_get_room(id).
+**hub_delete_room** - Devices become unassigned (not deleted). List affected devices first with hub_get_room(roomId).
 Dashboards or automations that reference the room may need updating.
 
 **hub_delete_item (type=app|driver|library)** - Remove app instances via Hubitat UI first (apps). Change devices to different driver first (drivers). For libraries, check that no apps/drivers reference the library via #include namespace.Name before deleting -- deletion breaks any code that still includes it. Auto-backs up before deletion.
@@ -36290,7 +36290,7 @@ Each entry: id, name, namespace, a private flag, and a `contains` summary of the
     ,
         rooms: '''## Rooms
 
-Room tools address a room by its `id` (a string from hub_list_rooms), never by name. A device is in at most one room. hub_delete_room is also under "Destructive Write Tools".
+Room tools address a room by its id (a string from hub_list_rooms, passed as `roomId`), never by name. A device is in at most one room. hub_delete_room is also under "Destructive Write Tools".
 
 ### hub_list_rooms
 
@@ -36298,7 +36298,7 @@ Every room as `{id, name, deviceCount, deviceIds}`, sorted by name; `cursor` pag
 
 ### hub_get_room
 
-Takes the room's `id` (from hub_list_rooms). Returns `{id, name, deviceCount, devices}`, the devices read once from the hub's Devices page (as hub_list_devices) with `label`, `name` and `currentStates` (credential-named states masked while Hide passwords and credentials is on). A device not selected for MCP access has `accessible=false` and no states; one the page does not list has `metadataUnavailable=true`. If the page cannot be read the call returns an error. To filter or page a room's devices use hub_list_devices(roomFilter=<room name>).
+Takes the room's `roomId` (from hub_list_rooms). Returns `{id, name, deviceCount, devices}`, the devices read once from the hub's Devices page (as hub_list_devices) with `label`, `name` and `currentStates` (credential-named states masked while Hide passwords and credentials is on). A device not selected for MCP access has `accessible=false` and no states; one the page does not list has `metadataUnavailable=true`. If the page cannot be read the call returns an error. To filter or page a room's devices use hub_list_devices(roomFilter=<room name>).
 
 ### hub_create_room
 
@@ -36306,11 +36306,11 @@ Names must be unique (case-insensitive; the hub itself allows duplicates). A lis
 
 ### hub_update_room
 
-`deviceIds` replaces the room's device list, as the hub's Rooms page does: a device left out becomes unassigned, an added one leaves its previous room, `[]` empties the room. Start from hub_get_room(id). The result reports `previousName` after a rename, and `deviceIds`, `deviceCount` and `unassignedDeviceIds` when the list was passed. A device id the hub does not know fails the save with nothing written. After a rename, automations or dashboards that name the room may need updating.
+`deviceIds` replaces the room's device list, as the hub's Rooms page does: a device left out becomes unassigned, an added one leaves its previous room, `[]` empties the room. Start from hub_get_room(roomId). The result reports `previousName` after a rename, and `deviceIds`, `deviceCount` and `unassignedDeviceIds` when the list was passed. A device id the hub does not know fails the save with nothing written. After a rename, automations or dashboards that name the room may need updating.
 
 ### hub_delete_room
 
-Devices become unassigned (not deleted); the result reports `devicesUnassigned`. Pre-flight: backup <24h, verify the room with hub_get_room(id), list the affected devices to the user, get explicit confirmation, set confirm=true.
+Devices become unassigned (not deleted); the result reports `devicesUnassigned`. Pre-flight: backup <24h, verify the room with hub_get_room(roomId), list the affected devices to the user, get explicit confirmation, set confirm=true.
 ''',
         slow_ops: '''## Slow operations
 
