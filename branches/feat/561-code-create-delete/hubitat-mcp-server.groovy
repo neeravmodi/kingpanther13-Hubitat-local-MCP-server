@@ -17309,57 +17309,6 @@ private String _hubMessageText(msg) {
     if (text == null) return null
     return text.replaceAll(/<\/?[A-Za-z!][^>]*>/, "").trim()
 }
-private Map _driverDefinitionName(String source) {
-    def block = (source =~ /(?s)\bdefinition\s*\((.*?)\)/)
-    if (!block.find()) return null
-    String params = block.group(1)
-    def name = (params =~ /\bname\s*:\s*(["'])(.*?)\1/)
-    if (!name.find()) return null
-    def namespace = (params =~ /\bnamespace\s*:\s*(["'])(.*?)\1/)
-    return [name: name.group(2), namespace: namespace.find() ? namespace.group(2) : null]
-}
-private Map _settleRefusedDriverCreate(String sourceCode, String hubMsg, String sourceMode) {
-    String error = "Driver installation failed: ${hubMsg}".toString()
-    Map unknown = _codeCreateFailure("driver", error, _codeCreateUnknownOutcomeNote("driver"))
-    Map definition = _driverDefinitionName(sourceCode)
-    if (definition == null) return unknown
-    def exact = []
-    try {
-        def txt = hubInternalGet("/hub2/userDeviceTypes", null, 30)
-        def rows = txt ? new groovy.json.JsonSlurper().parseText(txt) : null
-        if (!(rows instanceof List)) return unknown
-        def named = rows.findAll { it instanceof Map && it.name?.toString() == definition.name &&
-            (definition.namespace == null || it.namespace?.toString() == definition.namespace) }
-        if (named.size() > 3) return unknown
-        for (row in named) {
-            def codeText = hubInternalGet("/driver/ajax/code", [id: row.id?.toString()])
-            def code = codeText ? new groovy.json.JsonSlurper().parseText(codeText) : null
-            if (!(code instanceof Map) || code.status == "error" || code.source == null) return unknown
-            if (code.source.toString() == sourceCode) exact << [id: row.id?.toString(), version: code.version]
-        }
-    } catch (Exception e) {
-        mcpLog("warn", "hub-admin", "Driver reads after a refused create failed: ${e.message}")
-        return unknown
-    }
-    if (exact.isEmpty()) {
-        return _codeCreateFailure("driver", error, "No driver on the hub holds this source. A compile error means nothing was saved: fix the source and retry. If other saves were running at the same time, check hub_list_drivers before retrying: the hub can finish a refused save later.")
-    }
-    if (exact.size() > 1) return unknown
-    def match = exact[0]
-    mcpLog("info", "hub-admin", "Driver create was refused (${hubMsg}) but driver ${match.id} holds the sent source")
-    return [
-        success: true,
-        message: "Driver installed: the hub refused the save, but a driver with this exact source is on the hub.",
-        driverId: match.id,
-        version: match.version,
-        foundAfterRefusal: true,
-        hubMessage: hubMsg,
-        sourceMode: sourceMode,
-        sourceLength: sourceCode.length(),
-        note: "The hub refused the save ('${hubMsg}'), but driver ${match.id} on the hub holds exactly this source, so it was saved. Do not retry.".toString(),
-        lastBackup: formatTimestamp(state.lastBackupTimestamp)
-    ]
-}
 private Map _createCodeItem(String type, args) {
     Map resolved = _resolveCodeSource(args)
     String sourceCode = resolved.code
@@ -17376,7 +17325,6 @@ private Map _createCodeItem(String type, args) {
     if (parsed instanceof Map && parsed.success == false) {
         String hubMsg = _hubMessageText(parsed.message ?: parsed.errorMessage) ?: "the hub refused the source"
         mcpLog("warn", "hub-admin", "${label} create refused: ${hubMsg}")
-        if (type == "driver") return _settleRefusedDriverCreate(sourceCode, hubMsg, sourceMode)
         String note = type == "library" ?
             "The source needs a library() block with name, namespace, author and description. Fix the source and retry." :
             "Fix the source and retry."
@@ -17426,14 +17374,14 @@ private Map _createDriversBulk(args) {
                     resume: [note: "Completed driver installs are retained. Continue with only installsRemaining; do not repeat completed installs."]]
         }
         def item = args.installs[idx]
-        if (!(item instanceof Map) || (item.source == null && item.sourceFile == null && item.importUrl == null)) {
-            itemResults << [driverId: null, success: false, error: "Each installs entry must have a 'source', 'sourceFile', or 'importUrl' field."]
+        def unknownKeys = item instanceof Map ? item.keySet().collect { it as String }.findAll { !(it in bulkEntryKeys) } : []
+        if (unknownKeys) {
+            itemResults << [driverId: null, success: false, error: "Unknown installs[] argument${unknownKeys.size() == 1 ? '' : 's'}: ${unknownKeys.sort().join(', ')}. Nothing was installed for this entry. Valid arguments: ${bulkEntryKeys.join(', ')}.".toString(), note: "Correct or remove the key and send this entry again. See ${_codeGuidePointer()}.".toString()]
             allSucceeded = false
             continue
         }
-        def unknownKeys = item.keySet().collect { it as String }.findAll { !(it in bulkEntryKeys) }
-        if (unknownKeys) {
-            itemResults << [driverId: null, success: false, error: "Unknown installs[] argument${unknownKeys.size() == 1 ? '' : 's'}: ${unknownKeys.sort().join(', ')}. Nothing was installed for this entry. Valid arguments: ${bulkEntryKeys.join(', ')}.".toString(), note: "Correct or remove the key and send this entry again. See ${_codeGuidePointer()}.".toString()]
+        if (!(item instanceof Map) || (item.source == null && item.sourceFile == null && item.importUrl == null)) {
+            itemResults << [driverId: null, success: false, error: "Each installs entry must have a 'source', 'sourceFile', or 'importUrl' field."]
             allSucceeded = false
             continue
         }
@@ -17444,11 +17392,6 @@ private Map _createDriversBulk(args) {
                 entry.version = r.version
                 entry.sourceMode = r.sourceMode
                 entry.sourceLength = r.sourceLength
-                if (r.foundAfterRefusal) {
-                    entry.foundAfterRefusal = true
-                    entry.hubMessage = r.hubMessage
-                    entry.note = r.note
-                }
             } else {
                 entry.error = r.error ?: "Install failed"
                 if (r.note) entry.note = r.note
@@ -18048,14 +17991,14 @@ def toolUpdateDriverCode(args) {
                         resume: [note: "Completed driver updates are retained. Continue with only updatesRemaining, preserving their order and expectedVersion values."]]
             }
             def item = args.updates[idx]
-            if (!(item instanceof Map) || !item.driverId) {
-                itemResults << [driverId: item?.driverId?.toString() ?: "item[${idx}]", success: false, error: "Each updates entry must have a 'driverId' field."]
+            def unknownKeys = item instanceof Map ? item.keySet().collect { it as String }.findAll { !(it in bulkEntryKeys) } : []
+            if (unknownKeys) {
+                itemResults << [driverId: item.driverId?.toString() ?: "item[${idx}]", success: false, error: "Unknown updates[] argument${unknownKeys.size() == 1 ? '' : 's'}: ${unknownKeys.sort().join(', ')}. Nothing was changed for this driver. Valid arguments: ${bulkEntryKeys.join(', ')}.", note: "Correct or remove the key and send this entry again. See ${_codeGuidePointer()}.".toString()]
                 allSucceeded = false
                 continue
             }
-            def unknownKeys = item.keySet().collect { it as String }.findAll { !(it in bulkEntryKeys) }
-            if (unknownKeys) {
-                itemResults << [driverId: item.driverId.toString(), success: false, error: "Unknown updates[] argument${unknownKeys.size() == 1 ? '' : 's'}: ${unknownKeys.sort().join(', ')}. Nothing was changed for this driver. Valid arguments: ${bulkEntryKeys.join(', ')}.", note: "Correct or remove the key and send this entry again. See ${_codeGuidePointer()}.".toString()]
+            if (!(item instanceof Map) || !item.driverId) {
+                itemResults << [driverId: (item instanceof Map ? item.driverId?.toString() : null) ?: "item[${idx}]", success: false, error: "Each updates entry must have a 'driverId' field."]
                 allSucceeded = false
                 continue
             }
@@ -18135,7 +18078,7 @@ private Integer _deleteIdArg(rawId) {
         Long value = raw as Long
         if (value > 0 && value <= Integer.MAX_VALUE) return value as Integer
     }
-    throw new IllegalArgumentException("id is required and must be a positive integer (got: '${rawId}')")
+    throw new IllegalArgumentException("item_id is required and must be a positive integer (got: '${rawId}')")
 }
 def toolDeleteItem(args) {
     String type = args.type?.toString()
@@ -18143,7 +18086,7 @@ def toolDeleteItem(args) {
         throw new IllegalArgumentException("type is required and must be one of: app, driver, library")
     }
     requireDestructiveConfirm(args.confirm)
-    Integer idInt = _deleteIdArg(args.id)
+    Integer idInt = _deleteIdArg(args.item_id)
     String id = idInt.toString()
     String label = type.capitalize()
     def backupTaken = null
@@ -18683,7 +18626,7 @@ A transport drop can lose the response while the hub still commits this write; v
             name: "hub_create_driver",
             description: """⚠️ Install new driver. Show code to user and get confirmation first.
 
-Supply the code via exactly one of source / sourceFile / importUrl (mutually exclusive; see each param). For >1 driver use BULK mode (the installs param).
+Supply the code via exactly one of source / sourceFile / importUrl (mutually exclusive; see each param). Send driver creates one at a time, never in parallel; for >1 driver use BULK mode (the installs param), which runs them in order.
 
 The hub compiles on save and returns success=false with its error. Requires Write master + confirm + backup <24h. Returns the new driverId and version (bulk: one result per entry).
 [[FLAT_TRIM]]
@@ -18809,10 +18752,10 @@ For type=driver, MCP 2026-07-28 clients automatically continue this slow write a
                 type: "object",
                 properties: [
                     type: [type: "string", enum: ["app", "driver", "library"], description: "What to delete."],
-                    id: [type: "string", description: "App/driver/library code ID (positive integer), from hub_list_apps(scope='types') / hub_list_drivers / hub_list_libraries respectively."],
+                    item_id: [type: "string", description: "App/driver/library code ID (positive integer), from hub_list_apps(scope='types') / hub_list_drivers / hub_list_libraries respectively."],
                     confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms backup was created and user approved."]
                 ],
-                required: ["type", "id", "confirm"]
+                required: ["type", "item_id", "confirm"]
             ]
         ],
         [
@@ -30995,7 +30938,7 @@ def getGatewayConfig() {
                 hub_create_driver: "Install new driver. To save context prefer importUrl (hub fetches the source) or hub_write_file + sourceFile; inline source for stubs only. For 1: source|sourceFile|importUrl. For >1: USE BULK (single round-trip: installs=[{source|sourceFile|importUrl},...]). confirm=true",
                 hub_update_app: "Modify existing app code (CRITICAL), and/or enable OAuth on it. To save context prefer importUrl (hub fetches the source itself) or hub_write_file + sourceFile over inline source. Args: appId, source|sourceFile|importUrl|resave, oauth ({enabled,client_id?,client_secret?,refresh_secret?} -- enable/configure OAuth, returns the clientId/secret), confirm=true",
                 hub_update_driver: "Modify existing driver code (CRITICAL). For 1 driver: driverId+source|sourceFile|importUrl|resave. For >1 drivers: USE BULK (single round-trip: updates=[{driverId,sourceFile|importUrl},...]). To save context prefer importUrl (hub fetches) or hub_write_file + sourceFile over inline. confirm=true",
-                hub_delete_item: "Permanently delete an app/driver/library (DESTRUCTIVE, auto-backs up). Args: type (app|driver|library), id, confirm=true",
+                hub_delete_item: "Permanently delete an app/driver/library (DESTRUCTIVE, auto-backs up). Args: type (app|driver|library), item_id, confirm=true",
                 hub_create_library: "Install new Groovy library (#include namespace.Name). To save context prefer importUrl (hub fetches the source) or hub_write_file + sourceFile; inline source for stubs only. Args: source|sourceFile|importUrl, confirm=true",
                 hub_update_library: "Modify existing library code. To save context prefer importUrl (hub fetches) or hub_write_file + sourceFile over inline. Args: libraryId, source|sourceFile|importUrl|resave, confirm=true",
                 hub_install_bundle: "Install a code bundle (.zip) from a URL the way HPM does (hub fetches+unpacks into Libraries/Apps/Drivers Code). Args: importUrl (zip), installer?, confirm=true",
@@ -35004,7 +34947,7 @@ Only run Z-Wave radio operations when the user explicitly asks for them.
 **hub_delete_room** - Devices become unassigned (not deleted). List affected devices first.
 Dashboards or automations that reference the room may need updating.
 
-**hub_delete_item (type=app|driver|library)** - Remove app instances via Hubitat UI first (apps). Change devices to different driver first (drivers). For libraries, check that no apps/drivers reference the library via #include namespace.Name before deleting -- deletion breaks any code that still includes it. Backs up the source to File Manager before deleting, and sends no delete when that backup fails: a missing app or library returns `<Type> N does not exist`, a source the hub cannot read (a missing driver reads this way) says the item may not exist, and a backup file that cannot be written says to retry once File Manager accepts writes. `id` is the code id (digits only). A backup of that id under an hour old is reused without a read, so a missing app then reaches the hub, which accepts the delete of a missing app, and the call reports success. A refusal whose message says the item is in use carries a note on what to remove first; a refusal with no message means the item may not exist, so check the list tool. A reply the hub does not clearly confirm returns `success:false` with `response`; check the list tool.
+**hub_delete_item (type=app|driver|library)** - Remove app instances via Hubitat UI first (apps). Change devices to different driver first (drivers). For libraries, check that no apps/drivers reference the library via #include namespace.Name before deleting -- deletion breaks any code that still includes it. Backs up the source to File Manager before deleting, and sends no delete when that backup fails: a missing app or library returns `<Type> N does not exist`, a source the hub cannot read (a missing driver reads this way) says the item may not exist, and a backup file that cannot be written says to retry once File Manager accepts writes. `item_id` is the code id (digits only). A backup of that id under an hour old is reused without a read, so a missing app then reaches the hub, which accepts the delete of a missing app, and the call reports success. A refusal whose message says the item is in use carries a note on what to remove first; a refusal with no message means the item may not exist, so check the list tool. A reply the hub does not clearly confirm returns `success:false` with `response`; check the list tool.
 
 ### hub_call_zwave (Z-Wave lifecycle action grouping + routing)
 
@@ -35084,8 +35027,8 @@ The radio firmware-flash `action` values (the bullet above summarizes these as "
 - Supply exactly one of `source`, `sourceFile` or `importUrl`. For large source, write it once with hub_write_file and pass the filename as `sourceFile`, so a retry does not re-send the whole source.
 - Library source needs a `library()` block with name, namespace, author and description. The hub compiles apps and drivers on save; it does not compile-check a library until an app or driver #includes it.
 - `success:true` carries the new `appId`, `driverId` or `libraryId` and `version`.
-- hub_create_app and hub_create_library: `success:false` with the hub's error (for example a compile error) means nothing was saved. Fix the source and retry.
-- hub_create_driver only: every refusal is checked against the hub before it is reported, because concurrent creates have been refused for drivers that were saved. The tool reads the drivers with the source's definition name (and namespace) and compares each one's source with the source sent. One exact match returns `success:true` with its `driverId`, `foundAfterRefusal:true` and the hub's message in `hubMessage`; do not retry. No exact match is a refusal. After a compile error nothing was saved. When other saves were running at the same time, the hub can still finish a refused save later, so check hub_list_drivers before retrying. No definition name, more than three drivers with that name, more than one exact match, or a failed read leaves the outcome unknown.
+- `success:false` with the hub's error (for example a compile error) means nothing was saved. Fix the source and retry.
+- hub_create_driver: send driver creates one at a time, waiting for one to finish before sending the next. To create several, use `installs[]`, which runs its entries in order.
 - `success:false` saying the install is unverified, or that the request failed: the outcome is unknown. Check hub_list_apps(scope='types'), hub_list_drivers or hub_list_libraries before retrying, because saving the same definition again creates a duplicate at a new id.
 - hub_create_driver bulk mode: `installs=[{source|sourceFile|importUrl}, ...]`, which cannot be combined with the single-item fields. Items run in order and continue past failures. Each item reports its own `driverId`, `success`, `version` and `error`, and the top-level `success` is true only when every item succeeded. An entry with an unknown key is refused alone, before anything is saved for it. If the call stops at the time budget, it returns `status:"in_progress"` with `installsRemaining`; send only those again.
 - Slow writes: MCP 2026-07-28 clients automatically continue hub_create_driver and can replay its retained terminal response. hub_create_app, hub_create_library and older clients can lose the response on a transport drop while the hub still commits the write, so check the list tool before retrying. See the slow_ops section.
