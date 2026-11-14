@@ -4,7 +4,7 @@
  * A native MCP (Model Context Protocol) server that runs directly on Hubitat
  * with a built-in custom rule engine for creating automations via Claude.
  *
- * Version: 5.1.8 - Enriched list_devices summary + server-side filter (disabled, enabled, stale:N)
+ * Version: 5.1.9 - Enriched list_devices summary + server-side filter (disabled, enabled, stale:N)
  *
  * Installation:
  * 1. Go to Hubitat > Apps Code > New App
@@ -1095,6 +1095,7 @@ def _toolDisplayMeta_partDashboards() {
         hub_clone_dashboard: [title: "Clone Dashboard", summary: "Clone an Easy or legacy Hubitat® Dashboard into a new one."]
     ]
 }
+@groovy.transform.Field static final Object ROOM_UPDATE_LOCK = new Object()
 def toolListRooms(args = null) {
     return _listRoomSummaries(args?.cursor)
 }
@@ -1106,8 +1107,8 @@ def toolGetRoom(args) {
         try {
             for (pageRec in _readDevicesPage(roomIds as Set)) pageById.put(pageRec.id, pageRec)
         } catch (IllegalStateException e) {
-            return [success: false, isError: true, error: "The hub's device list (/hub2/devicesList) could not be read: ${e.message}".toString(),
-                    note: "Retry; if it persists check the hub's Devices page."]
+            return [success: false, error: "The hub's device list (/hub2/devicesList) could not be read: ${e.message}".toString(),
+                    note: "Retry; if it persists check the hub's Devices page. See hub_get_tool_guide(section='rooms')."]
         }
     }
     Set authorized = _mcpAuthorizedIds(getChildDevices() ?: [])
@@ -1149,7 +1150,7 @@ private Map _listRoomSummaries(cursor) {
             deviceCount: room.deviceIds?.size() ?: 0,
             deviceIds: room.deviceIds?.collect { it.toString() } ?: []
         ]
-    }.sort { it.name }
+    }.sort { (it.name ?: '').toLowerCase() }
     def paged = _paginateList(roomList, cursor, 100, "hub_list_rooms")
     def result = [rooms: paged.page, count: paged.page.size()]
     if (cursor != null) {
@@ -1172,11 +1173,29 @@ private List _roomDeviceIds(deviceIds) {
     }
     return deviceIds.collect {
         String s = it?.toString()?.trim()
-        if (!(s ==~ /\d+/)) {
+        if (!(s ==~ /\d{1,10}/) || (s as Long) > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("deviceIds must be numeric device ids; got '${it}'. Use hub_list_devices to find device ids.")
         }
         s as Integer
     }.unique()
+}
+private void _requireRoomDevicesSelected(Collection ids) {
+    if (!ids) return
+    Set authorized = _mcpAuthorizedIds(getChildDevices() ?: [])
+    if (authorized == null) return
+    List outside = ids.collect { it.toString() }.unique().findAll { !authorized.contains(it) }
+    if (outside) {
+        throw new IllegalArgumentException("deviceIds ${outside.join(', ')} ${outside.size() == 1 ? 'is' : 'are'} outside the MCP device selection, so this room write cannot add or remove ${outside.size() == 1 ? 'it' : 'them'}. Select ${outside.size() == 1 ? 'it' : 'them'} in the MCP app's device list, or turn on Bypass Device Allowlist. A device hub_get_room shows with accessible=false stays in the list you send.")
+    }
+}
+private List _roomMovedDevices(List rooms, Collection ids, String exceptRoomId) {
+    List moved = []
+    for (id in ids) {
+        String did = id.toString()
+        def from = rooms.find { r -> r.id?.toString() != exceptRoomId && r.deviceIds?.any { it.toString() == did } }
+        if (from) moved << [deviceId: did, fromRoomId: from.id.toString(), fromRoom: from.name]
+    }
+    return moved
 }
 private void _requireUniqueRoomName(List rooms, String name, exceptId) {
     if (rooms.find { it.name?.toLowerCase() == name.toLowerCase() && it.id?.toString() != exceptId?.toString() }) {
@@ -1184,6 +1203,7 @@ private void _requireUniqueRoomName(List rooms, String name, exceptId) {
     }
 }
 private Map _roomFailure(String error, String note) {
+    mcpLog("warn", "room", error)
     return [success: false, error: error,
             note: "${note} See hub_get_tool_guide(section='rooms').".toString()]
 }
@@ -1212,15 +1232,39 @@ def toolCreateRoom(args) {
     String name = args.name?.toString()?.trim()
     if (!name) throw new IllegalArgumentException("Room name is required")
     List deviceIds = args.deviceIds == null ? [] : _roomDeviceIds(args.deviceIds)
-    _requireUniqueRoomName((getRooms() ?: []).findAll { it != null }, name, null)
+    List rooms = (getRooms() ?: []).findAll { it != null }
+    _requireUniqueRoomName(rooms, name, null)
+    _requireRoomDevicesSelected(deviceIds)
+    List moved = _roomMovedDevices(rooms, deviceIds, null)
     def saved = _saveRoom(0, name, deviceIds, "create room '${name}'")
     if (saved.failure) return saved.failure
     mcpLog("info", "room", "Created room '${name}' (ID: ${saved.roomId})")
-    return [
-        success: true,
-        room: [id: saved.roomId, name: name, deviceCount: deviceIds.size(), deviceIds: deviceIds.collect { it.toString() }],
-        message: "Room '${name}' created."
-    ]
+    Map created = [id: saved.roomId, name: name, deviceCount: deviceIds.size(), deviceIds: deviceIds.collect { it.toString() }]
+    if (moved) created.movedDevices = moved
+    return [success: true, room: created, message: "Room '${name}' created."]
+}
+private Map _renameRoom(String roomId, String name) {
+    def raw
+    try {
+        raw = hubInternalGet("/room/updateName", [id: roomId, name: name])
+    } catch (Exception e) {
+        return _roomFailure("Could not rename room ${roomId}: ${e.message}".toString(),
+            "The hub may still have renamed it; check with hub_list_rooms before retrying.")
+    }
+    def parsed = null
+    try {
+        parsed = raw?.trim() ? new groovy.json.JsonSlurper().parseText(raw) : null
+    } catch (Exception ignored) {
+        parsed = null
+    }
+    if (parsed instanceof Map && parsed.success == true) return null
+    if (parsed instanceof Map && parsed.success == false) {
+        return _roomFailure("The hub refused to rename room ${roomId}: ${parsed.message ?: 'no reason given'}".toString(),
+            "Nothing was saved.")
+    }
+    String body = raw?.trim() ? raw.toString().take(200) : "an empty body"
+    return _roomFailure("The hub's answer to rename room ${roomId} carried no success flag (${body}).".toString(),
+        "The rename may have landed; check with hub_list_rooms before retrying.")
 }
 def toolUpdateRoom(args) {
     requireDestructiveConfirm(args.confirm)
@@ -1230,25 +1274,36 @@ def toolUpdateRoom(args) {
     String newName = hasName ? args.name.toString().trim() : null
     if (hasName && !newName) throw new IllegalArgumentException("name must not be blank.")
     List newIds = hasDevices ? _roomDeviceIds(args.deviceIds) : null
-    Map found = _requireRoom(args.roomId)
+    synchronized (ROOM_UPDATE_LOCK) {
+        return _updateRoomLocked(args.roomId, newName, newIds)
+    }
+}
+private Map _updateRoomLocked(roomIdArg, String newName, List newIds) {
+    Map found = _requireRoom(roomIdArg)
     def room = found.room
     String roomId = room.id.toString()
     String oldName = room.name
-    if (hasName) _requireUniqueRoomName(found.rooms, newName, roomId)
+    if (newName != null) _requireUniqueRoomName(found.rooms, newName, roomId)
     List currentIds = (room.deviceIds ?: []).collect { it as Integer }
-    String finalName = hasName ? newName : oldName
-    List finalIds = hasDevices ? newIds : currentIds
-    def saved = _saveRoom(roomId as Integer, finalName, finalIds, "update room ${roomId}")
-    if (saved.failure) return saved.failure
+    String finalName = newName ?: oldName
     Map updated = [id: roomId, name: finalName]
     if (finalName != oldName) updated.previousName = oldName
-    if (hasDevices) {
-        updated.deviceIds = finalIds.collect { it.toString() }
-        updated.deviceCount = finalIds.size()
-        List dropped = (currentIds - finalIds).collect { it.toString() }
-        if (dropped) updated.unassignedDeviceIds = dropped
+    if (newIds == null) {
+        Map failure = _renameRoom(roomId, finalName)
+        if (failure) return failure
+    } else {
+        List added = newIds - currentIds
+        List dropped = currentIds - newIds
+        _requireRoomDevicesSelected(added + dropped)
+        List moved = _roomMovedDevices(found.rooms, added, roomId)
+        def saved = _saveRoom(roomId as Integer, finalName, newIds, "update room ${roomId}")
+        if (saved.failure) return saved.failure
+        updated.deviceIds = newIds.collect { it.toString() }
+        updated.deviceCount = newIds.size()
+        if (dropped) updated.unassignedDeviceIds = dropped.collect { it.toString() }
+        if (moved) updated.movedDevices = moved
     }
-    mcpLog("info", "room", "Updated room ${roomId}: '${oldName}' -> '${finalName}'${hasDevices ? ", ${finalIds.size()} devices" : ''}")
+    mcpLog("info", "room", "Updated room ${roomId}: '${oldName}' -> '${finalName}'${newIds != null ? ", ${newIds.size()} devices" : ''}")
     return [success: true, room: updated, message: "Room '${finalName}' updated."]
 }
 def toolDeleteRoom(args) {
@@ -1296,7 +1351,7 @@ def _getAllToolDefinitions_partRooms() {
         ],
         [
             name: "hub_create_room",
-            description: "Create a room, optionally with devices (each moves out of its current room). Requires Write master, backup <24h, confirm=true.[[FLAT_TRIM]] Returns the new room's id. Room names must be unique. To move devices into an existing room use hub_update_room instead. See hub_get_tool_guide(section='rooms').[[/FLAT_TRIM]]",
+            description: "Create a room, optionally with devices (each moves out of its current room). Requires Write master, backup <24h, confirm=true.[[FLAT_TRIM]] Returns the new room's id, and movedDevices for devices taken from another room. Room names must be unique. Devices outside the MCP device selection are refused unless Bypass Device Allowlist is on. To move devices into an existing room use hub_update_room instead. See hub_get_tool_guide(section='rooms').[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -1309,7 +1364,7 @@ def _getAllToolDefinitions_partRooms() {
         ],
         [
             name: "hub_update_room",
-            description: "Rename a room and/or replace its device list, by id; an omitted field keeps its value. deviceIds is the FULL list: a device left out becomes unassigned, an added one leaves its previous room. Requires Write master, backup <24h, confirm=true.[[FLAT_TRIM]] Send room updates one at a time, never in parallel. Start from hub_get_room(roomId). After a rename, automations or dashboards that name the room may need updating. See hub_get_tool_guide(section='rooms').[[/FLAT_TRIM]]",
+            description: "Rename a room and/or replace its device list, by id; an omitted field keeps its value. deviceIds is the FULL list: a device left out becomes unassigned, an added one leaves its previous room. Requires Write master, backup <24h, confirm=true.[[FLAT_TRIM]] Send room updates one at a time, never in parallel. Start from hub_get_room(roomId) and keep its accessible=false devices in the list: adding or removing a device outside the MCP device selection is refused unless Bypass Device Allowlist is on. After a rename, automations or dashboards that name the room may need updating. See hub_get_tool_guide(section='rooms').[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -6536,7 +6591,7 @@ private boolean _logsHasFetchSnapshot(r) {
     return r.snapshot instanceof Map && r.snapshot.background != null
 }
 private boolean _logsTabFailed(mode, r) {
-    return r.isError == true
+    return _isFailureResult(r)
 }
 private List _cloudCallRows(Map raw) {
     Map hoursByApp = [:]
@@ -11377,7 +11432,6 @@ private _sendCommandBatch(commands, reqT0 = null) {
         if (failed < results.size()) result.partial = true
         result.error = "${failed} of ${results.size()} device command(s) failed; ${sent} were sent. See results[] for the per-device cause.".toString()
         result.note = "The entries that succeeded ALREADY actuated -- do NOT re-send the whole batch. Before re-sending a failed entry, read its error/note: an outcome the hub did not CONFIRM may still have actuated, so verify with hub_get_device_attribute first. See hub_get_tool_guide(section='device_authorization') for what makes an entry fail."
-        if (failed == results.size() && !remaining) result.isError = true
     }
     if (remaining) {
         result.success = false
@@ -28784,7 +28838,7 @@ def handleToolsCall(msg) {
             }
             orphaned.note = ((orphaned.note ? orphaned.note + " " : "") + lostNote).toString()
             return _renderToolResult(msg.id, toolName, reactiveToolName, args,
-                _mrtrMarkRejoined(orphaned, rejoined), orphaned.isError == true)
+                _mrtrMarkRejoined(orphaned, rejoined), _isFailureResult(orphaned))
         }
         def failure = _mrtrFailureWithLedger(rec, reactiveToolName, "Tool error: ${e.message}".toString())
         if (rec instanceof Map && claim?.outcome == "claimed") {
@@ -28866,7 +28920,7 @@ def handleToolsCallLegacy(msg) {
         }
         if (audit != null && outcome == null) outcome = _writeOutcome(result)
         return _renderToolResult(msg.id, toolName, reactiveToolName, args, result,
-            result instanceof Map && result.isError == true)
+            _isFailureResult(result))
     } catch (IllegalArgumentException e) {
         if (audit != null && outcome == null) outcome = [outcome: "failed", error: "validation refused the call"]
         mcpLog("error", "server", "Validation error in ${reactiveToolName}: ${e.message}", null, [
@@ -28965,7 +29019,10 @@ private Map _writeOutcome(result) {
                 : [outcome: "partial", error: "paused with remaining work in the result"]
         }
         if (r.partial == true) return [outcome: "partial", error: _writeOutcomeCode(r, "some items did not apply")]
-        if (r.isError == true || r.success == false) return [outcome: "failed", error: _writeOutcomeCode(r, "tool returned a failure result")]
+        if (_isFailureResult(r)) {
+            boolean appliedSome = r.applied instanceof List && !r.applied.isEmpty()
+            return [outcome: appliedSome ? "partial" : "failed", error: _writeOutcomeCode(r, "tool returned a failure result")]
+        }
         if (r.stateError instanceof CharSequence && r.stateError.toString().trim()) {
             return [outcome: "unknown", error: "the write ran but reading the resulting state failed"]
         }
@@ -29991,7 +30048,7 @@ private Map _mrtrCommitSlice(String stateId, Map rec, Map claim, Map executionAr
         return [outcome: "continued"]
     }
     def terminal = _mrtrAggregateTerminal(rec, result)
-    boolean isError = terminal instanceof Map && terminal.isError == true
+    boolean isError = _isFailureResult(terminal)
     if (!_mrtrStoreTerminal(stateId, rec, claim, terminal, isError)) {
         throw new IllegalStateException("requestState ownership was lost before its terminal result could be stored")
     }
@@ -30469,6 +30526,9 @@ private def _renderValidationError(id, toolName, reactiveToolName, args, String 
     return _renderToolResult(id, toolName, reactiveToolName, args,
         _mrtrMarkRejoined(failure, rejoined), true)
 }
+private boolean _isFailureResult(result) {
+    return result instanceof Map && (result.isError == true || result.success == false)
+}
 private def _renderToolResult(id, toolName, reactiveToolName, args, result, boolean isErrorOverride = false) {
     if (result instanceof Map && result.__deviceValidation != null) {
         String detail = result.__deviceValidation.toString()
@@ -30479,7 +30539,7 @@ private def _renderToolResult(id, toolName, reactiveToolName, args, result, bool
     }
     def rendered = _publicToolResultValue(result)
     boolean validation = rendered instanceof Map && rendered.remove("__validation") == true
-    boolean failureFlag = rendered instanceof Map && (rendered.isError == true || rendered.success == false)
+    boolean failureFlag = _isFailureResult(rendered)
     boolean stateReadbackFailed = rendered instanceof Map && rendered.stateError instanceof CharSequence &&
         rendered.stateError.toString().trim()
     if (!validation && (isErrorOverride || failureFlag || stateReadbackFailed)) {
@@ -30487,7 +30547,7 @@ private def _renderToolResult(id, toolName, reactiveToolName, args, result, bool
             details: _toolLogDetails(reactiveToolName, toolName, args, [failureKind: stateReadbackFailed ? "state_readback_failed" : "tool_failed"])
         ])
     }
-    if (rendered instanceof Map && (rendered.isError == true || rendered.success == false)) {
+    if (failureFlag) {
         try { _applyReactiveBpsWarning(reactiveToolName, args, rendered) }
         catch (Exception bpErr) {
             mcpLog("warn", "server", "Reactive BPS hint failed for ${reactiveToolName}: ${bpErr.message}")
@@ -30517,7 +30577,7 @@ private def _renderToolResult(id, toolName, reactiveToolName, args, result, bool
         ])
     }
     def envelopeBody = [content: [[type: "text", text: jsonText]]]
-    if (isErrorOverride || (rendered instanceof Map && rendered.isError == true)) {
+    if (isErrorOverride || failureFlag) {
         envelopeBody.isError = true
     }
     def candidateResponse = jsonRpcResult(id, envelopeBody)
@@ -34631,7 +34691,7 @@ private Map _rmForceDeleteApp(Integer appId) {
     return resp
 }
 def currentVersion() {
-    return "5.1.8"
+    return "5.1.9"
 }
 def hubBpsGuideKey(String section, Long atMs = null) {
     long bucket = ((atMs != null ? atMs : now()) as long).intdiv(3600000L)
@@ -34713,6 +34773,7 @@ def _guideSectionForTool(toolName) {
     if (t in ['hub_get_device', 'hub_update_device']) return 'update_device'
     if (t == 'hub_manage_virtual_device') return 'virtual_devices'
     if (t in ['hub_create_dashboard', 'hub_update_dashboard', 'hub_delete_dashboard', 'hub_clone_dashboard']) return 'dashboards'
+    if (t in ['hub_create_room', 'hub_update_room']) return 'rooms'
     if (t in ['hub_create_backup', 'hub_restore_backup']) return 'backup'
     if (t in ['hub_write_file', 'hub_delete_file']) return 'file_manager'
     if (t in ['hub_call_zwave', 'hub_set_zwave', 'hub_call_zigbee', 'hub_set_zigbee',
@@ -34833,6 +34894,8 @@ If you are calling one of these tools, you must read its section for that sectio
 - hub_call_zwave -> hub_admin_write_radios
 - hub_set_zigbee -> hub_admin_write_radios
 - hub_set_zwave -> hub_admin_write_radios
+- hub_create_room -> rooms
+- hub_update_room -> rooms
 - hub_clone_custom_rule -> rules
 - hub_create_custom_rule -> rules
 - hub_delete_custom_rule -> rules
@@ -35547,10 +35610,10 @@ Use after hub_list_files to fetch a named file (config, backup, exported rule/ap
 - Firing the separate calls in parallel does NOT help -- the hub serialises them anyway (see "Make tool calls sequentially" below).
 - It does not make the devices move simultaneously; the hub still actuates one at a time. For a directly-attached device that costs almost nothing, but a device behind a bridge carries real per-device time that batching cannot remove: six Bond-bridged shades batched came back at ~2.75s, against ~5.0s sent separately (six Z-Wave switches batch at ~1.5s).
 - Entries are independent, so mixed devices and mixed commands go in one batch. Max 20. A partly-failed batch reports failedDeviceIds plus partial:true -- re-send only those ids; the rest already actuated.
-- The batch result always carries `count` (entries attempted), `sentCount`, `failedCount` and a per-entry `results[]`. Any failure adds `failedDeviceIds`, `error` and `note`. `isError: true` is set only when every attempted entry failed. An entry's `deviceId` may be a string or an integer.
+- The batch result always carries `count` (entries attempted), `sentCount`, `failedCount` and a per-entry `results[]`. Any failure adds `failedDeviceIds`, `error` and `note`. A result with `success: false` (a failed entry or an early stop) is sent with `isError: true`. An entry's `deviceId` may be a string or an integer.
 
 - Batch entries return NO state snapshot, and waitFor is not accepted with `commands`. To confirm, follow with hub_get_device_attribute using deviceIds (multi-device convergence): one batch to fire, one poll to confirm -- two round trips for the whole group.
-- A very large batch of slow bridged devices can stop early at the relay time budget: the result carries stoppedEarly:true with remainingCommands, the untried tail verbatim, to re-send in a new call.
+- A very large batch of slow bridged devices can stop early at the relay time budget: the result carries stoppedEarly:true with remainingCommands, the untried tail verbatim, to re-send in a new call; it is `success: false` and flagged `isError: true` even when no entry failed.
 - For a set commanded repeatedly, a group or scene beats both: one device to command and the hub fans out. `commands` is for the ad-hoc set that was never defined in advance.
 
 **hub_list_devices:**
@@ -36084,11 +36147,11 @@ Each entry: id, name, namespace, a private flag, and a `contains` summary of the
     ,
         rooms: '''## Rooms
 
-Room tools address a room by its id (a string from hub_list_rooms, passed as `roomId`), never by name. A device is in at most one room. hub_delete_room is also under "Destructive Write Tools".
+Room tools address a room by its id (a string from hub_list_rooms, passed as `roomId`), never by name. A device is in at most one room. The acknowledgment key above covers hub_create_room and hub_update_room. hub_delete_room is also under "Destructive Write Tools" and takes the key from hub_get_tool_guide(section='hub_admin_write_destructive') instead.
 
 ### hub_list_rooms
 
-Every room as `{id, name, deviceCount, deviceIds}`, sorted by name; `cursor` pages it (100 per page).
+Every room as `{id, name, deviceCount, deviceIds}`, sorted by name ignoring case; `cursor` pages it (100 per page).
 
 ### hub_get_room
 
@@ -36096,11 +36159,11 @@ Takes the room's `roomId` (from hub_list_rooms). Returns `{id, name, deviceCount
 
 ### hub_create_room
 
-Names must be unique (case-insensitive; the hub itself allows duplicates). A listed device moves out of its previous room. The result carries the new `id`. To move devices into an existing room use hub_update_room, or set one device's room with hub_update_device -- do NOT create a room for that.
+Names must be unique (case-insensitive; the hub itself allows duplicates). A listed device moves out of its previous room; the result carries the new `id`, and `movedDevices` (`[{deviceId, fromRoomId, fromRoom}]`) for each device taken from another room. While Bypass Device Allowlist is off, every listed device must be in the MCP device selection; any other id is refused before anything is saved. To move devices into an existing room use hub_update_room, or set one device's room with hub_update_device -- do NOT create a room for that.
 
 ### hub_update_room
 
-`deviceIds` replaces the room's device list, as the hub's Rooms page does: a device left out becomes unassigned, an added one leaves its previous room, `[]` empties the room. Start from hub_get_room(roomId). Send room updates one at a time, waiting for each to finish: an update saves the name and the full device list together, so two overlapping updates to one room can undo each other. The result reports `previousName` after a rename, and `deviceIds`, `deviceCount` and `unassignedDeviceIds` when the list was passed. A device id the hub does not know fails the save with nothing written. After a rename, automations or dashboards that name the room may need updating.
+`deviceIds` replaces the room's device list, as the hub's Rooms page does: a device left out becomes unassigned, an added one leaves its previous room, `[]` empties the room. Start from hub_get_room(roomId), and keep the ids it shows with `accessible=false` in the list you send: while Bypass Device Allowlist is off, adding or removing a device outside the MCP device selection is refused before anything is saved (one already in the room may stay). A name-only update renames the room without touching its devices. An update that sets `deviceIds` re-sends the name and the full device list, so any other change to that room landing in between (another update, a hub_update_device room move, an edit on the hub's Rooms page) can be undone: send room updates one at a time, waiting for each to finish. The result reports `previousName` after a rename, and `deviceIds`, `deviceCount`, `unassignedDeviceIds` and `movedDevices` (`[{deviceId, fromRoomId, fromRoom}]`, devices taken from another room) when the list was passed. The hub refuses a name-only update to a name shorter than 3 characters. A device id the hub does not know fails the save with nothing written. After a rename, automations or dashboards that name the room may need updating.
 
 ### hub_delete_room
 
