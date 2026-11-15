@@ -818,7 +818,7 @@ private Map _applyLegacyLayoutOps(Map current, Map args, Map status, List warnin
                 throw new IllegalArgumentException("addTiles: each tile needs template, col, and row (missing ${missing.join(', ')} in ${spec}).")
             }
             def dup = tiles.find { t ->
-                ["template", "device", "col", "row", "templateExtra"].every { k -> t.get(k)?.toString() == spec.get(k)?.toString() } &&
+                (_legacyTileKeys() - ["id", "colSpan", "rowSpan"]).every { k -> t.get(k)?.toString() == spec.get(k)?.toString() } &&
                     (t.colSpan ?: 1).toString() == (spec.colSpan ?: 1).toString() &&
                     (t.rowSpan ?: 1).toString() == (spec.rowSpan ?: 1).toString()
             }
@@ -848,9 +848,12 @@ private Map _applyLegacyLayoutOps(Map current, Map args, Map status, List warnin
     layout.tiles = tiles
     return layout
 }
+private List _legacyTileKeys() {
+    return ["id", "template", "device", "col", "row", "colSpan", "rowSpan", "templateExtra",
+            "globalVar", "linkName", "bgImage", "hideUnit", "refreshInterval"]
+}
 private void _requireKnownTileKeys(Map spec, String op) {
-    def allowed = ["id", "template", "device", "col", "row", "colSpan", "rowSpan", "templateExtra",
-                   "globalVar", "linkName", "bgImage", "hideUnit", "refreshInterval"]
+    def allowed = _legacyTileKeys()
     def unknown = spec.keySet().collect { it?.toString() }.findAll { !(it in allowed) }
     if (unknown) {
         throw new IllegalArgumentException("${op}: unknown tile key${unknown.size() == 1 ? '' : 's'} ${unknown.join(', ')}. Allowed keys: ${allowed.join(', ')}.")
