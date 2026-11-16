@@ -238,6 +238,7 @@ private Map _getDashboard(String id, Map read) {
     def full = _dashboardConfigFromApp(id)
     if (full != null) {
         if (!full.name) full.name = summary.name
+        full.note = "Read from the dashboard's app config because the dashboard list was unreadable; it carries no theme. Pass the dashboard's theme in options when updating, or it reverts to 'legacy'."
         return full
     }
     return summary + [partial: true, note: "Only id + name could be read (the dashboard's config page was unreadable); tile/device/pin fields are unavailable, not defaulted. Retry hub_get_dashboard."]
@@ -332,7 +333,13 @@ private Map _getLegacyDashboard(String id, Map summary, Map rec) {
     try { layout = _legacyLayoutFetch(id, token) } catch (Exception e) {
         mcpLogError("dashboard", "legacy layout read failed for ${id}", e)
     }
-    if (layout instanceof Map) return out + [layout: layout]
+    if (layout instanceof Map) {
+        if (out.deviceIds == null) {
+            return out + [layout: layout, partial: true,
+                          note: "The dashboard's authorized device list could not be read (unavailable, not empty). Retry hub_get_dashboard."]
+        }
+        return out + [layout: layout]
+    }
     return out + [partial: true, note: "The dashboard's layout endpoint was unreadable (details logged); tiles/grid are unavailable, not empty. Retry hub_get_dashboard." + _lanAccessHint(status)]
 }
 private Map _dashboardConfigFromApp(String id) {
@@ -36381,7 +36388,7 @@ Read-only; each entry carries `id`, `name`, and `type`. Easy entries also carry 
 
 Read-only. For an Easy Dashboard: tiles, navigation, theme, devices, PINs, and `localOnly`. For a legacy dashboard: its authorized `deviceIds` plus a nested `layout` object (see "Legacy layout shape" below). This is the read `hub_update_dashboard` takes back: `name` and `deviceIds` go top level, and an Easy dashboard's config fields (tile toggles, `navigationSelection`, `theme`, PINs, `localOnly`) go inside `options`; sent top level they are refused as unknown arguments.
 
-- PINs read `***redacted (password)***` while Hide passwords and credentials is on; passing that back to `hub_update_dashboard` keeps the stored PIN.
+- PINs read `***redacted (password)***` while Hide passwords and credentials is on; passing that back to `hub_update_dashboard` keeps the stored PIN.\n- When the dashboard list is unreadable, an Easy Dashboard is read from its app config, which carries no `theme`; the result says so in its `note`. Pass the known theme in `options` before updating, or it reverts to `legacy`. A legacy read whose device list can't be read returns `partial: true` with the layout and no `deviceIds`.
 - A read that partly fails returns `partial: true` with a note — the missing fields are unavailable, not defaulted.
 
 ### hub_create_dashboard
