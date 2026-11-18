@@ -22222,7 +22222,7 @@ def _getAllToolDefinitions_partNativeRM() {
         ],
         [
             name: "hub_get_rule_health",
-            description: """Read one rule's health: Rule Machine, Visual Rules Builder, or another built-in classic app (Basic Rule, Button Controller).[[FLAT_TRIM]] A Rule Machine rule's page is rendered once (Rule Machine updates its broken flag only then) before its compiled state is read: broken, paused, stopped, privateBoolean, disabledActions, structuralIssues and the red-X disabled flag, plus live eventSubscriptionCount and scheduledJobCount. A Visual Rule reports its validationErrors. User and community apps are not read.[[/FLAT_TRIM]] ok=false with unreadable=false means issues names a problem; unreadable=true means nothing could be read, which is not evidence of breakage; checkErrors lists reads that failed. Guide: builtin_app_tools_rules.""",
+            description: """Read one rule's health: Rule Machine, Visual Rules Builder, or another built-in classic app (Basic Rule, Button Controller).[[FLAT_TRIM]] A Rule Machine rule's page is rendered once (Rule Machine updates its broken flag only then) before its compiled state is read: broken, paused, stopped, privateBoolean, disabledActions, structuralIssues and the red-X disabled flag, plus live eventSubscriptionCount and scheduledJobCount. A Visual Rule reports its validationErrors. User and community apps are not read.[[/FLAT_TRIM]] ok=false with unreadable=false means issues names a problem or checkErrors names a failed read; unreadable=true means nothing could be read, which is not evidence of breakage. Guide: builtin_app_tools_rules.""",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -22378,12 +22378,20 @@ def toolListRmRules(args) {
     def ghostIds = collected.ghostIds
     def treeReadable = collected.treeReadable
     def liveApps = collected.liveApps
-    combined.values().each { entry -> _rmAnnotateRuleStatus(entry, treeReadable, liveApps) }
+    def unsettled = [:]
+    combined.values().each { entry ->
+        def flags = _rmAnnotateRuleStatus(entry, treeReadable, liveApps)
+        if (flags != null) unsettled.put(entry.id?.toString(), flags)
+    }
     def rules = combined.values().sort { it.label ?: "" }.toList()
     def labelFilter = args?.labelFilter?.toString()?.toLowerCase()
     if (labelFilter) rules = rules.findAll { (it.label ?: "").toString().toLowerCase().contains(labelFilter) }
     def cursor = args?.cursor
     def paged = _paginateList(rules, cursor, 50, "hub_list_rules")
+    paged.page.each { entry ->
+        def flags = unsettled.get(entry.id?.toString())
+        if (flags != null) _rmSettleRuleStatusFromState(entry, flags)
+    }
     def result = [
         rules: paged.page.collect { r ->
             def clean = [:] + r
@@ -22468,14 +22476,14 @@ private void registerRmRule(Map combined, def r, String version) {
         ])
     }
 }
-private void _rmAnnotateRuleStatus(Map entry, boolean treeReadable, Map liveApps) {
+private Map _rmAnnotateRuleStatus(Map entry, boolean treeReadable, Map liveApps) {
     def idInt
     try { idInt = (entry.id instanceof Number) ? entry.id.intValue() : entry.id?.toString()?.toInteger() }
     catch (Exception ignored) { idInt = null }
     def node = (treeReadable && idInt != null && liveApps != null) ? liveApps[idInt] : null
     if (node == null) {
         entry.status = "unknown"
-        return
+        return null
     }
     if (node.type instanceof String && node.type) {
         entry.type = node.type
@@ -22492,7 +22500,7 @@ private void _rmAnnotateRuleStatus(Map entry, boolean treeReadable, Map liveApps
         if (cleanRm == null) missing << "RMUtils label"
         mcpLog("warn", "rm-interop", "_rmAnnotateRuleStatus: rule ${entry.id} has incomplete node data (missing ${missing.join(', ')}); status unknown")
         entry.status = "unknown"
-        return
+        return null
     }
     def disabled = disabledRaw == true
     def paused = false
@@ -22507,22 +22515,29 @@ private void _rmAnnotateRuleStatus(Map entry, boolean treeReadable, Map liveApps
         entry.label = _rmStripTrailingDecoration(entry.label, "(Stopped)")
         entry.name = _rmStripTrailingDecoration(entry.name, "(Stopped)")
     }
-    if (paused || stopped) {
-        try {
-            def status = _rmFetchStatusJson(idInt)
-            if (status?.appState instanceof List) {
-                def statePaused = _readAppStateBoolean(status, "paused", null)
-                if (statePaused != null) paused = statePaused
-                if (!status.appState.any { it?.name == "stopped" }) stopped = false
-                else {
-                    def stateStopped = _readAppStateBoolean(status, "stopped", null)
-                    if (stateStopped != null) stopped = stateStopped
-                }
+    _rmApplyRuleStatus(entry, disabled, paused, stopped)
+    return (paused || stopped) ? [appId: idInt, disabled: disabled, paused: paused, stopped: stopped] : null
+}
+private void _rmSettleRuleStatusFromState(Map entry, Map flags) {
+    boolean paused = flags.paused
+    boolean stopped = flags.stopped
+    try {
+        def status = _rmFetchStatusJson(flags.appId as Integer)
+        if (status?.appState instanceof List) {
+            def statePaused = _readAppStateBoolean(status, "paused", null)
+            if (statePaused != null) paused = statePaused
+            if (!status.appState.any { it?.name == "stopped" }) stopped = false
+            else {
+                def stateStopped = _readAppStateBoolean(status, "stopped", null)
+                if (stateStopped != null) stopped = stateStopped
             }
-        } catch (Exception e) {
-            mcpLog("warn", "rm-interop", "_rmAnnotateRuleStatus: rule ${entry.id} state read failed (${e.message}); status from its appsList name")
         }
+    } catch (Exception e) {
+        mcpLog("warn", "rm-interop", "_rmSettleRuleStatusFromState: rule ${entry.id} state read failed (${e.message}); status from its appsList name")
     }
+    _rmApplyRuleStatus(entry, flags.disabled as boolean, paused, stopped)
+}
+private void _rmApplyRuleStatus(Map entry, boolean disabled, boolean paused, boolean stopped) {
     entry.disabled = disabled
     entry.paused = paused
     entry.status = disabled ? "disabled" : (stopped ? "stopped" : (paused ? "paused" : "active"))
@@ -24126,6 +24141,7 @@ def toolCheckRuleHealth(args) {
         result.eventSubscriptionCount = null
         result.scheduledJobCount = null
         result.checkErrors << "statusJson: ${statusErr.message ?: statusErr.toString()}".toString()
+        result.ok = false
     }
     return result
 }
@@ -24133,9 +24149,15 @@ def toolListRuleLocalVariables(args) {
     if (args?.appId == null) throw new IllegalArgumentException("appId is required")
     def appId = normalizeRuleId(args.appId)
     def typeName = null
-    try { typeName = getAppByAppId(appId as Long)?.appType?.name?.toString() } catch (Exception ignored) { }
+    Exception lookupError = null
+    try { typeName = getAppByAppId(appId as Long)?.appType?.name?.toString() } catch (Exception e) { lookupError = e }
     def all
-    if (typeName != null && typeName ==~ /Rule-4\..*/) {
+    if (lookupError != null) {
+        try { all = _rmReadLocalVarsFromStatus(appId) }
+        catch (Exception statusErr) {
+            throw new IllegalStateException("App ${appId}'s type could not be looked up (${lookupError.message ?: lookupError.toString()}) and its status page could not be read either (${statusErr.message ?: statusErr.toString()}). Try again.")
+        }
+    } else if (typeName != null && typeName ==~ /Rule-4\..*/) {
         def compiled = _ruleCompiledState(appId)
         if (compiled?.ruleFormat != "rm") throw new IllegalStateException("Rule ${appId}'s state could not be read${compiled?.readError ? " (${compiled.readError})" : ''}")
         def stored = compiled.state.allLocalVars
@@ -34383,8 +34405,8 @@ Map _rmCheckRuleHealth(Integer appId) {
     }
     if (!read) issues << "health check failed: neither the app's page nor its compiled state could be read".toString()
     result.unreadable = !read
-    result.ok = identified && read && issues.isEmpty() && result.broken != true && result.validationErrors.isEmpty() &&
-        !(ruleType && result.broken == null)
+    result.ok = identified && read && issues.isEmpty() && checkErrors.isEmpty() && result.broken != true &&
+        result.validationErrors.isEmpty() && !(ruleType && result.broken == null)
     return result
 }
 private Map _rmCollectInputSchema(Map configPage) {
@@ -35795,7 +35817,7 @@ For BACKUP enumeration and restore, use the unified **hub_list_backups** (in hub
 - User and community apps are not read (their page runs their own code); use hub_get_app_config.
 - `eventSubscriptionCount` / `scheduledJobCount` are the app's live subscriptions and scheduled jobs (null with a `checkErrors` entry when that read fails). Visual Rule write responses embed this report without them.
 
-`ok:true` means everything was read and nothing is wrong. `ok:false` with `unreadable:false` means `issues` names the problem; `unreadable:true` means nothing could be read, which is not evidence of breakage. `checkErrors` lists reads that failed without being evidence about the rule. A structural issue is expected while a block is built across several calls; finish it with a hub_set_rule(operation='update') terminator change, and compare with hub_set_rule(operation='read') before considering a restore.
+`ok:true` means everything was read and nothing is wrong. `ok:false` with `unreadable:false` means `issues` names a problem or `checkErrors` names a read that failed, leaving part of the rule unchecked; `unreadable:true` means nothing could be read, which is not evidence of breakage. A `checkErrors` entry is not evidence about the rule either: repeat the call to finish the check. A structural issue is expected while a block is built across several calls; finish it with a hub_set_rule(operation='update') terminator change, and compare with hub_set_rule(operation='read') before considering a restore.
 
 ### hub_list_rule_local_variables
 
