@@ -3763,12 +3763,16 @@ private int _filesIntArg(Map args, String key, int defaultValue, int min, int ma
     def v = args?.get(key)
     if (v == null) return defaultValue
     String t = (v instanceof Number || v instanceof CharSequence) ? v.toString().trim() : ""
+    String outOfRange = "${key} must be an integer from ${min} to ${max}; got ${v}."
     if (v instanceof Number && !t.isLong() && t.isBigDecimal()) {
         BigDecimal d = new BigDecimal(t)
+        if (d.compareTo(new BigDecimal(min)) < 0 || d.compareTo(new BigDecimal(max)) > 0) {
+            throw new IllegalArgumentException(outOfRange)
+        }
         if (d.signum() == 0 || d.stripTrailingZeros().scale() <= 0) t = d.toBigInteger().toString()
     }
     if (!t.isLong() || t.toLong() < min || t.toLong() > max) {
-        throw new IllegalArgumentException("${key} must be an integer from ${min} to ${max}; got ${v}.")
+        throw new IllegalArgumentException(outOfRange)
     }
     return t.toInteger()
 }
@@ -3920,7 +3924,7 @@ def toolWriteFile(args) {
     String downloadError = "the hub returned no content"
     boolean missing = false
     try { existingBytes = downloadHubFile(fileName) }
-    catch (Exception e) { downloadError = e.message; missing = _filesDownloadMissing(e) }
+    catch (Exception e) { downloadError = e.message ?: e.class.simpleName; missing = _filesDownloadMissing(e) }
     if (existingBytes == null) {
         String kind = missing ? null : _filesRootEntryKind(fileName)
         if (kind == "dir") return _filesFolderResult(fileName)
@@ -3928,11 +3932,11 @@ def toolWriteFile(args) {
             mcpLog("warn", "file-manager", "Write of '${fileName}' refused: its current content could not be read (${downloadError})")
             String cause = kind == FILES_KIND_UNKNOWN
                 ? "The File Manager listing also failed, so whether '${fileName}' exists is unknown."
-                : "'${fileName}' exists but its content could not be downloaded (${downloadError})."
+                : "'${fileName}' exists but its content could not be downloaded."
             return [
                 success: false,
                 fileName: fileName,
-                error: "Could not read the current '${fileName}' to take its backup copy; nothing was written.".toString(),
+                error: "Could not read the current '${fileName}' to take its backup copy (${downloadError}); nothing was written.".toString(),
                 note: "${cause} Retry in a moment, write the content under a new name, or download the current file from directDownload first. ${FILES_GUIDE_POINTER}".toString(),
                 directDownload: _filesDownloadUrl(fileName)
             ]
@@ -3992,7 +3996,7 @@ def toolWriteFile(args) {
             error: "Failed to write file '${fileName}': ${e.message}",
             note: backupFileName
                 ? "Its previous content is kept in the backup copy '${backupFileName}'. Read '${fileName}' to see what it holds now before retrying. ${FILES_GUIDE_POINTER}".toString()
-                : "Nothing was written. Retry once File Manager accepts writes. ${FILES_GUIDE_POINTER}".toString()
+                : "The hub reported the upload failed; check with hub_list_files whether '${fileName}' now exists before retrying. ${FILES_GUIDE_POINTER}".toString()
         ]
     }
 }
@@ -4009,10 +4013,21 @@ def toolDeleteFile(args) {
     if (!isBackupFile) {
         byte[] bytes = null
         boolean missing = false
+        String downloadError = null
         try { bytes = downloadHubFile(fileName) }
         catch (Exception e) {
+            downloadError = e.message ?: e.class.simpleName
             missing = _filesDownloadMissing(e)
-            mcpLog("debug", "file-manager", "Could not download '${fileName}' before deletion: ${e.message}")
+            mcpLog("debug", "file-manager", "Could not download '${fileName}' before deletion: ${downloadError}")
+        }
+        if (bytes == null && _loadLimiterRefusedMessage(downloadError)) {
+            mcpLog("warn", "file-manager", "Delete of '${fileName}' refused: the load limiter refused its backup download (${downloadError})")
+            return [
+                success: false,
+                fileName: fileName,
+                error: "Could not read '${fileName}' to take its backup copy (${downloadError}); nothing was deleted.".toString(),
+                note: "The hub's load limiter refused the download, which is temporary. Nothing was deleted; retry in a moment. ${FILES_GUIDE_POINTER}".toString()
+            ]
         }
         if (bytes == null) {
             String kind = missing ? null : _filesRootEntryKind(fileName)
@@ -4056,7 +4071,7 @@ def toolDeleteFile(args) {
         if (backupFileName) {
             result.backupFile = backupFileName
             result.backupDownload = _filesDownloadUrl(backupFileName)
-            result.undoHint = "To recover: use 'hub_read_file' on '${backupFileName}' to view contents, or 'hub_write_file' to recreate '${fileName}' from the backup."
+            result.undoHint = "To recover a text file, read '${backupFileName}' with hub_read_file (every chunk, following nextOffset) and recreate '${fileName}' with hub_write_file. For a binary file, download backupDownload and upload it in Settings > File Manager."
             _filesReportCopyRetention(result, fileName, _filesPruneBackupCopies(fileName, backupFileName))
         }
         if (existenceUnknown) {
@@ -4075,6 +4090,10 @@ def toolDeleteFile(args) {
         return result
     } catch (Exception e) {
         mcpLogError("file-manager", "Failed to delete file '${fileName}'", e)
+        if (!backupFileName) {
+            Map unavailable = _itemBackupIndexUnavailableResult(e)
+            if (unavailable != null) return unavailable + [fileName: fileName]
+        }
         return [
             success: false,
             fileName: fileName,
@@ -4127,7 +4146,7 @@ def _getAllToolDefinitions_partFiles() {
         ],
         [
             name: "hub_delete_file",
-            description: "⚠️ Permanently delete a file from the hub's File Manager. A backup copy is taken first (backupFile/undoHint in the result). Requires confirm=true and a hub backup from the last 24 hours — get user approval first.",
+            description: "⚠️ Permanently delete a file from the hub's File Manager. A backup copy is taken first when possible (backupFile/undoHint in the result); a file that is itself a backup gets none, and if no copy can be taken (unreadable content or a failed upload) the delete still runs with a warning. Requires confirm=true and a hub backup from the last 24 hours — get user approval first.",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -4154,7 +4173,7 @@ def _toolDisplayMeta_partFiles() {
         hub_list_files: [title: "List Files", summary: "List files in the hub File Manager, optionally filtered by a name substring."],
         hub_read_file: [title: "Read File", summary: "Read a File Manager file's contents."],
         hub_write_file: [title: "Write File", summary: "Create or update a File Manager file (backs up the existing one; identical content writes nothing)."],
-        hub_delete_file: [title: "Delete File", summary: "Delete a File Manager file (auto-backs up first)."]
+        hub_delete_file: [title: "Delete File", summary: "Delete a File Manager file (takes a backup copy first when possible)."]
     ]
 }
 def toolListItemBackups(args = null) {
@@ -30713,6 +30732,8 @@ def _responseTooLargeSuggestion(String toolName) {
             return "For scope='instances': set includeHidden=false (the default), narrow via filter (builtin / user / disabled / parents / children), or pass cursor to page through the apps list."
         case "hub_get_app_config":
             return "Omit includeSettings -- Room Lighting / RM 5.1 apps can have 500-1000 settings keys. For multi-page apps, read one page at a time with pageName, chosen from the page.hrefs a page returns. If you only need identity, pass summary=true."
+        case "hub_read_file":
+            return "This chunk is too large once JSON-escaped: quotes, backslashes, newlines and non-ASCII characters take several bytes each. Call again at the same offset with a smaller length, e.g. 10000."
         case "hub_list_files":
             return "Pagination here is OPT-IN: with no cursor the tool returns the WHOLE listing, so a large File Manager has no natural page break. Re-issue with cursor='' to page through it, or narrow with filter='<substring of the name>'."
         case "hub_get_device_health":
@@ -31034,7 +31055,7 @@ def getGatewayConfig() {
                 hub_list_files: "List files and subfolders in File Manager (names, sizes, download base, free space). Args: filter, folder, cursor",
                 hub_read_file: "Read file content. Args: fileName, offset, length",
                 hub_write_file: "Write file to File Manager. Args: fileName, content, confirm=true",
-                hub_delete_file: "Delete file from File Manager (auto-backs up first to <name>_backup_<ts>, unless it's already a backup). Args: fileName, confirm=true"
+                hub_delete_file: "Delete file from File Manager (takes a backup copy to <name>_backup_<ts> first when possible; none for a file that is itself a backup). Args: fileName, confirm=true"
             ],
             searchHints: [
                 hub_list_files: "show uploaded stored csv json text data filter search name substring backup",
@@ -35620,17 +35641,17 @@ Files download from http://<hub IP>/local/<filename> (`downloadUrlBase` in hub_l
 - hub_read_file, hub_write_file and hub_delete_file act on root files only: a name with `/` is refused, and a folder name is refused as a folder ("is a folder, not a file").
 
 **Chunked reading:**
-- `offset` (character offset, 0 or more) and `length` (1-60000, default 30000); follow `nextOffset` while `hasMore` is true. Whole numbers sent as decimals (3.0) are accepted. Each chunk downloads the whole file on the hub, so read a large file with `length: 60000`.
+- `offset` (character offset, 0 or more) and `length` (1-60000, default 30000); follow `nextOffset` while `hasMore` is true. Whole numbers sent as decimals (3.0) are accepted. Each chunk downloads the whole file on the hub, so a larger `length` means fewer downloads, but quotes, backslashes, newlines and non-ASCII characters cost several bytes each on the wire once JSON-escaped. On `response_too_large`, call again at the same `offset` with a smaller `length`.
 
-**Errors and retries:** every failure is an error result (`isError: true`, `success: false`). Reading or deleting a root file that does not exist says "does not exist in File Manager" and changes nothing. Writing a file's current content again writes nothing (`unchanged: true`), so a retried write is safe. A delete retried after a dropped response reports "does not exist" when the first call already deleted it, so check its backup copy with hub_list_files(filter: '<base>_backup_'). A write whose current content cannot be read is refused rather than overwritten, since its backup copy could not be taken; write under a new name, or download the current file from `directDownload` first. A delete of a listed file whose content cannot be read still goes ahead with no backup copy and a `warning`: refusing would leave no way to remove a corrupt file, while a write has a new name as its workaround. If the listing also fails while a delete checks a file it could not download, the delete still goes ahead and reports success with a `warning` that existence could not be checked and the file may not have existed (the hub's delete does not fail on a missing name).
+**Errors and retries:** every failure is an error result (`isError: true`, `success: false`). Reading or deleting a root file that does not exist says "does not exist in File Manager" and changes nothing. Writing a file's current content again writes nothing (`unchanged: true`), so a retried write is safe. A delete retried after a dropped response reports "does not exist" when the first call already deleted it, so check its backup copy with hub_list_files(filter: '<base>_backup_'). A write whose current content cannot be read is refused rather than overwritten, since its backup copy could not be taken; write under a new name, or download the current file from `directDownload` first. A delete of a listed file whose content cannot be read (unless the load limiter refused the download, which refuses the delete) still goes ahead with no backup copy and a `warning`: refusing would leave no way to remove a corrupt file, while a write has a new name as its workaround. If the listing also fails while a delete checks a file it could not download, the delete goes ahead with a `warning` that existence could not be checked and the file may not have existed (the hub's delete does not fail on a missing name). If the listing fails and the backup index is not loaded yet, the delete is refused before anything changes; retry once File Manager answers. Send writes and deletes of the same file one at a time.
 
-**Backup copies:** hub_write_file (when it overwrites different content) and hub_delete_file first copy the file to `<name>_backup_<yyyyMMdd-HHmmss-SSS><ext>` (older copies use `<yyyyMMdd-HHmmss>`). If that copy cannot be written, hub_write_file writes nothing and returns `success: false`; hub_delete_file deletes anyway with a `warning`. After the write or delete succeeds, the newest 5 copies of each file name are kept; older copies of that same name are deleted and listed in `removedOldBackups`. A failed listing or delete leaves them and adds `pruneWarning`.
+**Backup copies:** hub_write_file (when it overwrites different content) and hub_delete_file first copy the file to `<name>_backup_<yyyyMMdd-HHmmss-SSS><ext>` (older copies use `<yyyyMMdd-HHmmss>`). hub_delete_file takes none for a file that is itself a backup (a name containing `_backup_` or starting `mcp-backup-`, `mcp-rm-backup-` or `mcp-prerestore-`). If that copy cannot be written, hub_write_file writes nothing and returns `success: false`; hub_delete_file deletes anyway with a `warning`. After the write or delete succeeds, the newest 5 copies of each file name are kept; older copies of that same name are deleted and listed in `removedOldBackups`. A failed listing or delete leaves them and adds `pruneWarning`. To recover a text file, read its copy with hub_read_file (every chunk, following `nextOffset`) and write it back with hub_write_file; for a binary file, download `backupDownload` and upload it in Settings > File Manager.
 
 ### hub_list_files
 
-Use to discover available files before reading one with hub_read_file, or to confirm a write/backup landed. Each file carries `size` (bytes) and `lastModified` (epoch ms). **`filter`:** case-insensitive substring match on the file name -- pass `filter: "backup"` to find backups instead of paging the whole listing and matching client-side. **Cursor pagination:** page size 100 -- omit the cursor for an unbounded list; pass "" for the first page and iterate `nextCursor`.
+Use to discover available files before reading one with hub_read_file, or to confirm a write/backup landed. Each file carries `size` (bytes) and `lastModified` (epoch ms) when the hub reports them. **`filter`:** case-insensitive substring match on the file name -- pass `filter: "backup"` to find backups instead of paging the whole listing and matching client-side. **Cursor pagination:** page size 100 -- omit the cursor for an unbounded list; pass "" for the first page and iterate `nextCursor`.
 
-**Folders:** the root listing includes subfolders as entries with `type: "dir"` (no size); list one with `folder: "<name>"` (nested as `a/b`; letters, digits, underscore and hyphen; no spaces or dots -- the hub can neither create nor list a folder with either). Files carry `type: "file"`, and `backupIncluded: false` marks a file a full local backup leaves out (past its 100 MiB File Manager limit). The response adds `freeSpaceBytes` and `filesExcludedFromFullBackup` (a count). A folder that is empty or does not exist lists no files. A file in a subfolder downloads from that listing's `downloadUrlBase` + its name.
+**Folders:** the root listing includes subfolders as entries with `type: "dir"` (no size); list one with `folder: "<name>"` (nested as `a/b`; letters, digits, underscore and hyphen; no spaces or dots -- the hub can neither create nor list a folder with either). Files carry `type: "file"`, and `backupIncluded: false` marks a file a full local backup leaves out (past its 100 MiB File Manager limit). The response adds `freeSpaceBytes` and `filesExcludedFromFullBackup` (a count) when the hub reports them. A folder that is empty or does not exist lists no files. A file in a subfolder downloads from that listing's `downloadUrlBase` + its name.
 
 ### hub_read_file
 
