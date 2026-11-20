@@ -4,7 +4,7 @@
  * A native MCP (Model Context Protocol) server that runs directly on Hubitat
  * with a built-in custom rule engine for creating automations via Claude.
  *
- * Version: 5.1.12 - Enriched list_devices summary + server-side filter (disabled, enabled, stale:N)
+ * Version: 5.2.0 - Enriched list_devices summary + server-side filter (disabled, enabled, stale:N)
  *
  * Installation:
  * 1. Go to Hubitat > Apps Code > New App
@@ -79,12 +79,34 @@ definition(
     oauth: [displayName: "MCP Rule Server", displayLink: ""],
     singleInstance: true
 )
+@groovy.transform.Field static final Object DASHBOARD_UPDATE_LOCK = new Object()
 def toolListDashboards(args = null) {
+    def cursor = args?.cursor
+    Map out = _readDashboards().out
+    if (cursor != null && out.dashboards instanceof List) {
+        def paged = _paginateList(out.dashboards, cursor, 50, "hub_list_dashboards")
+        out.total = out.dashboards.size()
+        out.dashboards = paged.page
+        out.count = paged.page.size()
+        if (paged.nextCursor != null) out.nextCursor = paged.nextCursor
+    }
+    return _dashboardFailureNote(out)
+}
+def toolGetDashboard(args) {
     args = args ?: [:]
+    String wantId = _requireDashboardId(args.dashboardId, "dashboardId", " to read")
+    def read = _readDashboards()
+    return _dashboardFailureNote(read.out.success == false ? read.out : _getDashboard(wantId, read))
+}
+private Map _dashboardFailureNote(Map result) {
+    if (result?.success != false) return result
+    String guide = "See hub_get_tool_guide(section='dashboards')."
+    String note = result.note?.toString()
+    return result + [note: !note ? guide : (note.contains(guide) ? note : note + " " + guide)]
+}
+private Map _readDashboards() {
     def page = _fetchDashboardPinToken()
-    def token = page?.token
-    def q = [:]
-    if (token) q.pinToken = token
+    def q = page?.token ? [pinToken: page.token] : [:]
     def parsed = null
     boolean allErrored = false
     try {
@@ -92,32 +114,52 @@ def toolListDashboards(args = null) {
         parsed = raw ? new groovy.json.JsonSlurper().parseText(raw) : []
     } catch (Exception e) {
         mcpLogError("dashboard", "list dashboards via /dashboard/all failed", e)
-        parsed = null
         allErrored = true
     }
-    def list = (parsed instanceof List) ? parsed.findAll { it != null && (it.version == null || it.version.toString().startsWith("2") || it.version.toString().startsWith("1")) } : []
-    if (!list.isEmpty()) {
-        def dashboards = list.collect { _summarizeDashboard(it) }
-        return [dashboards: dashboards, count: dashboards.size(), source: "dashboard-all"]
+    def records = (parsed instanceof List) ? parsed.findAll { r ->
+        def v = (r instanceof Map) ? r.version?.toString() : "x"
+        v == null || v.startsWith("2") || v.startsWith("1")
+    } : []
+    if (records) {
+        def dashboards = records.collect { _summarizeDashboard(it) }
+        return [out: [dashboards: dashboards, count: dashboards.size(), source: "dashboard-all"], records: records]
     }
-    def viaApps = _listDashboardsViaChildApps()
-    if (viaApps != null && !viaApps.isEmpty()) {
-        def note = allErrored
-            ? "/dashboard/all errored (logged); listed via the dashboard parents' child apps instead. Each entry carries id + name + type only; call hub_get_dashboard for full config."
-            : "Listed from the dashboard parents' child apps (/dashboard/all returned nothing${page?.session ? '' : ': the dashboard page token or its session could not be read'}). Each entry carries id + name + type only; call hub_get_dashboard for full config."
-        return [dashboards: viaApps, count: viaApps.size(), source: "child-apps", note: note]
+    def viaApps = null
+    boolean incomplete = false
+    try {
+        def tree = _dashboardAppTree()
+        incomplete = tree.malformed
+        viaApps = tree.rows.findAll { row ->
+            row.id != null && (row.parentType == "Easy Dashboard Parent" ||
+                (_isLegacyDashboardParentType(row.parentType) && row.type?.toString() == "Dashboard"))
+        }.collect { row ->
+            [id: row.id.toString(), name: row.name, type: row.parentType == "Easy Dashboard Parent" ? "easy" : "legacy"]
+        }
+    } catch (Exception e) {
+        mcpLogError("dashboard", "enumerate dashboards via child apps failed", e)
+    }
+    String partialNote = incomplete ? " Part of the app inventory had an unexpected shape, so this list may be missing dashboards." : ""
+    if (viaApps) {
+        def note = (allErrored
+            ? "/dashboard/all errored (logged); listed via the dashboard parents' child apps instead. Each entry carries id + name + type only; call hub_get_dashboard for the full config."
+            : "Listed from the dashboard parents' child apps (/dashboard/all returned nothing${page?.session ? '' : ': the dashboard page token or its session could not be read'}). Each entry carries id + name + type only; call hub_get_dashboard for the full config.") + partialNote
+        def out = [dashboards: viaApps, count: viaApps.size(), source: "child-apps", note: note]
+        if (incomplete) out.partial = true
+        return [out: out, records: viaApps]
     }
     if (viaApps == null) {
-        return [success: false,
+        return [out: [success: false,
                 error: allErrored
                     ? "Could not list dashboards: both /dashboard/all and the child-app fallback failed to read."
                     : "Could not confirm the dashboard list: /dashboard/all returned nothing and the child-app fallback read failed.",
-                note: "Transient hub error (details logged). Retry; if it persists, check hub connectivity."]
+                note: "Transient hub error (details logged). Retry; if it persists, check hub connectivity."], records: []]
     }
-    return [dashboards: [], count: 0,
-            note: allErrored
+    def empty = [dashboards: [], count: 0,
+            note: (allErrored
                 ? "No dashboards found: /dashboard/all errored (logged) and the dashboard parents have no child apps. Retry; if it persists, check hub connectivity."
-                : "No dashboards found: /dashboard/all returned empty and no dashboard-parent child apps were present."]
+                : "No dashboards found: /dashboard/all returned empty and no dashboard-parent child apps were present.") + partialNote]
+    if (incomplete) empty.partial = true
+    return [out: empty, records: []]
 }
 private Map _fetchDashboardPinToken() {
     try {
@@ -135,105 +177,117 @@ private Map _fetchDashboardPinToken() {
         return null
     }
 }
-private List _listDashboardsViaChildApps() {
-    try {
-        def raw = hubInternalGet("/hub2/appsList")
-        if (!raw) return null
-        def parsed = new groovy.json.JsonSlurper().parseText(raw)
-        def apps = parsed?.apps ?: []
-        def out = []
-        def walk
-        walk = { node ->
-            def d = node?.data ?: [:]
-            def t = d.type?.toString() ?: ""
-            if (t == "Easy Dashboard Parent") {
-                (node?.children ?: []).each { c ->
-                    def cd = c?.data ?: [:]
-                    if (cd.id != null) out << [id: cd.id?.toString(), name: cd.name, type: "easy"]
-                }
-            } else if (_isLegacyDashboardParentType(t)) {
-                (node?.children ?: []).each { c ->
-                    def cd = c?.data ?: [:]
-                    if (cd.id != null && cd.type?.toString() == "Dashboard") out << [id: cd.id?.toString(), name: cd.name, type: "legacy"]
-                }
-            }
-            (node?.children ?: []).each { walk(it) }
+private Map _dashboardAppTree() {
+    def raw = hubInternalGet("/hub2/appsList")
+    def parsed = raw ? new groovy.json.JsonSlurper().parseText(raw) : null
+    if (!(parsed instanceof Map) || !(parsed.apps instanceof List)) throw new IllegalStateException("the app inventory is unavailable")
+    def rows = []
+    boolean malformed = false
+    def walk
+    walk = { node, String parentType ->
+        if (!(node instanceof Map) || (node.data != null && !(node.data instanceof Map)) ||
+                (node.children != null && !(node.children instanceof List))) {
+            malformed = true
+            return
         }
-        apps.each { walk(it) }
-        return out
-    } catch (Exception e) {
-        mcpLogError("dashboard", "enumerate dashboards via child apps failed", e)
-        return null
+        def d = node.data ?: [:]
+        def type = d.type != null ? d.type : node.type
+        rows << [id: (d.id != null ? d.id : node.id), type: type, parentType: parentType, name: d.name,
+                 installed: d.installed, hidden: d.hidden, hasData: node.data != null]
+        (node.children ?: []).each { walk(it, type?.toString()) }
     }
+    parsed.apps.each { walk(it, null) }
+    return [rows: rows, malformed: malformed]
 }
 private boolean _isLegacyDashboardParentType(String t) {
     return t && t.startsWith("Hubitat") && t.endsWith("Dashboard")
 }
-private String _requireDashboardId(rawId, String verbNote) {
+private String _requireDashboardId(rawId, String param, String verbNote) {
     def s = rawId?.toString()?.trim()
     if (!s) {
-        throw new IllegalArgumentException("dashboardId is required (the dashboard installedAppId${verbNote}). Call hub_list_dashboards to find it.")
+        throw new IllegalArgumentException("${param} is required (the dashboard id${verbNote}). Call hub_list_dashboards to find it.")
     }
     if (!(s ==~ /\d+/)) {
-        throw new IllegalArgumentException("dashboardId must be a numeric dashboard installedAppId; got '${rawId}'. Call hub_list_dashboards to find it.")
+        throw new IllegalArgumentException("${param} must be a numeric dashboard id; got '${rawId}'. Call hub_list_dashboards to find it.")
     }
     return s
 }
-def toolGetDashboard(args) {
-    args = args ?: [:]
-    def wantId = _requireDashboardId(args.dashboardId, "")
-    def listed = toolListDashboards(args)
-    if (listed instanceof Map && listed.success == false) {
-        return listed
-    }
-    def match = (listed.dashboards ?: []).find { it.id?.toString() == wantId }
-    if (!match) {
-        def available = (listed.dashboards ?: []).collect { it.id }.findAll { it != null }
-        return [success: false, error: "No dashboard found with id '${wantId}'.",
-                availableIds: available,
-                note: available.isEmpty()
-                    ? "The list returned no dashboards; check the hub's Dashboards page."
-                    : "Use hub_list_dashboards to see valid ids."]
-    }
-    if (match.type == "legacy") {
-        return _getLegacyDashboard(wantId, match)
-    }
-    if (!match.containsKey("showClockTile")) {
-        def full = _dashboardConfigFromApp(wantId)
-        if (full != null) {
-            full.id = wantId
-            if (!full.name) full.name = match.name
-            return full
-        }
-        return match + [partial: true, note: "Only id + name could be read (the dashboard's config page was unreadable); tile/device/pin fields are unavailable, not defaulted. Retry hub_get_dashboard."]
-    }
-    return match
+private Map _dashboardRecord(String id, Map read) {
+    return (read.records ?: []).find { r -> (r.installedAppId ?: r.id)?.toString() == id }
 }
-private Map _legacyDashboardProbe(String id) {
-    def raw
-    try {
-        raw = hubInternalGet("/installedapp/statusJson/${id}")
-    } catch (Exception e) {
-        mcpLogError("dashboard", "legacy dashboard probe failed for ${id}", e)
-        return null
+private Map _dashboardNotFound(String id, Map read) {
+    def available = (read.out.dashboards ?: []).collect { it.id }.findAll { it != null }
+    if (read.out.partial) {
+        return [success: false, error: "Dashboard '${id}' was not among the dashboards read, but the dashboard list was incomplete, so it may still exist.",
+                availableIds: available, partial: true,
+                note: "Part of the hub's app inventory had an unexpected shape. Retry, or check the hub's Dashboards page."]
     }
-    if (!raw) return null
+    return [success: false, error: "No dashboard found with id '${id}'.",
+            availableIds: available,
+            note: available.isEmpty()
+                ? "The list returned no dashboards; check the hub's Dashboards page."
+                : "Call hub_list_dashboards to see valid ids."]
+}
+private Map _getDashboard(String id, Map read) {
+    def rec = _dashboardRecord(id, read)
+    if (rec == null) return _dashboardNotFound(id, read)
+    boolean fromAll = read.out.source == "dashboard-all"
+    Map summary = fromAll ? _summarizeDashboard(rec) : rec
+    if (summary.type == "legacy") return _getLegacyDashboard(id, summary, fromAll ? rec : null)
+    if (summary.containsKey("showClockTile")) return summary
+    def full = _dashboardConfigFromApp(id)
+    if (full != null) {
+        if (!full.name) full.name = summary.name
+        full.note = "Read from the dashboard's app config because the dashboard list was unreadable; it carries no theme. Pass the dashboard's theme in options when updating, or it reverts to 'legacy'."
+        return full
+    }
+    return summary + [partial: true, note: "Only id + name could be read (the dashboard's config page was unreadable); tile/device/pin fields are unavailable, not defaulted. Retry hub_get_dashboard."]
+}
+private Map _dashboardStatus(String id) {
     def parsed
-    try { parsed = new groovy.json.JsonSlurper().parseText(raw) } catch (Exception e) {
-        mcpLogError("dashboard", "legacy dashboard probe: statusJson for ${id} was not JSON", e)
+    try {
+        def raw = hubInternalGet("/installedapp/statusJson/${id}")
+        parsed = raw ? new groovy.json.JsonSlurper().parseText(raw) : null
+    } catch (Exception e) {
+        mcpLogError("dashboard", "dashboard status read failed for ${id}", e)
         return null
     }
-    def ia = (parsed instanceof Map) ? parsed.installedApp : null
-    if (!(ia instanceof Map) || ia.name?.toString() != "Dashboard" || ia.systemAppType != true) return [legacy: false]
-    def out = [legacy: true, label: ia.label]
-    (parsed.appState ?: []).each { s ->
-        if (s?.name?.toString() == "accessToken") out.accessToken = s.value?.toString()
+    if (!(parsed instanceof Map)) return null
+    def ia = parsed.installedApp
+    boolean present = ia instanceof Map && !ia.isEmpty()
+    boolean systemApp = present && ia.systemAppType == true
+    if (!systemApp || ia.name?.toString() != "Dashboard") {
+        return [present: present, legacy: false, easy: systemApp && ia.name?.toString() == "Easy Dashboard"]
     }
-    def devices = (parsed.appSettings ?: []).find { it?.name?.toString() == "devicesPicked" }
-    if (devices?.deviceIdsForDeviceList != null) out.deviceIds = _normalizeDeviceIdList(devices.deviceIdsForDeviceList)
-    def la = (parsed.appSettings ?: []).find { it?.name?.toString() == "localAccess" }
+    def out = [present: true, legacy: true, easy: false, label: ia.label]
+    def token = (parsed.appState ?: []).find { it?.name?.toString() == "accessToken" }
+    if (token?.value != null) out.accessToken = token.value.toString()
+    def appSettings = parsed.appSettings instanceof List ? parsed.appSettings : null
+    def devices = appSettings?.find { it?.name?.toString() == "devicesPicked" }
+    if (appSettings != null && devices == null) {
+        out.deviceIds = []
+    } else if (devices instanceof Map && (devices.deviceIdsForDeviceList instanceof Collection || devices.deviceIdsForDeviceList instanceof String)) {
+        out.deviceIds = _normalizeDeviceIdList(devices.deviceIdsForDeviceList)
+    }
+    def la = (appSettings ?: []).find { it?.name?.toString() == "localAccess" }
     if (la != null) out.localAccess = la.value?.toString() != "false"
     return out
+}
+private String _lanAccessHint(Map status) {
+    if (status?.localAccess == true) return ""
+    if (status?.localAccess == false) return " Note: this dashboard has 'Allow LAN access' disabled, which can block its layout endpoint."
+    return " If this dashboard has 'Allow LAN access' disabled, that can block its layout endpoint."
+}
+private Map _notADashboard(String id, Map status, String verb) {
+    if (status.legacy == true || status.easy == true) return null
+    def read = _readDashboards()
+    if (read.out.success == false) {
+        return [success: false, id: id,
+                error: "Could not confirm that app ${id} is a dashboard (the dashboard list was unreadable), so no ${verb} was attempted.",
+                note: read.out.note ?: "Transient hub error (details logged); retry."]
+    }
+    if (_dashboardRecord(id, read) != null) return null
+    return _dashboardNotFound(id, read) + [id: id]
 }
 private String _legacyMintRequestToken(String id, String accessToken) {
     def html = hubInternalGet("/apps/api/${id}/dashboard/${id}", [access_token: accessToken])
@@ -242,7 +296,6 @@ private String _legacyMintRequestToken(String id, String accessToken) {
     return m.find() ? m.group(1) : null
 }
 private Map _legacyLayoutFetch(String id, String accessToken) {
-    if (!accessToken) return null
     def rt = _legacyMintRequestToken(id, accessToken)
     if (!rt) return null
     def raw = hubInternalGet("/apps/api/${id}/dashboard/${id}/layout", [access_token: accessToken, requestToken: rt])
@@ -250,36 +303,44 @@ private Map _legacyLayoutFetch(String id, String accessToken) {
     return (parsed instanceof Map) ? parsed : null
 }
 private Map _legacyLayoutPost(String id, String accessToken, Map layout) {
-    def rt = _legacyMintRequestToken(id, accessToken)
-    if (!rt) {
-        throw new IllegalStateException("Could not mint a dashboard requestToken (the dashboard page render failed); the layout was not saved.")
+    String rt = null
+    try { rt = _legacyMintRequestToken(id, accessToken) } catch (Exception e) {
+        mcpLogError("dashboard", "dashboard requestToken mint failed for ${id}", e)
     }
+    if (!rt) return [sent: false]
     def resp = hubInternalPostJson("/apps/api/${id}/dashboard/${id}/layout",
         groovy.json.JsonOutput.toJson(layout), 420, false, [access_token: accessToken, requestToken: rt])
-    return (resp instanceof Map) ? resp : null
+    return [sent: true, saved: (resp instanceof Map && resp.tiles instanceof List) ? resp : null]
 }
-private Map _getLegacyDashboard(String id, Map match) {
-    def probe = _legacyDashboardProbe(id)
-    if (probe == null || probe.legacy != true) {
-        return match + [partial: true, note: "Listed as a legacy dashboard but its status page was unreadable; layout unavailable (not empty). Retry hub_get_dashboard."]
+private Map _getLegacyDashboard(String id, Map summary, Map rec) {
+    def out = [id: id, name: summary.name, type: "legacy"]
+    if (summary.deviceIds != null) out.deviceIds = summary.deviceIds
+    String token = _dashboardRealValue(rec?.accessToken) ? rec.accessToken.toString() : null
+    Map status = null
+    if (!token || out.deviceIds == null) {
+        status = _dashboardStatus(id)
+        if (status?.legacy != true) {
+            return out + [partial: true, note: "Listed as a legacy dashboard but its status page was unreadable; layout unavailable (not empty). Retry hub_get_dashboard."]
+        }
+        if (status.label) out.name = status.label
+        if (out.deviceIds == null && status.deviceIds != null) out.deviceIds = status.deviceIds
+        if (!token) token = status.accessToken
     }
-    def out = [id: id, name: (probe.label ?: match.name), type: "legacy"]
-    if (probe.deviceIds != null) out.deviceIds = probe.deviceIds
-    if (!probe.accessToken) {
-        return out + [partial: true, note: "The dashboard's access token could not be read from its app state, so its layout endpoint is unreachable. Open the dashboard app page once and retry."]
+    if (!token) {
+        return out + [partial: true, note: "The dashboard's access token could not be read, so its layout endpoint is unreachable. Open the dashboard app page once and retry."]
     }
     def layout = null
-    try { layout = _legacyLayoutFetch(id, probe.accessToken) } catch (Exception e) {
+    try { layout = _legacyLayoutFetch(id, token) } catch (Exception e) {
         mcpLogError("dashboard", "legacy layout read failed for ${id}", e)
     }
     if (layout instanceof Map) {
-        out.layout = layout
-    } else {
-        out.partial = true
-        out.note = "The dashboard's layout endpoint was unreadable (details logged); tiles/grid are unavailable, not empty. Retry hub_get_dashboard." +
-            (probe.localAccess == false ? " Note: this dashboard has 'Allow LAN access' disabled, which can block its layout endpoint." : "")
+        if (out.deviceIds == null) {
+            return out + [layout: layout, partial: true,
+                          note: "The dashboard's authorized device list could not be read (unavailable, not empty). Retry hub_get_dashboard."]
+        }
+        return out + [layout: layout]
     }
-    return out
+    return out + [partial: true, note: "The dashboard's layout endpoint was unreadable (details logged); tiles/grid are unavailable, not empty. Retry hub_get_dashboard." + _lanAccessHint(status)]
 }
 private Map _dashboardConfigFromApp(String id) {
     try {
@@ -289,82 +350,86 @@ private Map _dashboardConfigFromApp(String id) {
         def s = parsed?.settings
         if (!(s instanceof Map)) return null
         def out = [id: id, name: parsed?.app?.label, type: "easy"]
-        ["showModeTile", "showClockTile", "showCalendarTile", "showHSMTile", "showEdit",
-         "showNavigation", "showTutorial"].each { k ->
+        _dashboardTileKeys().each { k ->
             if (s.containsKey(k)) out.put(k, s.get(k)?.toString() == "true")
         }
         if (s.containsKey("navigationSelection")) out.navigationSelection = _dashboardNavSelectionCsv(s.navigationSelection)
-        if (s.devicesPicked instanceof Map) out.deviceIds = s.devicesPicked.keySet().collect { it.toString() }
-        if (s.dashboardPin && s.dashboardPin.toString() != "null") out.dashboardPin = s.dashboardPin
-        if (s.hsmPin && s.hsmPin.toString() != "null") out.hsmPin = s.hsmPin
+        if (s.containsKey("localOnly")) out.localOnly = s.localOnly?.toString() == "true"
+        if (!s.containsKey("devicesPicked")) out.deviceIds = []
+        else if (s.devicesPicked instanceof Map) out.deviceIds = s.devicesPicked.keySet().collect { it.toString() }
+        if (_dashboardRealValue(s.dashboardPin)) out.dashboardPin = s.dashboardPin
+        if (_dashboardRealValue(s.hsmPin)) out.hsmPin = s.hsmPin
         return out
     } catch (Exception e) {
         mcpLogError("dashboard", "read dashboard config from app failed", e)
         return null
     }
 }
-private Boolean _dashboardPresent(String id) {
-    def viaApps = _listDashboardsViaChildApps()
-    if (viaApps != null) return viaApps.any { it.id?.toString() == id }
-    def listed = toolListDashboards([:])
-    if (!(listed instanceof Map) || listed.success == false) return null
-    return (listed.dashboards ?: []).any { it.id?.toString() == id }
-}
 def toolCreateDashboard(args) {
-    args = args ?: [:]
+    return _dashboardFailureNote(_createDashboard(args ?: [:]))
+}
+private Map _createDashboard(Map args) {
+    if (args.sourceId != null) return _copyDashboard(args)
     if (!args.name?.toString()?.trim()) {
-        throw new IllegalArgumentException("name is required (the dashboard's display name).")
+        throw new IllegalArgumentException("name is required (the dashboard's display name), unless sourceId copies an existing dashboard.")
     }
     if (_dashboardTypeArg(args.type) == "legacy") {
         return _createLegacyDashboard(args)
     }
     def deviceCsv = _dashboardDeviceCsv(args.deviceIds, true)
     def q = _buildDashboardConfigQuery(args, deviceCsv)
-    q.version = (args.version ?: "2.0").toString()
+    _requireDashboardDevicesSelected(deviceCsv.split(",") as List, "this dashboard write", "add")
     _requireUnprotectedEasyDashboardParent()
+    Map created
     try {
-        def raw = hubInternalGet("/dashboard/create", q)
-        return _dashboardWriteResult(raw, "create", null)
-    } catch (IllegalArgumentException iae) {
-        throw iae
+        created = _dashboardWriteResult(hubInternalGet("/dashboard/create", q + [version: "2.0"]), "create", null)
     } catch (Exception e) {
         mcpLogError("dashboard", "create dashboard failed", e)
         return [success: false, outcomeUnknown: true, error: "Failed to confirm dashboard creation: ${e.message}",
                 note: "A dashboard may have been created. Inspect hub_list_dashboards before retrying; retrying blindly may create a duplicate."]
     }
+    return created.success == true ? _applyEasyCreateOnlyOffSettings(created, q) : created
+}
+private Map _applyEasyCreateOnlyOffSettings(Map created, Map q) {
+    def off = ["showEdit", "showNavigation"].findAll { q.get(it) == "false" }
+    if (!off) return created
+    String failure = null
+    if (created.id == null) {
+        failure = "the create answer carried no dashboard id"
+    } else {
+        try {
+            def upd = _dashboardWriteResult(hubInternalGet("/dashboard/update", q + [id: created.id.toString()]), "update", created.id.toString())
+            if (upd.success != true) failure = upd.error ?: "the hub reported failure"
+        } catch (Exception e) {
+            mcpLogError("dashboard", "follow-up update after dashboard create failed", e)
+            failure = e.message
+        }
+    }
+    if (failure == null) return created + [offAfterCreate: off]
+    def warnings = (created.warnings ?: []) + ["The dashboard was created with ${off.join(' and ')} on: the hub's create turns ${off.size() == 1 ? 'it' : 'them'} on, and the follow-up update that turns ${off.size() == 1 ? 'it' : 'them'} off failed (${failure}). Set ${off.size() == 1 ? 'it' : 'them'} with hub_update_dashboard."]
+    return created + [warnings: warnings]
 }
 private void _requireUnprotectedEasyDashboardParent() {
     def protectedIds = _protectedAppIds()
     if (protectedIds.isEmpty()) return
-    def parsed
+    Map tree
     try {
-        def raw = hubInternalGet("/hub2/appsList")
-        parsed = raw ? new groovy.json.JsonSlurper().parseText(raw) : null
+        tree = _dashboardAppTree()
     } catch (Exception e) {
         throw new IllegalArgumentException("Cannot verify Easy Dashboard parent protection: ${e.message}. No create request was sent.")
     }
-    if (!(parsed instanceof Map) || !(parsed.apps instanceof List)) {
-        throw new IllegalArgumentException("Cannot verify Easy Dashboard parent protection: the app inventory is unavailable. No create request was sent.")
+    if (tree.malformed) {
+        throw new IllegalArgumentException("Cannot verify Easy Dashboard parent protection: the app inventory is malformed. No create request was sent.")
     }
-    def walk
-    walk = { node ->
-        if (!(node instanceof Map) || (node.data != null && !(node.data instanceof Map)) ||
-                (node.children != null && !(node.children instanceof List))) {
-            throw new IllegalArgumentException("Cannot verify Easy Dashboard parent protection: the app inventory is malformed. No create request was sent.")
-        }
-        def rawId = node.data?.id != null ? node.data.id : node.id
-        def id = _protectedAppId(rawId)
-        def type = node.data?.type ?: node.type
-        if (((node.data != null || rawId != null) && !id) || (protectedIds.contains(id) && !(type instanceof String && type)) ||
-                (type == "Easy Dashboard Parent" && !id)) {
+    tree.rows.each { row ->
+        def id = _protectedAppId(row.id)
+        boolean easyParent = row.type == "Easy Dashboard Parent"
+        if (((row.hasData || row.id != null) && !id) || (protectedIds.contains(id) && !(row.type instanceof String && row.type.trim())) ||
+                (easyParent && !id)) {
             throw new IllegalArgumentException("Cannot verify Easy Dashboard parent protection: an app ID or type is missing. No create request was sent.")
         }
-        if (type == "Easy Dashboard Parent") {
-            _requireUnprotectedAppMutation(id, "create a dashboard under", protectedIds)
-        }
-        (node.children ?: []).each { walk(it) }
+        if (easyParent) _requireUnprotectedAppMutation(id, "create a dashboard under", protectedIds)
     }
-    parsed.apps.each { walk(it) }
 }
 private String _dashboardTypeArg(raw) {
     def t = raw?.toString()?.trim()?.toLowerCase()
@@ -375,7 +440,7 @@ private String _dashboardTypeArg(raw) {
     return t
 }
 private Integer _legacyDashboardParentId() {
-    def node = _findLegacyDashboardParentNode()
+    def node = _findLegacyDashboardParent()
     if (node == null) {
         def created = null
         try {
@@ -383,7 +448,7 @@ private Integer _legacyDashboardParentId() {
         } catch (Exception e) {
             mcpLogError("dashboard", "legacy dashboard parent bootstrap (Add Built-In App) failed", e)
         }
-        node = _findLegacyDashboardParentNode()
+        node = _findLegacyDashboardParent()
         if (node == null && created?.location) {
             def lm = (created.location.toString() =~ /\/installedapp\/configure\/(\d+)/)
             if (lm.find()) node = [id: lm.group(1), installed: true]
@@ -400,30 +465,18 @@ private Integer _legacyDashboardParentId() {
     if (node?.id == null) return null
     try { return node.id.toString().toInteger() } catch (NumberFormatException ignored) { return null }
 }
-private Map _findLegacyDashboardParentNode() {
+private Map _findLegacyDashboardParent() {
     try {
-        def raw = hubInternalGet("/hub2/appsList")
-        if (!raw) return null
-        def parsed = new groovy.json.JsonSlurper().parseText(raw)
-        Map found = null
-        def walk
-        walk = { node ->
-            if (found != null) return
-            def d = node?.data ?: [:]
-            if (_isLegacyDashboardParentType(d.type?.toString()) && d.id != null && d.hidden != true) {
-                found = [id: d.id, installed: d.installed]
-                return
-            }
-            (node?.children ?: []).each { walk(it) }
+        def row = _dashboardAppTree().rows.find { r ->
+            _isLegacyDashboardParentType(r.type?.toString()) && r.id != null && r.hidden != true
         }
-        (parsed?.apps ?: []).each { walk(it) }
-        return found
+        return row ? [id: row.id, installed: row.installed] : null
     } catch (Exception e) {
         mcpLogError("dashboard", "legacy dashboard parent lookup failed", e)
         return null
     }
 }
-private Map _legacyDashboardFormPost(String appId, Map fields) {
+private void _legacyDashboardFormPost(String appId, Map fields) {
     def body = [formAction: "update", id: appId, version: "1", appTypeId: "", appTypeName: "",
                 currentPage: "mainPage", pageBreadcrumbs: "[]", referrer: "", url: "", _cancellable: "false"]
     body.putAll(fields)
@@ -431,17 +484,21 @@ private Map _legacyDashboardFormPost(String appId, Map fields) {
     if (resp?.status != null && resp.status >= 400) {
         throw new IllegalStateException("classic form POST failed for app ${appId}: status=${resp.status}")
     }
-    return resp
+}
+private void _legacyDashboardSetLabel(String appId, String name) {
+    _legacyDashboardFormPost(appId, [label: name, ("label.type"): "text", ("label.multiple"): "false"])
+}
+private void _legacyDashboardSetDevices(String appId, String deviceCsv) {
+    _legacyDashboardFormPost(appId, [("settings[devicesPicked]"): deviceCsv,
+                                     ("devicesPicked.type"): "capability.*", ("devicesPicked.multiple"): "true"])
 }
 private Map _createLegacyDashboard(Map args) {
     def name = args.name.toString().trim()
-    if (args.version != null) {
-        throw new IllegalArgumentException("version applies only to Easy Dashboards. Omit it for a legacy dashboard.")
-    }
     if (args.options != null) {
         throw new IllegalArgumentException("options applies only to Easy Dashboards. A legacy dashboard's look lives in its layout -- create it first, then pass setOptions/addTiles to hub_update_dashboard.")
     }
     def deviceCsv = _dashboardDeviceCsv(args.deviceIds, false)
+    if (deviceCsv) _requireDashboardDevicesSelected(deviceCsv.split(",") as List, "this dashboard write", "add")
     def parentId = _legacyDashboardParentId()
     if (parentId == null) {
         return [success: false,
@@ -469,19 +526,13 @@ private Map _createLegacyDashboard(Map args) {
     def warnings = []
     boolean labelApplied = false
     try {
-        _legacyDashboardFormPost(newId, [label: name, ("label.type"): "text", ("label.multiple"): "false"])
+        _legacyDashboardSetLabel(newId, name)
         labelApplied = true
     } catch (Exception e) {
         warnings << "label write failed (${e.message}) -- the dashboard keeps the default 'Dashboard' label; rename via hub_update_dashboard(name=...)."
     }
     if (deviceCsv) {
-        try {
-            _legacyDashboardFormPost(newId, [
-                ("settings[devicesPicked]"): deviceCsv,
-                ("devicesPicked.type"): "capability.*",
-                ("devicesPicked.multiple"): "true"
-            ])
-        } catch (Exception e) {
+        try { _legacyDashboardSetDevices(newId, deviceCsv) } catch (Exception e) {
             warnings << "device authorization failed (${e.message}) -- re-apply via hub_update_dashboard(deviceIds=[...])."
         }
     }
@@ -491,22 +542,117 @@ private Map _createLegacyDashboard(Map args) {
     if (warnings) out.warnings = warnings
     return out
 }
+private Map _copyDashboard(Map args) {
+    String sourceId = _requireDashboardId(args.sourceId, "sourceId", " to copy")
+    def extra = ["type", "deviceIds", "options"].findAll { args.get(it) != null }
+    if (extra) {
+        throw new IllegalArgumentException("${extra.join(', ')} cannot be combined with sourceId: a copy keeps the source's kind, devices and settings. Copy it, then change the copy with hub_update_dashboard.")
+    }
+    def read = _readDashboards()
+    def src = read.out.success == false ? read.out : _getDashboard(sourceId, read)
+    if (src.success == false) {
+        return [success: false, sourceId: sourceId,
+                error: "Could not read the source dashboard to copy it" + (src.error ? ": ${src.error}" : "."),
+                note: "Verify the id with hub_list_dashboards."]
+    }
+    String name = args.name?.toString()?.trim() ?: "${src.name ?: 'Dashboard'} (copy)".toString()
+    if (src.type == "legacy") return _copyLegacyDashboard(sourceId, src, name)
+    if (!src.deviceIds) {
+        return [success: false, sourceId: sourceId,
+                error: "Could read the source dashboard's id/name but not its device list, so it can't be copied.",
+                note: "Retry; if it persists, read it with hub_get_dashboard and recreate it with hub_create_dashboard."]
+    }
+    _requireDashboardDevicesSelected(src.deviceIds, "a copy of dashboard ${sourceId}", "authorize")
+    def opts = [:]
+    (_dashboardTileKeys() + ["theme", "navigationSelection", "dashboardPin", "hsmPin", "localOnly"]).each { k ->
+        if (src.containsKey(k)) opts.put(k, src.get(k))
+    }
+    def created = _createDashboard([name: name, deviceIds: src.deviceIds, options: opts])
+    if (created.success == true) {
+        def ok = [success: true, id: created.id, sourceId: sourceId, type: "easy", name: name,
+                  message: "Copied dashboard ${sourceId} into a new dashboard${created.id ? ' (' + created.id + ')' : ''}."]
+        if (created.offAfterCreate) ok.offAfterCreate = created.offAfterCreate
+        def warnings = (created.warnings ?: []) as List
+        if (!src.containsKey("theme")) {
+            warnings << "The source dashboard's theme could not be read, so the copy uses the default 'legacy' theme. Set it with hub_update_dashboard."
+        }
+        if (warnings) ok.warnings = warnings
+        return ok
+    }
+    def out = [success: false, sourceId: sourceId, error: created.error ?: "creating the copy failed",
+               note: created.note ?: "The copy may not have been created; verify with hub_list_dashboards."]
+    if (created.outcomeUnknown) out.outcomeUnknown = true
+    return out
+}
+private Map _copyLegacyDashboard(String sourceId, Map src, String name) {
+    if (!(src.layout instanceof Map)) {
+        return [success: false, sourceId: sourceId,
+                error: "Could read the legacy dashboard but not its layout, so it can't be copied.",
+                note: "Retry; if it persists, inspect it with hub_get_dashboard(dashboardId=${sourceId})."]
+    }
+    if (src.deviceIds == null) {
+        return [success: false, sourceId: sourceId,
+                error: "Could read the legacy dashboard's layout but not its authorized device list, so a copy would show no device data. Nothing was created.",
+                note: "Retry; if it persists, open the dashboard's app page once, or read it with hub_get_dashboard(dashboardId=${sourceId}) and recreate it with hub_create_dashboard(type='legacy', deviceIds=[...]) plus hub_update_dashboard(layout=...)."]
+    }
+    _requireDashboardDevicesSelected(src.deviceIds, "a copy of dashboard ${sourceId}", "authorize")
+    def created = _createLegacyDashboard([name: name, deviceIds: src.deviceIds])
+    if (created.success != true) {
+        return created + [sourceId: sourceId]
+    }
+    def newId = created.id.toString()
+    def status = _dashboardStatus(newId)
+    String saveError
+    if (status?.legacy == true && status.accessToken) {
+        try {
+            def post = _legacyLayoutPost(newId, status.accessToken, new LinkedHashMap(src.layout as Map))
+            if (!post.sent) saveError = "Could not mint a dashboard requestToken (the dashboard page render failed), so the layout was not saved."
+            else if (post.saved == null) saveError = "the layout endpoint did not echo a saved layout (outcome unconfirmed)"
+        } catch (Exception e) { saveError = e.message }
+    } else {
+        saveError = "the new dashboard's access token was unreadable"
+    }
+    if (saveError) {
+        return [success: false, id: newId, sourceId: sourceId, type: "legacy",
+                error: "Copy ${newId} was created but its layout could not be written: ${saveError}",
+                note: "Re-apply with hub_update_dashboard(dashboardId=${newId}, layout=<the layout from hub_get_dashboard(dashboardId=${sourceId})>)."]
+    }
+    def out = [success: true, id: newId, sourceId: sourceId, type: "legacy",
+               message: "Copied legacy dashboard ${sourceId} with its devices and layout into a new dashboard (${newId})."]
+    if (created.name) out.name = created.name
+    if (created.warnings) out.warnings = created.warnings
+    return out
+}
 def toolUpdateDashboard(args) {
-    args = args ?: [:]
-    def updateId = _requireDashboardId(args.dashboardId, " to update")
+    return _dashboardFailureNote(_updateDashboard(args ?: [:]))
+}
+private Map _updateDashboard(Map args) {
+    def updateId = _requireDashboardId(args.dashboardId, "dashboardId", " to update")
     _requireUnprotectedAppMutation(updateId, "edit dashboard")
-    def probe = _legacyDashboardProbe(updateId)
-    if (probe == null) {
+    synchronized (DASHBOARD_UPDATE_LOCK) {
+        return _updateDashboardLocked(updateId, args)
+    }
+}
+private Map _updateDashboardLocked(String updateId, Map args) {
+    def status = _dashboardStatus(updateId)
+    if (status == null) {
         return [success: false, id: updateId,
                 error: "Could not determine the dashboard's type (the status read failed), so no update was attempted.",
                 note: "Transient hub error (details logged); retry."]
     }
-    if (probe.legacy == true) {
-        return _updateLegacyDashboard(updateId, probe, args)
+    if (status.present != true) {
+        return [success: false, id: updateId,
+                error: "No dashboard found with id '${updateId}', so no update was attempted.",
+                note: "Call hub_list_dashboards to see valid ids."]
+    }
+    def notDashboard = _notADashboard(updateId, status, "update")
+    if (notDashboard != null) return notDashboard
+    if (status.legacy == true) {
+        return _updateLegacyDashboard(updateId, status, args)
     }
     def legacyOnlyArgs = ["layout", "setOptions", "addTiles", "updateTiles", "removeTileIds"].findAll { args.get(it) != null }
     if (legacyOnlyArgs) {
-        throw new IllegalArgumentException("${legacyOnlyArgs.join(', ')} appl${legacyOnlyArgs.size() == 1 ? 'ies' : 'y'} only to legacy Hubitat® Dashboards; dashboard ${updateId} is an Easy Dashboard. Easy updates replace the config wholesale: pass name, deviceIds, and options (read hub_get_dashboard first).")
+        throw new IllegalArgumentException("${legacyOnlyArgs.join(', ')} appl${legacyOnlyArgs.size() == 1 ? 'ies' : 'y'} only to legacy Hubitat® Dashboards; dashboard ${updateId} is an Easy Dashboard. Easy updates replace the config wholesale: pass name, deviceIds, and options (read it with hub_get_dashboard first).")
     }
     if (!args.name?.toString()?.trim()) {
         throw new IllegalArgumentException("name is required. Update REPLACES the dashboard's config wholesale (there is no server-side read-merge), so pass the full desired config every time.")
@@ -514,41 +660,45 @@ def toolUpdateDashboard(args) {
     def deviceCsv = _dashboardDeviceCsv(args.deviceIds, true)
     String pinMarker = _appConfigRedactedMarker()
     args = [:] + args
-    if (args.options instanceof Map) args.options = args.options.findAll { k, v -> !(k in ["dashboardPin", "hsmPin"] && v?.toString() == pinMarker) }
-    ["dashboardPin", "hsmPin"].each { k -> if (args[k]?.toString() == pinMarker) args.remove(k) }
-    def argsForQuery = args
-    boolean pinPreserveFailed = false
-    def hasField = { String k -> (args.options instanceof Map && args.options.containsKey(k)) || args.containsKey(k) }
-    if (!hasField("dashboardPin") || !hasField("hsmPin")) {
-        def cur = _dashboardConfigFromApp(updateId)
-        if (cur != null) {
-            def merged = [:] + (args.options instanceof Map ? args.options : [:])
-            if (!hasField("dashboardPin") && cur.containsKey("dashboardPin")) merged.dashboardPin = cur.dashboardPin
-            if (!hasField("hsmPin") && cur.containsKey("hsmPin")) merged.hsmPin = cur.hsmPin
-            argsForQuery = [:] + args
-            argsForQuery.options = merged
-        } else {
-            pinPreserveFailed = true
+    def opts = (args.options instanceof Map) ? args.options.findAll { k, v -> !(k in ["dashboardPin", "hsmPin"] && v?.toString() == pinMarker) } : [:]
+    def kept = ["dashboardPin", "hsmPin", "localOnly"].findAll { k -> !opts.containsKey(k) }
+    boolean selectionGate = _mcpAuthorizedIds(getChildDevices() ?: []) != null
+    def cur = (kept || selectionGate) ? _dashboardConfigFromApp(updateId) : null
+    if (cur != null) kept.each { k -> if (cur.containsKey(k)) opts.put(k, cur.get(k)) }
+    args.options = opts
+    def q = _buildDashboardConfigQuery(args, deviceCsv)
+    if (selectionGate) {
+        if (cur?.deviceIds == null) {
+            return [success: false, id: updateId,
+                    error: "Could not read the dashboard's current device list to check it against the MCP device selection, so no update was attempted.",
+                    note: "Transient hub error (details logged); retry."]
         }
+        _requireDashboardDevicesSelected(_dashboardChangedDeviceIds(cur.deviceIds, deviceCsv.split(",") as List),
+            "this dashboard write", "add or remove", true)
     }
-    def q = _buildDashboardConfigQuery(argsForQuery, deviceCsv)
     q.id = updateId
     try {
-        def raw = hubInternalGet("/dashboard/update", q)
-        def result = _dashboardWriteResult(raw, "update", updateId)
-        if (pinPreserveFailed && result instanceof Map && result.success == true) {
-            result.pinPreserveFailed = true
-            result.note = "Update applied, but the current config couldn't be read to preserve an omitted PIN -- if this dashboard had a dashboardPin/hsmPin it was cleared; re-set it with another update if needed."
+        def result = _dashboardWriteResult(hubInternalGet("/dashboard/update", q), "update", updateId)
+        if (cur == null && kept && result.success == true) {
+            def pins = kept.findAll { it != "localOnly" }
+            def lost = []
+            if (pins) {
+                result.pinPreserveFailed = true
+                lost << "any ${pins.join(' or ')} it had is cleared"
+            }
+            if (kept.contains("localOnly")) {
+                result.localOnlyPreserveFailed = true
+                lost << "'Local access only' is off"
+            }
+            result.note = "Update applied, but the current config couldn't be read to keep the omitted settings: ${lost.join(', and ')}. Re-set them with another update if needed."
         }
         return result
-    } catch (IllegalArgumentException iae) {
-        throw iae
     } catch (Exception e) {
         mcpLogError("dashboard", "update dashboard failed", e)
         return [success: false, error: "Failed to update dashboard: ${e.message}", note: "The dashboard may be unchanged; verify with hub_get_dashboard."]
     }
 }
-private Map _updateLegacyDashboard(String id, Map probe, Map args) {
+private Map _updateLegacyDashboard(String id, Map status, Map args) {
     def granular = ["setOptions", "addTiles", "updateTiles", "removeTileIds"].findAll { args.get(it) != null }
     def hasWholesale = args.layout != null
     def hasName = args.name?.toString()?.trim()
@@ -562,77 +712,78 @@ private Map _updateLegacyDashboard(String id, Map probe, Map args) {
     if (args.options != null) {
         throw new IllegalArgumentException("options applies only to Easy Dashboards. For a legacy dashboard, grid/color/font settings are layout fields -- pass them via setOptions (e.g. setOptions: [bgColor: '#000000', cols: 6]).")
     }
+    if (hasWholesale && !(args.layout instanceof Map)) {
+        throw new IllegalArgumentException("layout must be an object -- the full layout JSON, as returned by hub_get_dashboard.")
+    }
+    def deviceCsv = hasDevices ? _dashboardDeviceCsv(args.deviceIds, false) : null
+    List newDeviceIds = hasDevices ? (deviceCsv ? (deviceCsv.split(",") as List) : []) : null
     def out = [success: true, id: id, type: "legacy"]
     def applied = []
     def warnings = []
-    if (hasName) {
-        def newName = args.name.toString().trim()
-        try {
-            _legacyDashboardFormPost(id, [label: newName, ("label.type"): "text", ("label.multiple"): "false"])
-            out.name = newName
-            applied << "name"
-        } catch (Exception e) {
-            mcpLogError("dashboard", "legacy dashboard rename failed", e)
-            return [success: false, id: id, type: "legacy", applied: applied,
-                    error: "Rename failed: ${e.message}", note: "Nothing after the rename was attempted; the layout is unchanged."]
-        }
-    }
-    if (hasDevices) {
-        def csv = _dashboardDeviceCsv(args.deviceIds, false)
-        try {
-            _legacyDashboardFormPost(id, [
-                ("settings[devicesPicked]"): csv,
-                ("devicesPicked.type"): "capability.*",
-                ("devicesPicked.multiple"): "true"
-            ])
-            probe.deviceIds = csv ? (csv.split(",") as List) : []
-            out.deviceIds = probe.deviceIds
-            applied << "deviceIds"
-        } catch (Exception e) {
-            mcpLogError("dashboard", "legacy dashboard device authorization failed", e)
-            return [success: false, id: id, type: "legacy", applied: applied,
-                    error: "Device authorization write failed: ${e.message}", note: "The layout was not touched; retry deviceIds (and any layout ops) once the hub responds."]
-        }
-    }
+    def failed = { String error, String note -> [success: false, id: id, type: "legacy", applied: applied, error: error, note: note] }
+    Map newLayout = null
     if (hasWholesale || granular) {
-        if (!probe.accessToken) {
-            return [success: false, id: id, type: "legacy", applied: applied,
-                    error: "The dashboard's access token could not be read from its app state, so its layout endpoint is unreachable.",
-                    note: "Open the dashboard app page once (or reset its token) and retry."]
+        if (!status.accessToken) {
+            return failed("The dashboard's access token could not be read from its app state, so its layout endpoint is unreachable. Nothing was changed.",
+                "Open the dashboard app page once (or reset its token) and retry.")
         }
-        Map newLayout
         if (hasWholesale) {
-            if (!(args.layout instanceof Map)) {
-                throw new IllegalArgumentException("layout must be an object -- the full layout JSON, as returned by hub_get_dashboard.")
-            }
             newLayout = new LinkedHashMap(args.layout as Map)
         } else {
             Map current = null
-            try { current = _legacyLayoutFetch(id, probe.accessToken) } catch (Exception e) {
+            try { current = _legacyLayoutFetch(id, status.accessToken) } catch (Exception e) {
                 mcpLogError("dashboard", "legacy layout read-before-edit failed", e)
             }
-            if (!(current instanceof Map)) {
-                return [success: false, id: id, type: "legacy", applied: applied,
-                        error: "Could not read the current layout to apply the edits.",
-                        note: "Retry; if it persists, check hub connectivity." +
-                            (probe.localAccess == false ? " Note: this dashboard has 'Allow LAN access' disabled, which can block its layout endpoint." : "")]
+            if (current == null) {
+                return failed("Could not read the current layout to apply the edits. Nothing was changed.", "Retry; if it persists, check hub connectivity." + _lanAccessHint(status))
             }
-            newLayout = _applyLegacyLayoutOps(current, args, probe, warnings)
+            def planStatus = hasDevices ? (status + [deviceIds: newDeviceIds]) : status
+            newLayout = _applyLegacyLayoutOps(current, args, planStatus, warnings)
         }
-        Map saved = null
+    }
+    if (hasDevices && _mcpAuthorizedIds(getChildDevices() ?: []) != null) {
+        if (status.deviceIds == null) {
+            return failed("Could not read the dashboard's current device list to check it against the MCP device selection. Nothing was changed.",
+                "Retry; if it persists, open the dashboard's app page once.")
+        }
+        _requireDashboardDevicesSelected(_dashboardChangedDeviceIds(status.deviceIds, newDeviceIds), "this dashboard write", "add or remove", true)
+    }
+    if (hasName) {
+        def newName = args.name.toString().trim()
         try {
-            saved = _legacyLayoutPost(id, probe.accessToken, newLayout)
+            _legacyDashboardSetLabel(id, newName)
         } catch (Exception e) {
+            mcpLogError("dashboard", "legacy dashboard rename failed", e)
+            return failed("Rename failed: ${e.message}", "Nothing after the rename was attempted; the layout is unchanged.")
+        }
+        out.name = newName
+        applied << "name"
+    }
+    if (hasDevices) {
+        try {
+            _legacyDashboardSetDevices(id, deviceCsv)
+        } catch (Exception e) {
+            mcpLogError("dashboard", "legacy dashboard device authorization failed", e)
+            return failed("Device authorization write failed: ${e.message}", "The layout was not touched; retry deviceIds (and any layout ops) once the hub responds.")
+        }
+        status.deviceIds = newDeviceIds
+        out.deviceIds = newDeviceIds
+        applied << "deviceIds"
+    }
+    if (newLayout != null) {
+        String wholeLayout = hasWholesale ? " A wholesale layout must be the whole object hub_get_dashboard returns as layout (every top-level field, not only cols, rows and tiles)." : ""
+        Map post
+        try { post = _legacyLayoutPost(id, status.accessToken, newLayout) } catch (Exception e) {
             mcpLogError("dashboard", "legacy layout save failed", e)
-            return [success: false, id: id, type: "legacy", applied: applied,
-                    error: "Layout save failed: ${e.message}", note: "The layout may be unchanged; verify with hub_get_dashboard."]
+            return failed("Layout save failed: ${e.message}", "The layout may be unchanged; verify with hub_get_dashboard." + wholeLayout + _lanAccessHint(status))
         }
-        if (!(saved instanceof Map) || !(saved.tiles instanceof List)) {
-            return [success: false, id: id, type: "legacy", applied: applied,
-                    error: "The layout endpoint did not echo a saved layout; outcome unconfirmed.",
-                    note: "Verify with hub_get_dashboard."]
+        if (!post.sent) {
+            return failed("Could not mint a dashboard requestToken (the dashboard page render failed), so the layout was not saved.",
+                "Retry; if it persists, check hub connectivity." + _lanAccessHint(status))
         }
-        applied << (hasWholesale ? "layout" : granular.join(", "))
+        Map saved = post.saved
+        if (saved == null) return failed("The layout endpoint did not echo a saved layout; outcome unconfirmed.", "Verify with hub_get_dashboard." + wholeLayout + _lanAccessHint(status))
+        applied.addAll(hasWholesale ? ["layout"] : ["removeTileIds", "updateTiles", "addTiles", "setOptions"].findAll { it in granular })
         out.tileCount = saved.tiles.size()
         out.layout = saved
     }
@@ -640,7 +791,7 @@ private Map _updateLegacyDashboard(String id, Map probe, Map args) {
     if (warnings) out.warnings = warnings
     return out
 }
-private Map _applyLegacyLayoutOps(Map current, Map args, Map probe, List warnings) {
+private Map _applyLegacyLayoutOps(Map current, Map args, Map status, List warnings) {
     def layout = new LinkedHashMap(current)
     def tiles = (layout.tiles instanceof List) ? layout.tiles.findAll { it instanceof Map }.collect { new LinkedHashMap(it as Map) } : []
     if (args.removeTileIds != null) {
@@ -656,6 +807,7 @@ private Map _applyLegacyLayoutOps(Map current, Map args, Map probe, List warning
             throw new IllegalArgumentException("updateTiles must be an array of {id, ...fields-to-change} objects.")
         }
         args.updateTiles.each { spec ->
+            if (spec instanceof Map) _requireKnownTileKeys(spec, "updateTiles")
             if (!(spec instanceof Map) || spec.id == null) {
                 throw new IllegalArgumentException("Each updateTiles entry needs an id plus the fields to change (e.g. [id: 3, col: 2, colSpan: 2]).")
             }
@@ -665,7 +817,7 @@ private Map _applyLegacyLayoutOps(Map current, Map args, Map probe, List warning
                 throw new IllegalArgumentException("updateTiles: no tile with id ${tid}. Existing tile ids: ${tiles.collect { it.id }}.")
             }
             spec.each { k, v -> if (k?.toString() != "id") tile.put(k, v) }
-            _warnUnauthorizedTileDevice(tile, probe, warnings)
+            _warnUnauthorizedTileDevice(tile, status, warnings)
         }
     }
     if (args.addTiles != null) {
@@ -676,12 +828,13 @@ private Map _applyLegacyLayoutOps(Map current, Map args, Map probe, List warning
         int nextId = (existingIds.isEmpty() ? -1 : existingIds.max()) + 1
         args.addTiles.each { spec ->
             if (!(spec instanceof Map)) throw new IllegalArgumentException("Each addTiles entry must be a tile object.")
+            _requireKnownTileKeys(spec, "addTiles")
             def missing = ["template", "col", "row"].findAll { spec.get(it) == null }
             if (missing) {
                 throw new IllegalArgumentException("addTiles: each tile needs template, col, and row (missing ${missing.join(', ')} in ${spec}).")
             }
             def dup = tiles.find { t ->
-                ["template", "device", "col", "row", "templateExtra"].every { k -> t.get(k)?.toString() == spec.get(k)?.toString() } &&
+                (_legacyTileKeys() - ["id", "colSpan", "rowSpan"]).every { k -> t.get(k)?.toString() == spec.get(k)?.toString() } &&
                     (t.colSpan ?: 1).toString() == (spec.colSpan ?: 1).toString() &&
                     (t.rowSpan ?: 1).toString() == (spec.rowSpan ?: 1).toString()
             }
@@ -693,7 +846,7 @@ private Map _applyLegacyLayoutOps(Map current, Map args, Map probe, List warning
             tile.id = nextId++
             if (tile.colSpan == null) tile.colSpan = 1
             if (tile.rowSpan == null) tile.rowSpan = 1
-            _warnUnauthorizedTileDevice(tile, probe, warnings)
+            _warnUnauthorizedTileDevice(tile, status, warnings)
             tiles << tile
         }
     }
@@ -711,6 +864,17 @@ private Map _applyLegacyLayoutOps(Map current, Map args, Map probe, List warning
     layout.tiles = tiles
     return layout
 }
+private List _legacyTileKeys() {
+    return ["id", "template", "device", "col", "row", "colSpan", "rowSpan", "templateExtra",
+            "globalVar", "linkName", "bgImage", "hideUnit", "refreshInterval"]
+}
+private void _requireKnownTileKeys(Map spec, String op) {
+    def allowed = _legacyTileKeys()
+    def unknown = spec.keySet().collect { it?.toString() }.findAll { !(it in allowed) }
+    if (unknown) {
+        throw new IllegalArgumentException("${op}: unknown tile key${unknown.size() == 1 ? '' : 's'} ${unknown.join(', ')}. Allowed keys: ${allowed.join(', ')}.")
+    }
+}
 private Integer _tileIdOf(tile) {
     def raw = (tile instanceof Map) ? tile.id : tile
     if (raw == null) return null
@@ -723,144 +887,93 @@ private Integer _requireTileId(raw, String op) {
     }
     return id
 }
-private void _warnUnauthorizedTileDevice(Map tile, Map probe, List warnings) {
+private void _warnUnauthorizedTileDevice(Map tile, Map status, List warnings) {
     def dev = tile.device?.toString()
-    if (dev && dev ==~ /\d+/ && probe.deviceIds != null && !probe.deviceIds.contains(dev)) {
+    if (dev && dev ==~ /\d+/ && status.deviceIds != null && !status.deviceIds.contains(dev)) {
         warnings << "Tile ${tile.id}: device ${dev} is not in this dashboard's authorized devices, so the tile will show no data. Authorize it via hub_update_dashboard(deviceIds=[...full list...])."
     }
 }
 def toolDeleteDashboard(args) {
-    args = args ?: [:]
+    return _dashboardFailureNote(_deleteDashboard(args ?: [:]))
+}
+private Map _deleteDashboard(Map args) {
     requireDestructiveConfirm(args.confirm)
-    def dashId = _requireDashboardId(args.dashboardId, " to delete")
-    if (!_requireUnprotectedAppDeletion(dashId.toInteger(), true)) {
-        return [success: true, id: dashId, alreadyAbsent: true,
-                message: "Dashboard ${dashId} is already absent; no delete was needed."]
-    }
-    def legacyProbe = _legacyDashboardProbe(dashId)
-    if (legacyProbe == null) {
+    def dashId = _requireDashboardId(args.dashboardId, "dashboardId", " to delete")
+    def absent = [success: true, id: dashId, alreadyAbsent: true, message: "Dashboard ${dashId} is already absent; no delete was needed."]
+    if (!_requireUnprotectedAppDeletion(dashId.toInteger(), true)) return absent
+    def status = _dashboardStatus(dashId)
+    if (status == null) {
         return [success: false, id: dashId,
                 error: "Could not determine the dashboard's type (the status read failed), so no delete was attempted.",
                 note: "Transient hub error (details logged); retry."]
     }
-    if (legacyProbe.legacy == true) {
-        try {
-            _rmForceDeleteApp(dashId as Integer)
-        } catch (Exception e) {
+    if (!status.present) return absent
+    def notDashboard = _notADashboard(dashId, status, "delete")
+    if (notDashboard != null) return notDashboard
+    def out = [id: dashId]
+    String hubError = null
+    if (status.legacy) {
+        out.type = "legacy"
+        try { _rmForceDeleteApp(dashId as Integer) } catch (Exception e) {
             mcpLog("debug", "dashboard", "legacy dashboard forcedelete answered '${e.message}' -- verifying by effect")
         }
-        def present = _dashboardPresent(dashId)
-        if (present == false) {
-            return [success: true, id: dashId, type: "legacy", message: "Legacy dashboard ${dashId} deleted."]
-        }
-        if (present == null) {
-            return [success: false, id: dashId, type: "legacy",
-                    error: "Delete request was sent, but removal could not be confirmed (the verification read failed).",
-                    note: "Verify with hub_list_dashboards before retrying."]
-        }
-        return [success: false, id: dashId, type: "legacy",
-                error: "the legacy dashboard is still present after the force-delete call",
-                note: "Nothing was deleted. hub_delete_native_app(appId=${dashId}, force=true) snapshots first and uses the same delete path."]
-    }
-    try {
-        def raw = hubInternalGet("/dashboard/delete", [id: dashId])
-        def parsed = raw ? new groovy.json.JsonSlurper().parseText(raw) : null
-        def present = _dashboardPresent(dashId)
-        if ((parsed instanceof Map && parsed.success == true) || present == false) {
-            return [success: true, id: dashId, message: "Dashboard ${dashId} deleted."]
-        }
-        if (present == null) {
-            return [success: false, id: dashId,
-                    error: "Delete request was sent, but removal could not be confirmed (the verification read failed).",
-                    note: "Verify with hub_list_dashboards before retrying."]
-        }
-        return [success: false, id: dashId,
-                error: (parsed instanceof Map) ? (parsed.message ?: parsed.error ?: "the dashboard is still present after the delete call") : "the dashboard is still present after the delete call",
-                note: "Nothing was deleted. Verify the id with hub_list_dashboards."]
-    } catch (Exception e) {
-        mcpLogError("dashboard", "delete dashboard failed", e)
-        return [success: false, id: dashId, error: e.message, note: "Nothing was deleted."]
-    }
-}
-def toolCloneDashboard(args) {
-    args = args ?: [:]
-    def sourceId = _requireDashboardId(args.dashboardId, " to clone")
-    def src = toolGetDashboard([dashboardId: sourceId])
-    if (!(src instanceof Map) || src.success == false) {
-        return [success: false, sourceId: sourceId,
-                error: "Could not read the source dashboard to clone it" + ((src instanceof Map && src.error) ? ": ${src.error}" : "."),
-                note: "Verify the id with hub_list_dashboards."]
-    }
-    if (src.type == "legacy") {
-        return _cloneLegacyDashboard(sourceId, src)
-    }
-    if (!(src.deviceIds)) {
-        return [success: false, sourceId: sourceId,
-                error: "Could read the source dashboard's id/name but not its device list, so it can't be cloned.",
-                note: "Retry; if it persists, read it with hub_get_dashboard and recreate via hub_create_dashboard."]
-    }
-    def opts = [:]
-    ["showModeTile", "showClockTile", "showCalendarTile", "showHSMTile", "showEdit", "showNavigation",
-     "showTutorial", "theme", "navigationSelection", "dashboardPin", "hsmPin"].each { k ->
-        if (src.containsKey(k)) opts.put(k, src.get(k))
-    }
-    def created = toolCreateDashboard([name: "${src.name ?: 'Dashboard'} (copy)", deviceIds: (src.deviceIds ?: []), options: opts])
-    if (created instanceof Map && created.success == true) {
-        return [success: true, sourceId: sourceId, newId: created.id,
-                message: "Cloned dashboard ${sourceId} by copying its config into a new dashboard${created.id ? ' (' + created.id + ')' : ''}."]
-    }
-    return [success: false, sourceId: sourceId,
-            error: (created instanceof Map) ? (created.error ?: "clone-by-copy failed") : "unexpected response",
-            note: "The copy may not have been created; verify with hub_list_dashboards."]
-}
-private Map _cloneLegacyDashboard(String sourceId, Map src) {
-    if (!(src.layout instanceof Map)) {
-        return [success: false, sourceId: sourceId,
-                error: "Could read the legacy dashboard but not its layout, so it can't be cloned.",
-                note: "Retry; if it persists, inspect it with hub_get_dashboard."]
-    }
-    def created = _createLegacyDashboard([name: "${src.name ?: 'Dashboard'} (copy)", deviceIds: (src.deviceIds ?: [])])
-    if (!(created instanceof Map) || created.success != true) {
-        return [success: false, sourceId: sourceId,
-                error: (created instanceof Map ? created.error : null) ?: "legacy clone: creating the copy failed",
-                note: "The copy may not have been created; verify with hub_list_dashboards."]
-    }
-    def newId = created.id?.toString()
-    def probe = _legacyDashboardProbe(newId)
-    String saveError = null
-    if (probe?.legacy == true && probe.accessToken) {
-        try {
-            def saved = _legacyLayoutPost(newId, probe.accessToken, new LinkedHashMap(src.layout as Map))
-            if (!(saved instanceof Map) || !(saved.tiles instanceof List)) {
-                saveError = "the layout endpoint did not echo a saved layout (outcome unconfirmed)"
-            }
-        } catch (Exception e) { saveError = e.message }
     } else {
-        saveError = "the new dashboard's access token was unreadable"
+        def parsed = null
+        try {
+            def raw = hubInternalGet("/dashboard/delete", [id: dashId])
+            parsed = raw ? new groovy.json.JsonSlurper().parseText(raw) : null
+        } catch (Exception e) {
+            mcpLogError("dashboard", "delete dashboard request failed; verifying by effect", e)
+            hubError = "the delete request failed (${e.message})"
+        }
+        if (parsed instanceof Map && parsed.success == true) return out + [success: true, message: "Dashboard ${dashId} deleted."]
+        if (parsed instanceof Map) hubError = parsed.message ?: parsed.error
     }
-    if (saveError) {
-        return [success: false, sourceId: sourceId, newId: newId, type: "legacy",
-                error: "Copy ${newId} was created but its layout could not be written: ${saveError}",
-                note: "Re-apply with hub_update_dashboard(dashboardId=${newId}, layout=<the source's layout from hub_get_dashboard>)."]
+    def present = _dashboardStatus(dashId)?.present
+    if (present == false) {
+        return out + [success: true, message: "${status.legacy ? 'Legacy dashboard' : 'Dashboard'} ${dashId} deleted."]
     }
-    def out = [success: true, sourceId: sourceId, newId: newId, type: "legacy",
-               message: "Cloned legacy dashboard ${sourceId} by copying its layout into a new dashboard (${newId})."]
-    if (created.warnings) out.warnings = created.warnings
-    return out
+    if (present == null) {
+        return out + [success: false, outcomeUnknown: true,
+                      error: "Delete request was sent, but removal could not be confirmed (the verification read failed)" + (hubError ? "; ${hubError}." : "."),
+                      note: "The dashboard may or may not have been deleted. Verify with hub_list_dashboards before retrying."]
+    }
+    return out + [success: false, error: hubError ?: "the dashboard is still present after the delete call",
+                  note: status.legacy
+                      ? "Nothing was deleted. hub_delete_native_app(appId=${dashId}, force=true) snapshots first and uses the same delete path."
+                      : "Nothing was deleted. Verify the id with hub_list_dashboards."]
 }
-private Map _summarizeDashboard(raw) {
-    if (!(raw instanceof Map)) return [raw: raw]
+private void _requireDashboardDevicesSelected(Collection ids, String write, String verb, boolean withKeptIdHint = false) {
+    if (!ids) return
+    Set authorized = _mcpAuthorizedIds(getChildDevices() ?: [])
+    if (authorized == null) return
+    List outside = ids.collect { it.toString() }.unique().findAll { !authorized.contains(it) }
+    if (outside) {
+        boolean one = outside.size() == 1
+        throw new IllegalArgumentException("deviceIds ${outside.join(', ')} ${one ? 'is' : 'are'} outside the MCP device selection, so ${write} cannot ${verb} ${one ? 'it' : 'them'}. Select ${one ? 'it' : 'them'} in the MCP app's device list, or turn on Bypass Device Allowlist." +
+            (withKeptIdHint ? " An id hub_get_dashboard returns stays in the list you send." : ""))
+    }
+}
+private List _dashboardChangedDeviceIds(Collection current, Collection next) {
+    List cur = current.collect { it.toString() }
+    List nxt = next.collect { it.toString() }
+    return (nxt.findAll { !cur.contains(it) } + cur.findAll { !nxt.contains(it) }).unique()
+}
+private List _dashboardTileKeys() {
+    return ["showModeTile", "showClockTile", "showCalendarTile", "showHSMTile", "showEdit", "showNavigation", "showTutorial"]
+}
+private Map _summarizeDashboard(Map raw) {
     def out = [
         id: (raw.installedAppId ?: raw.id)?.toString(),
         name: raw.name,
         type: raw.version?.toString()?.startsWith("1") ? "legacy" : "easy"
     ]
-    ["showModeTile", "showClockTile", "showCalendarTile", "showHSMTile", "showEdit",
-     "showNavigation", "showTutorial", "theme"].each { k ->
+    if (raw.containsKey("deviceIds")) out.deviceIds = _normalizeDeviceIdList(raw.deviceIds)
+    if (out.type == "legacy") return out
+    (_dashboardTileKeys() + ["theme", "localOnly"]).each { k ->
         if (raw.containsKey(k)) out.put(k, raw.get(k))
     }
     if (raw.containsKey("navigationSelection")) out.navigationSelection = _dashboardNavSelectionCsv(raw.navigationSelection)
-    if (raw.containsKey("deviceIds")) out.deviceIds = _normalizeDeviceIdList(raw.deviceIds)
     if (_dashboardRealValue(raw.dashboardPin)) out.dashboardPin = raw.dashboardPin
     if (_dashboardRealValue(raw.hsmPin)) out.hsmPin = raw.hsmPin
     return out
@@ -913,32 +1026,29 @@ private _dashboardPublic(result) {
     return result
 }
 private Map _buildDashboardConfigQuery(Map args, String deviceCsv) {
-    def boolStr = { v -> (v == true || v?.toString()?.toLowerCase() == "true") ? "true" : "false" }
     def opts = (args.options instanceof Map) ? args.options : [:]
-    def opt = { String k -> opts.containsKey(k) ? opts.get(k) : args.get(k) }
+    def opt = { String k -> opts.get(k) }
+    def q = [name: args.name.toString(), deviceIds: deviceCsv]
+    _dashboardTileKeys().each { k ->
+        def v = opt(k)
+        if (v == null && k in ["showEdit", "showNavigation"]) v = true
+        q.put(k, (v == true || v?.toString()?.toLowerCase() == "true") ? "true" : "false")
+    }
     ["dashboardPin", "hsmPin"].each { k ->
-        if (opt(k)?.toString() == _appConfigRedactedMarker()) {
+        def v = opt(k)
+        if (v?.toString() == _appConfigRedactedMarker()) {
             throw new IllegalArgumentException("${k} is the redaction marker, not a PIN. Pass the real PIN, or omit it on hub_update_dashboard to keep the stored one.")
         }
+        q.put(k, v != null ? v.toString() : "")
     }
-    return [
-        name: args.name.toString(),
-        deviceIds: deviceCsv,
-        showModeTile: boolStr(opt("showModeTile")),
-        showClockTile: boolStr(opt("showClockTile")),
-        showCalendarTile: boolStr(opt("showCalendarTile")),
-        showHSMTile: boolStr(opt("showHSMTile")),
-        showEdit: boolStr(opt("showEdit")),
-        showNavigation: boolStr(opt("showNavigation")),
-        showTutorial: boolStr(opt("showTutorial")),
-        navigationSelection: _dashboardNavSelectionCsv(opt("navigationSelection")),
-        dashboardPin: (opt("dashboardPin") != null) ? opt("dashboardPin").toString() : "",
-        hsmPin: (opt("hsmPin") != null) ? opt("hsmPin").toString() : "",
-        theme: _dashboardTheme(opt("theme"))
-    ]
+    def localOnly = opt("localOnly")
+    if (localOnly != null) q.localOnly = (localOnly == true || localOnly.toString().toLowerCase() == "true") ? "true" : "false"
+    q.navigationSelection = _dashboardNavSelectionCsv(opt("navigationSelection"))
+    q.theme = _dashboardTheme(opt("theme"))
+    return q
 }
 private String _dashboardNavSelectionCsv(navigationSelection) {
-    if (navigationSelection == null || !_dashboardRealValue(navigationSelection)) return ""
+    if (!_dashboardRealValue(navigationSelection)) return ""
     def items
     if (navigationSelection instanceof Collection) {
         items = navigationSelection
@@ -981,118 +1091,95 @@ private Map _dashboardWriteResult(raw, String op, String reqId) {
     if (parsed instanceof List) {
         return [success: false,
                 error: "Dashboard ${op} returned the dashboard list instead of a status object; outcome unconfirmed.",
-                note: "The ${op} may or may not have applied; verify with hub_list_dashboards.",
-                dashboards: parsed.findAll { it != null }.collect { _summarizeDashboard(it) }]
+                note: "The ${op} may or may not have applied; verify with hub_list_dashboards."]
     }
     return [success: false, error: "Unexpected (non-JSON) response from /dashboard/${op}.",
             note: "The ${op} may or may not have applied; verify with hub_list_dashboards."]
 }
 def _getAllToolDefinitions_partDashboards() {
-    def dashFields = [
-        id: [type: "string"], name: [type: "string"], type: [type: "string"],
-        showModeTile: [type: "boolean"], showClockTile: [type: "boolean"],
-        showCalendarTile: [type: "boolean"], showHSMTile: [type: "boolean"],
-        showEdit: [type: "boolean"], showNavigation: [type: "boolean"], showTutorial: [type: "boolean"],
-        navigationSelection: [type: "string"], theme: [type: "string"],
-        deviceIds: [type: "array"], dashboardPin: [type: "string"], hsmPin: [type: "string"]
-    ]
+    def idParam = [type: "string", description: "Dashboard id, from hub_list_dashboards."]
     return [
         [
             name: "hub_list_dashboards",
-            description: "List the hub's dashboards -- both Easy Dashboards and legacy Hubitat® Dashboards.[[FLAT_TRIM]] Read-only; each entry carries id, name, and a type ('easy' or 'legacy'). Easy entries also include tile/theme config. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
+            description: "List the hub's dashboards -- Easy Dashboards and legacy Hubitat® Dashboards -- with id, name and type ('easy' or 'legacy').[[FLAT_TRIM]] Easy entries also carry their tile/theme config. Read one in full with hub_get_dashboard. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
-                properties: [:]
+                properties: [
+                    cursor: [type: "string", description: "Opt-in pagination cursor. Omit for unbounded; pass \"\" for the first page, iterate nextCursor (page size 50)."]
+                ]
             ]
         ],
         [
             name: "hub_get_dashboard",
-            description: "Get a dashboard's full config by id. Easy Dashboard: tiles/theme/devices/PINs. Legacy Hubitat® Dashboard: its authorized deviceIds plus the nested layout (tiles, grid, colors).[[FLAT_TRIM]] Read this before a wholesale hub_update_dashboard and pass its output straight back. A read that partly fails returns partial:true with a note (values are unavailable, not defaulted). See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
+            description: "Get one dashboard in full by id: an Easy Dashboard's config (tiles, navigation, theme, devices, PINs, localOnly), or a legacy Hubitat® Dashboard's authorized deviceIds plus its tile layout.[[FLAT_TRIM]] hub_update_dashboard takes it back with name and deviceIds top level and the config fields inside options. A read that partly fails returns partial:true with a note. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
-                    dashboardId: [type: "string", description: "installedAppId."]
+                    dashboardId: idParam
                 ],
                 required: ["dashboardId"]
             ]
         ],
         [
             name: "hub_create_dashboard",
-            description: "Create a dashboard. type='easy' (default) builds an Easy Dashboard from devices + tile options; type='legacy' creates an empty legacy Hubitat® Dashboard whose deviceIds are its authorized-device list.[[FLAT_TRIM]] A legacy dashboard starts with an empty layout -- add tiles afterward with hub_update_dashboard (addTiles / setOptions) -- and rejects the Easy-only options arg. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
+            description: "Create a dashboard, or copy one with sourceId. type='easy' (default) builds an Easy Dashboard from devices + options; type='legacy' creates an empty legacy Hubitat® Dashboard. PRE-FLIGHT: 1) verify deviceIds with hub_list_devices (or sourceId with hub_list_dashboards) 2) tell the user what will be created.[[FLAT_TRIM]] A copy duplicates an Easy config, or a legacy dashboard's devices and layout; the source is never changed. A legacy dashboard starts empty -- add tiles with hub_update_dashboard. While Bypass Device Allowlist is off, every device in deviceIds (or the source's devices, for a copy) must be in the MCP device selection. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
-                    name: [type: "string", description: "Display name."],
-                    type: [type: "string", enum: ["easy", "legacy"], description: "Dashboard kind: 'easy' (default) or 'legacy' Hubitat® Dashboard."],
-                    deviceIds: [type: "array", description: "Device ids. Required (>=1, runtime-enforced) for an Easy Dashboard; for a legacy dashboard these are its authorized devices (optional).", items: [type: "string"]],
-                    version: [type: "string", description: "Easy-only: dashboard version sent on create. Default 2.0."],
-                    options: [type: "object", description: "Easy-only optional config; see hub_get_tool_guide(section='dashboards'). Rejected for type='legacy'."]
-                ],
-                required: ["name"]
+                    name: [type: "string", description: "Display name. Required unless sourceId is given (a copy defaults to '<source name> (copy)')."],
+                    type: [type: "string", enum: ["easy", "legacy"], description: "Dashboard kind (default easy)."],
+                    deviceIds: [type: "array", description: "Device ids: >=1 for Easy; a legacy dashboard's authorized devices (optional).", items: [type: "string"]],
+                    options: [type: "object", description: "Easy-only config; see hub_get_tool_guide(section='dashboards')."],
+                    sourceId: [type: "string", description: "Dashboard id to copy. Only name may accompany it."]
+                ]
             ]
         ],
         [
             name: "hub_update_dashboard",
-            description: "Update a dashboard by id; behavior depends on its kind. Easy Dashboard: wholesale config replace -- read hub_get_dashboard first and pass the FULL config back (name + deviceIds required; omitted fields revert to default). Legacy Hubitat® Dashboard: edit its name (label), deviceIds (authorized devices), and/or layout.[[FLAT_TRIM]] Legacy layout edits are EITHER `layout` (wholesale object) OR the granular ops removeTileIds / updateTiles / addTiles / setOptions (not both); ops apply in that order in one save and are retry-safe (an already-gone removal and an identical add are skipped with a warning). Passing a legacy layout arg at an Easy Dashboard, or options at a legacy one, is rejected. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
+            description: "Update a dashboard by id. Easy Dashboard: wholesale config replace -- read it with hub_get_dashboard and pass the FULL config back (name + deviceIds required; omitted fields revert to default, except omitted PINs and localOnly, which are kept (pass \"\" to clear a PIN)). Legacy Hubitat® Dashboard: edit its name, deviceIds (authorized devices) and/or layout. PRE-FLIGHT: 1) hub_get_dashboard to confirm the id and read the current config 2) tell the user what will change.[[FLAT_TRIM]] Legacy layout edits are EITHER `layout` (wholesale) OR the granular ops removeTileIds / updateTiles / addTiles / setOptions, applied in that order in one save; an already-gone removal and an identical add are skipped with a warning. Args for the other kind are rejected. While Bypass Device Allowlist is off, a device added to or dropped from deviceIds must be in the MCP device selection. Send updates one at a time; a change made on the hub's Dashboards page between the read and the save is overwritten. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
-                    dashboardId: [type: "string", description: "installedAppId."],
+                    dashboardId: idParam,
                     name: [type: "string", description: "Display name (Easy) or app label (legacy)."],
-                    deviceIds: [type: "array", description: "Full device id set. Required (>=1) for Easy; wholesale-replaces a legacy dashboard's authorized devices.", items: [type: "string"]],
-                    options: [type: "object", description: "Easy-only. Same keys as hub_create_dashboard.options."],
-                    layout: [type: "object", description: "Legacy-only. Wholesale layout replace (the hub_get_dashboard object)."],
+                    deviceIds: [type: "array", description: "Full device id set. Required (>=1) for Easy; replaces a legacy dashboard's authorized devices.", items: [type: "string"]],
+                    options: [type: "object", description: "Easy-only. Every config field (tile toggles, navigationSelection, theme, PINs, localOnly) goes here, never top level; same keys as hub_create_dashboard.options."],
+                    layout: [type: "object", description: "Legacy-only. Wholesale layout replace: the whole layout object hub_get_dashboard returns, edited (every top-level field, not only cols/rows/tiles)."],
                     setOptions: [type: "object", description: "Legacy-only. Merge top-level layout fields (cols, rows, bgColor, iconSize, fontSize, gridGap)."],
-                    addTiles: [type: "array", description: "Legacy-only. Tiles to add; each needs template, col, row (device/colSpan/rowSpan/templateExtra optional).", items: [type: "object"]],
-                    updateTiles: [type: "array", description: "Legacy-only. Tile edits; each entry is {id, ...fields-to-change}.", items: [type: "object"]],
-                    removeTileIds: [type: "array", description: "Legacy-only. Tile ids to remove; ids already gone are skipped.", items: [type: "integer"]]
+                    addTiles: [type: "array", description: "Legacy-only. Tiles to add; each needs template, col, row.", items: [type: "object"]],
+                    updateTiles: [type: "array", description: "Legacy-only. Tile edits, each {id, ...fields-to-change}.", items: [type: "object"]],
+                    removeTileIds: [type: "array", description: "Legacy-only. Tile ids to remove.", items: [type: "integer"]]
                 ],
                 required: ["dashboardId"]
             ]
         ],
         [
             name: "hub_delete_dashboard",
-            description: "⚠️ Permanently delete a dashboard by id (irreversible), Easy or legacy Hubitat®. Tell the user first.[[FLAT_TRIM]] A legacy dashboard is removed through the classic force-delete and confirmed by effect; the result carries its type. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
+            description: "⚠️ Permanently delete a dashboard by id (irreversible), Easy or legacy Hubitat®. PRE-FLIGHT: 1) verify the id with hub_list_dashboards/hub_get_dashboard 2) backup <24h 3) explicit user approval naming the dashboard 4) confirm=true.[[FLAT_TRIM]] Removal is confirmed by effect. See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
-                    dashboardId: [type: "string", description: "installedAppId to delete."],
+                    dashboardId: idParam,
                     confirm: [type: "boolean", description: "Must be true (requires a recent backup + user approval)."]
                 ],
                 required: ["dashboardId", "confirm"]
-            ]
-        ],
-        [
-            name: "hub_clone_dashboard",
-            description: "Clone a dashboard into a copy by id. Easy: copies its config. Legacy Hubitat®: creates a new legacy dashboard with the same authorized devices and copies the layout wholesale (clone-by-value; the source is never touched).[[FLAT_TRIM]] See hub_get_tool_guide(section='dashboards').[[/FLAT_TRIM]]",
-            inputSchema: [
-                type: "object",
-                properties: [
-                    dashboardId: [type: "string", description: "Source installedAppId."]
-                ],
-                required: ["dashboardId"]
             ]
         ]
     ]
 }
 def _readOnlyToolNames_partDashboards() {
-    return [
-        "hub_list_dashboards", "hub_get_dashboard"
-    ]
+    return ["hub_list_dashboards", "hub_get_dashboard"]
 }
 def _idempotentWriteToolNames_partDashboards() {
-    return [
-        "hub_update_dashboard", "hub_delete_dashboard"
-    ]
+    return ["hub_update_dashboard", "hub_delete_dashboard"]
 }
 def _toolDisplayMeta_partDashboards() {
     return [
         hub_list_dashboards: [title: "List Dashboards", summary: "List Easy and legacy Hubitat® Dashboards with ids, names, and type."],
         hub_get_dashboard: [title: "Get Dashboard", summary: "Get one dashboard's full config by id (Easy config or legacy layout)."],
-        hub_create_dashboard: [title: "Create Dashboard", summary: "Create an Easy Dashboard or an empty legacy Hubitat® Dashboard."],
+        hub_create_dashboard: [title: "Create Dashboard", summary: "Create an Easy or empty legacy Hubitat® Dashboard, or copy an existing one."],
         hub_update_dashboard: [title: "Update Dashboard", summary: "Update a dashboard: Easy wholesale, or legacy name/devices/layout edits."],
-        hub_delete_dashboard: [title: "Delete Dashboard", summary: "Permanently delete an Easy or legacy Hubitat® Dashboard by id."],
-        hub_clone_dashboard: [title: "Clone Dashboard", summary: "Clone an Easy or legacy Hubitat® Dashboard into a new one."]
+        hub_delete_dashboard: [title: "Delete Dashboard", summary: "Permanently delete an Easy or legacy Hubitat® Dashboard by id."]
     ]
 }
 @groovy.transform.Field static final Object ROOM_UPDATE_LOCK = new Object()
@@ -1128,7 +1215,6 @@ def toolGetRoom(args) {
         Map states = [:]
         for (st in rec.currentStates) states.put(st.key, _listStateValue(st.key, st.value, redact))
         if (states) devInfo.currentStates = states
-        if ("currentStates" in rec.missingFields) devInfo.metadataUnavailable = true
         devices << devInfo
     }
     return [
@@ -3639,17 +3725,26 @@ private String _filesDownloadUrl(String name) {
 private void _filesRequireRootName(String fileName, String toolName) {
     if (fileName.contains("/")) {
         String folder = fileName.substring(0, fileName.lastIndexOf('/'))
+        String rootOnly = "'${fileName}' names a file in a subfolder; ${toolName} acts on root files only."
         throw new IllegalArgumentException(toolName == "hub_write_file"
             ? "'${fileName}' names a file in a subfolder. hub_write_file writes root files only; it cannot write into a subfolder.".toString()
-            : "'${fileName}' names a file in a subfolder; ${toolName} acts on root files only. List the folder with hub_list_files(folder: '${folder}'); its files download from that listing's downloadUrlBase.".toString())
+            : _filesValidFolder(folder)
+                ? "${rootOnly} List the folder with hub_list_files(folder: '${folder}'); its files download from that listing's downloadUrlBase.".toString()
+                : rootOnly)
     }
     if (!(fileName ==~ /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/)) {
         throw new IllegalArgumentException("Invalid file name '${fileName}'. Only letters, numbers, hyphens, underscores and periods; cannot start with a period.")
     }
 }
+private boolean _filesValidFolder(String folder) {
+    return folder ==~ /[A-Za-z0-9_\/-]+/ && !folder.split("/").any { it == "" }
+}
+private boolean _filesDownloadMissing(Exception e) {
+    return e.class.simpleName == "NoSuchFileException"
+}
 private String _filesRootEntryKind(String name) {
     try {
-        def entry = _fileManagerListing().files.find { it.name == name }
+        def entry = _fileManagerRootEntries().find { it.name == name }
         return entry == null ? null : (entry.type == "dir" ? "dir" : "file")
     } catch (Exception e) {
         mcpLog("warn", "file-manager", "Could not list File Manager to check '${name}': ${e.message}")
@@ -3734,15 +3829,15 @@ def toolListFiles(args = null) {
     def cursor = args?.cursor
     def filterLower = _filesFoldCase(args?.filter?.toString()?.trim())
     def folder = args?.folder?.toString()?.trim()?.replaceAll(/^\/+|\/+$/, "")
-    if (folder && (!(folder ==~ /[A-Za-z0-9_.\/-]+/) || folder.split("/").any { it == ".." || it == "." || it == "" })) {
-        throw new IllegalArgumentException("folder must be a relative File Manager folder path such as 'webcore' (letters, digits, dot, underscore, hyphen, '/' between parts; no spaces, no '..').")
+    if (folder && !_filesValidFolder(folder)) {
+        throw new IllegalArgumentException("folder must be a relative File Manager folder path such as 'webcore' (letters, digits, underscore and hyphen, '/' between parts; no spaces or dots).")
     }
     Map listing
     try { listing = _fileManagerListing(folder ?: null) }
     catch (Exception e) {
         mcpLogError("file-manager", "File Manager listing failed${folder ? " for folder '${folder}'" : ''}", e)
         return [success: false, error: "Could not list File Manager: ${e.message}",
-                note: "Nothing was changed. Retry in a moment; if it keeps failing, check Settings > File Manager in the hub web UI."]
+                note: "Nothing was changed. Retry in a moment; if it keeps failing, check Settings > File Manager in the hub web UI. ${FILES_GUIDE_POINTER}".toString()]
     }
     List fileList = listing.files.collect { f ->
         Map entry = [name: f.name]
@@ -3776,7 +3871,7 @@ def toolReadFile(args) {
         if (bytes == null) throw new Exception("the hub returned no content")
         content = new String(bytes, "UTF-8")
     } catch (Exception e) {
-        String kind = _filesRootEntryKind(fileName)
+        String kind = _filesDownloadMissing(e) ? null : _filesRootEntryKind(fileName)
         if (kind == null) {
             mcpLog("info", "file-manager", "Read of '${fileName}' refused: no such file")
             return _filesMissing(fileName, "File '${fileName}' does not exist in File Manager.")
@@ -3823,10 +3918,11 @@ def toolWriteFile(args) {
     String content = args.content.toString()
     byte[] existingBytes = null
     String downloadError = "the hub returned no content"
+    boolean missing = false
     try { existingBytes = downloadHubFile(fileName) }
-    catch (Exception e) { downloadError = e.message }
+    catch (Exception e) { downloadError = e.message; missing = _filesDownloadMissing(e) }
     if (existingBytes == null) {
-        String kind = _filesRootEntryKind(fileName)
+        String kind = missing ? null : _filesRootEntryKind(fileName)
         if (kind == "dir") return _filesFolderResult(fileName)
         if (kind != null) {
             mcpLog("warn", "file-manager", "Write of '${fileName}' refused: its current content could not be read (${downloadError})")
@@ -3865,7 +3961,7 @@ def toolWriteFile(args) {
                 success: false,
                 fileName: fileName,
                 error: "Could not back up existing '${fileName}' before overwriting: ${e.message}".toString(),
-                note: "Nothing was written; '${fileName}' still holds its previous content. Retry once File Manager accepts writes.".toString()
+                note: "Nothing was written; '${fileName}' still holds its previous content. Retry once File Manager accepts writes. ${FILES_GUIDE_POINTER}".toString()
             ]
         }
         mcpLog("info", "file-manager", "Backed up existing '${fileName}' to '${backupFileName}' before overwriting (${existingBytes.length} bytes)")
@@ -3895,8 +3991,8 @@ def toolWriteFile(args) {
             fileName: fileName,
             error: "Failed to write file '${fileName}': ${e.message}",
             note: backupFileName
-                ? "Its previous content is kept in the backup copy '${backupFileName}'. Read '${fileName}' to see what it holds now before retrying.".toString()
-                : "Nothing was written. Retry once File Manager accepts writes."
+                ? "Its previous content is kept in the backup copy '${backupFileName}'. Read '${fileName}' to see what it holds now before retrying. ${FILES_GUIDE_POINTER}".toString()
+                : "Nothing was written. Retry once File Manager accepts writes. ${FILES_GUIDE_POINTER}".toString()
         ]
     }
 }
@@ -3912,10 +4008,14 @@ def toolDeleteFile(args) {
     boolean existenceUnknown = false
     if (!isBackupFile) {
         byte[] bytes = null
+        boolean missing = false
         try { bytes = downloadHubFile(fileName) }
-        catch (Exception e) { mcpLog("debug", "file-manager", "Could not download '${fileName}' before deletion: ${e.message}") }
+        catch (Exception e) {
+            missing = _filesDownloadMissing(e)
+            mcpLog("debug", "file-manager", "Could not download '${fileName}' before deletion: ${e.message}")
+        }
         if (bytes == null) {
-            String kind = _filesRootEntryKind(fileName)
+            String kind = missing ? null : _filesRootEntryKind(fileName)
             if (kind == "dir") return _filesFolderResult(fileName)
             if (kind == null) {
                 String base = _filesBackupNameParts(fileName)[0]
@@ -3980,8 +4080,8 @@ def toolDeleteFile(args) {
             fileName: fileName,
             error: "Failed to delete '${fileName}': ${e.message}",
             note: backupFileName
-                ? "Its backup copy '${backupFileName}' was taken first. Check with hub_list_files whether '${fileName}' is still listed before retrying.".toString()
-                : "Check with hub_list_files whether '${fileName}' is still listed before retrying."
+                ? "Its backup copy '${backupFileName}' was taken first. Check with hub_list_files whether '${fileName}' is still listed before retrying. ${FILES_GUIDE_POINTER}".toString()
+                : "Check with hub_list_files whether '${fileName}' is still listed before retrying. ${FILES_GUIDE_POINTER}".toString()
         ]
     }
 }
@@ -6611,7 +6711,7 @@ private Map _logsPatterns(Map args) {
     def compile = { String label, p ->
         if (p != null && !(p instanceof String)) throw new IllegalArgumentException("${label} must be a string")
         if (!p) throw new IllegalArgumentException("${label} must not be null or empty")
-        if (p.length() > 100) throw new IllegalArgumentException("${label} exceeds 100 char limit (was ${p.length()} chars)")
+        if (p.length() > 100) throw new IllegalArgumentException("${label} exceeds 100 char limit (was ${p.length()} chars); split an alternation's alternatives across patterns (patternMode 'any'); otherwise shorten it")
         try {
             return java.util.regex.Pattern.compile(p, java.util.regex.Pattern.CASE_INSENSITIVE)
         } catch (java.util.regex.PatternSyntaxException e) {
@@ -8557,8 +8657,8 @@ def _getAllToolDefinitions_partDiagnostics() {
                     level: [type: "string", enum: ["trace", "debug", "info", "warn", "error", "all"], description: "past and mcp."],
                     deviceId: [type: "string", description: "Numeric device id to scope past logs, stats or jobs to."],
                     appId: [type: "string", description: "Numeric app id, the same way."],
-                    pattern: [type: "string", description: "Case-insensitive regex over the row's name, and its message, methodName, descriptionText or value where it has one."],
-                    patterns: [type: "array", items: [type: "string"], description: "More regexes, combined by patternMode."],
+                    pattern: [type: "string", maxLength: 100, description: "Case-insensitive regex over the row's name, and its message, methodName, descriptionText or value where it has one."],
+                    patterns: [type: "array", items: [type: "string", maxLength: 100], description: "More regexes, combined by patternMode."],
                     patternMode: [type: "string", enum: ["any", "all"], description: "Default any."],
                     since: [type: ["string", "integer"], description: "past and events: rows after this time, so a returned time never repeats. '30m', '2h', '7d', a time as rows show it (no zone = hub time), ISO-8601 with a zone, or epoch ms."],
                     until: [type: ["string", "integer"], description: "Rows at or before this time."],
@@ -10214,11 +10314,6 @@ private void _flattenDevicesPage(List nodes, String parentId, List out, Set only
             for (t in (data.tags instanceof List ? data.tags : (data.tags ? data.tags.toString().tokenize(",") : []))) {
                 if (t?.toString()?.trim()) tags << t.toString().trim()
             }
-            List missing = []
-            if (!(data.disabled instanceof Boolean)) missing << "disabled"
-            if (!data.containsKey("roomName")) missing << "room"
-            if (!data.containsKey("lastActivity")) missing << "lastActivity"
-            if (!(data.currentStates instanceof List)) missing << "currentStates"
             out << [id: id, label: label, name: data.secondaryName ? data.secondaryName.toString() : label,
                 driver: data.type, deviceTypeId: data.deviceTypeId, source: data.source,
                 deviceNetworkId: data.dni, zigbeeId: data.zigbeeId,
@@ -10226,23 +10321,29 @@ private void _flattenDevicesPage(List nodes, String parentId, List out, Set only
                     data.isNetwork == true ? "network" : data.isBluetooth == true ? "bluetooth" : data.isVirtual == true ? "virtual" : null,
                 linked: data.isLinked == true, disabled: data.disabled == true, lastActivity: data.lastActivity,
                 roomId: data.roomId, roomName: data.roomName ? data.roomName.toString() : null, parentDeviceId: parentId,
-                tags: tags, notes: data.notes ? data.notes.toString() : null, currentStates: states, missingFields: missing]
+                tags: tags, notes: data.notes ? data.notes.toString() : null, currentStates: states,
+                orphan: data.isOrphan == true, user: data.user == true, defaultCurrentState: data.defaultCurrentState ?: null,
+                meshEnabled: data.hubMesh == true, homekit: data.homekit == true, showOnHome: data.showOnHome == true,
+                dashboardTypes: data.dashboardTypes instanceof List ? data.dashboardTypes : [], defaultIcon: data.defaultIcon ?: null,
+                remoteDeviceUrl: data.remoteDeviceUrl ?: null]
         }
         if (node.children instanceof List) _flattenDevicesPage(node.children, id, out, onlyIds)
     }
 }
-private Map _capabilityFeedFor(List population) {
-    Map caps = _readCapabilityFeed()
+private Map _capabilityFeedFor(List population, Map buttonCounts = null) {
+    Map caps = _readCapabilityFeed(buttonCounts)
     return caps != null && caps.isEmpty() && population ? null : caps
 }
-private Map _readCapabilityFeed() {
+private Map _readCapabilityFeed(Map buttonCounts = null) {
     try {
         def txt = hubInternalGet("/hub2/vrb/devices")
         def parsed = txt ? new groovy.json.JsonSlurper().parseText(txt) : null
         if (!(parsed instanceof List)) return null
         Map caps = [:]
         for (entry in parsed) {
-            if (entry instanceof Map && entry.id != null) caps.put(entry.id.toString(), _capabilityNames(entry.capabilities))
+            if (!(entry instanceof Map) || entry.id == null) continue
+            caps.put(entry.id.toString(), _capabilityNames(entry.capabilities))
+            if (buttonCounts != null && entry.buttonCount instanceof Number) buttonCounts.put(entry.id.toString(), ((Number) entry.buttonCount).intValue())
         }
         return caps
     } catch (Exception e) {
@@ -10262,7 +10363,9 @@ private Set _mcpAuthorizedIds(List children) {
 }
 private List _listDeviceFieldNames() {
     ["id", "label", "name", "driver", "room", "roomId", "disabled", "deviceNetworkId", "lastActivity", "protocol",
-     "parentDeviceId", "mcpManaged", "linked", "tags", "notes", "source", "currentStates", "capabilities", "attributes", "commands"]
+     "parentDeviceId", "mcpManaged", "linked", "tags", "notes", "source", "currentStates", "capabilities", "attributes", "commands",
+     "orphan", "user", "defaultCurrentState", "meshEnabled", "homekit", "showOnHome", "dashboardTypes", "defaultIcon",
+     "remoteDeviceUrl", "buttonCount"]
 }
 private Map _listDevicesOptions(Map args) {
     if (args.scope != null && !(args.scope in ["authorized", "all", "owned"])) {
@@ -10292,7 +10395,7 @@ private Map _listDevicesOptions(Map args) {
         args.stateFilter.each { k, v -> stateFilter.put(k.toString(), v.toString()) }
         List hidden = _redactsCredentials() ? stateFilter.keySet().findAll { _deviceConfigurationSecretKey(it) } as List : []
         if (hidden) {
-            throw new IllegalArgumentException("stateFilter cannot match ${hidden.join(', ')}: credential-named attributes are hidden while 'Hide passwords and credentials' is on")
+            throw new IllegalArgumentException("stateFilter cannot match ${hidden.join(', ')}: credential-named attributes are hidden while 'Hide passwords and credentials' is on.")
         }
     }
     for (argName in ["attributeNames", "fields"]) {
@@ -10306,20 +10409,38 @@ private Map _listDevicesOptions(Map args) {
         throw new IllegalArgumentException("limit must be a non-negative integer")
     }
     if (args.cursor != null) _parseListCursor(args.cursor, Integer.MAX_VALUE, "hub_list_devices")
+    List deviceIds = null
+    if (args.deviceIds != null) {
+        if (!(args.deviceIds instanceof List) || args.deviceIds.isEmpty()) throw new IllegalArgumentException("deviceIds must be a non-empty array of device ids")
+        deviceIds = []
+        args.deviceIds.eachWithIndex { v, i ->
+            def id = _canonicalDeviceIdArg(v)
+            if (id == null) throw new IllegalArgumentException("deviceIds[${i}] must be a non-empty string or integral number (got: ${_describeValueForError(v)})")
+            deviceIds << id
+        }
+        List dupes = deviceIds.countBy { it }.findAll { k, c -> c > 1 }.keySet().sort()
+        if (dupes) throw new IllegalArgumentException("deviceIds contains duplicate entries: ${dupes} -- each device may appear once")
+    }
+    if (args.waitFor != null) {
+        if (deviceIds == null || deviceIds.size() > 20) throw new IllegalArgumentException("waitFor requires deviceIds with 1 to 20 devices")
+        if (args.cursor) throw new IllegalArgumentException("waitFor cannot be combined with cursor")
+        if (args.scope == "all") throw new IllegalArgumentException("waitFor reads states, which scope='all' does not list; use scope 'authorized' or 'owned'")
+    }
     String scope = args.scope ?: "authorized"
     String format = args.format ?: "summary"
     List fields = args.get("fields") ?: null
     if (scope == "all") {
-        List identity = ["id", "label", "name", "driver", "room", "roomId", "protocol", "disabled", "parentDeviceId", "source", "linked", "capabilities"]
+        List identity = ["id", "label", "name", "driver", "room", "roomId", "protocol", "disabled", "parentDeviceId", "source", "linked", "capabilities",
+                         "orphan", "user", "remoteDeviceUrl"]
         if (!(format in ["summary", "ids"])) throw new IllegalArgumentException("scope='all' supports format 'summary' or 'ids' only")
-        if (stateFilter || args.staleHours != null || since != null || args.attributeNames != null || fields?.any { !(it in identity) }) {
+        if (stateFilter || args.staleHours != null || since != null || args.attributeNames || fields?.any { !(it in identity) }) {
             throw new IllegalArgumentException("scope='all' lists identity only (fields: ${identity.join(', ')}); states need scope='authorized'")
         }
     }
-    if (args.attributeNames != null && !(format in ["summary", "context"])) {
+    if (args.attributeNames && !(format in ["summary", "context"])) {
         throw new IllegalArgumentException("attributeNames applies to format 'summary' or 'context' only")
     }
-    if (args.get("fields") != null && !(format in ["summary", "detailed"])) {
+    if (fields && !(format in ["summary", "detailed"])) {
         throw new IllegalArgumentException("fields applies to format 'summary' or 'detailed' only")
     }
     Set fieldSet
@@ -10335,20 +10456,22 @@ private Map _listDevicesOptions(Map args) {
         roomFilter: args.roomFilter ?: null, disabled: args.disabled, staleHours: args.staleHours,
         stateFilter: stateFilter ?: null, sinceDate: sinceDate,
         attributeNames: args.attributeNames ?: null, limit: args.limit != null ? (Math.min(args.limit as long, (long) Integer.MAX_VALUE) as int) : 0,
-        cursor: args.cursor?.toString(), redact: _redactsCredentials()]
+        cursor: args.cursor?.toString(), redact: _redactsCredentials(), deviceIds: deviceIds,
+        waitFor: args.waitFor != null ? _waitForSpec(args.waitFor, true, 60000, 200) : null]
     if (sinceDate != null) {
         opts.changedSince = (since instanceof Number || since.toString().trim().isLong()) ?
             sinceDate.format("yyyy-MM-dd'T'HH:mm:ss.SSSZ") : since.toString().trim()
     }
     opts.filtered = [opts.labelFilter, opts.capabilityFilter, opts.roomFilter, opts.disabled, opts.staleHours,
-                     opts.stateFilter, sinceDate].any { it != null }
+                     opts.stateFilter, sinceDate, deviceIds].any { it != null }
     opts.wantFull = fieldSet.contains("attributes") || fieldSet.contains("commands")
-    opts.wantCaps = opts.capabilityFilter != null || format == "context" || fieldSet.contains("capabilities")
+    opts.wantCaps = opts.capabilityFilter != null || format == "context" || fieldSet.contains("capabilities") || fieldSet.contains("buttonCount")
     return opts
 }
 def toolListDevices(Map args) {
     Map opts = _listDevicesOptions(args ?: [:])
     Long reqT0 = args?.__reqT0 instanceof Number ? args.__reqT0 as Long : null
+    _refuseUnsettledWait(opts.waitFor, reqT0)
     String scope = opts.scope
     String format = opts.format
     List children = getChildDevices() ?: []
@@ -10357,11 +10480,14 @@ def toolListDevices(Map args) {
     Set scopeIds = scope == "owned" ? childIds : (scope == "authorized" ? authorized : null)
     boolean paged = opts.cursor != null || opts.limit > 0 || format == "context"
     int pageSize = opts.limit > 0 ? opts.limit : 50
+    List deviceIds = opts.deviceIds
     if (scopeIds != null && scopeIds.isEmpty()) {
+        if (opts.waitFor) throw new IllegalArgumentException("deviceIds not in scope '${scope}': ${deviceIds}. Nothing was waited for.")
         Map empty = _emptyDeviceList(format, scope == "owned" ?
             "No MCP-managed virtual devices found. Use hub_manage_virtual_device(action=\"create\") to create one." :
             "No devices selected for MCP access and no MCP-managed virtual devices")
         if (paged) empty.putAll([offset: 0, limit: pageSize, hasMore: false])
+        if (deviceIds) empty.deviceIdsNotFound = deviceIds
         return empty
     }
     List population
@@ -10372,7 +10498,20 @@ def toolListDevices(Map args) {
                 note: "Retry; if it persists check the hub's Devices page."]
     }
     if (scopeIds != null) population = population.findAll { scopeIds.contains(it.id) }
-    Map caps = opts.wantCaps ? _capabilityFeedFor(population) : null
+    Set idSet = deviceIds as Set
+    List notFound = deviceIds ? deviceIds - population.collect { it.id } : []
+    if (notFound && opts.waitFor) {
+        throw new IllegalArgumentException("deviceIds not in scope '${scope}': ${notFound}. Nothing was waited for; check the ids with hub_list_devices.")
+    }
+    Map wait = null
+    if (opts.waitFor) {
+        Map first = [:]
+        for (rec in population) if (idSet.contains(rec.id)) first.put(rec.id, rec)
+        wait = _waitForRun(opts.waitFor, deviceIds, true, first, reqT0)
+        population = population.collect { wait.last.get(it.id) ?: it }
+    }
+    Map buttons = opts.fieldSet.contains("buttonCount") ? [:] : null
+    Map caps = opts.wantCaps ? _capabilityFeedFor(population, buttons) : null
     String lf = opts.labelFilter?.toLowerCase()
     String cf = opts.capabilityFilter
     String rf = opts.roomFilter
@@ -10383,27 +10522,18 @@ def toolListDevices(Map args) {
     List matched = []
     List unanswered = []
     for (candidate in population) {
-        List missing = candidate.missingFields
+        if (idSet != null && !idSet.contains(candidate.id)) continue
         if (lf != null && !candidate.label.toLowerCase().contains(lf)) continue
         if (cf != null && caps != null) {
             if (!caps.containsKey(candidate.id)) { unanswered << candidate.id; continue }
             if (!caps.get(candidate.id).any { it.equalsIgnoreCase(cf) }) continue
         } else if (cf != null) continue
-        if (opts.disabled != null) {
-            if ("disabled" in missing) { unanswered << candidate.id; continue }
-            if (candidate.disabled != opts.disabled) continue
-        }
-        if (rf != null) {
-            if ("room" in missing) { unanswered << candidate.id; continue }
-            if (!rf.equalsIgnoreCase(candidate.roomName ?: "")) continue
-        }
-        if (stateFilter != null) {
-            if ("currentStates" in missing) { unanswered << candidate.id; continue }
-            if (stateFilter.any { k, v -> candidate.currentStates.get(k) != v }) continue
-        }
+        if (opts.disabled != null && candidate.disabled != opts.disabled) continue
+        if (rf != null && !rf.equalsIgnoreCase(candidate.roomName ?: "")) continue
+        if (stateFilter != null && stateFilter.any { k, v -> candidate.currentStates.get(k) != v }) continue
         if (staleMs != null || sinceMs != null) {
             Date la = candidate.lastActivity ? _parseSinceArg(candidate.lastActivity) : null
-            if ("lastActivity" in missing || (candidate.lastActivity != null && la == null)) { unanswered << candidate.id; continue }
+            if (candidate.lastActivity != null && la == null) { unanswered << candidate.id; continue }
             if (staleMs != null && la != null && nowMs - la.time < staleMs) continue
             if (sinceMs != null && (la == null || la.time < sinceMs)) continue
         }
@@ -10412,6 +10542,8 @@ def toolListDevices(Map args) {
     int total = matched.size()
     Map common = [:]
     if (opts.filtered) common.unfilteredTotal = population.size()
+    if (notFound) common.deviceIdsNotFound = notFound
+    if (wait) common.waitFor = _waitForBlock(opts.waitFor, wait, true)
     if (unanswered) {
         common.metadataUnavailableIds = unanswered
         common.partial = true
@@ -10425,7 +10557,7 @@ def toolListDevices(Map args) {
     if (rf != null && total == 0) common.roomFilterMatchedKnownRoom = population.any { rf.equalsIgnoreCase(it.roomName ?: "") }
     if (opts.wantCaps && caps == null) {
         common.capabilitiesUnavailable = true
-        common.note = "The hub's capability feed (/hub2/vrb/devices) could not be read or listed no device, so capabilities are omitted and capabilityFilter matches nothing. Retry."
+        common.note = "The hub's capability feed (/hub2/vrb/devices) could not be read or listed no device, so capabilities and buttonCount are omitted and capabilityFilter matches nothing. Retry."
     }
     int start = opts.cursor != null ? Math.min(_parseListCursor(opts.cursor, Integer.MAX_VALUE, "hub_list_devices"), total) : 0
     int end = paged ? (int) Math.min((long) start + pageSize, (long) total) : total
@@ -10462,7 +10594,7 @@ def toolListDevices(Map args) {
                 }
                 fj = _fetchDeviceFullJson(rec.id)
             }
-            Map row = _listDeviceRecord(rec, opts, attrNames, caps, childIds, fj)
+            Map row = _listDeviceRecord(rec, opts, attrNames, caps, buttons, childIds, fj)
             if (scope == "all") row.mcpAuthorized = authorized == null || authorized.contains(rec.id)
             devices << row
         }
@@ -10487,7 +10619,7 @@ def toolListDevices(Map args) {
     }
     return result
 }
-private Map _listDeviceRecord(Map rec, Map opts, List attrNames, Map caps, Set childIds, Map fj) {
+private Map _listDeviceRecord(Map rec, Map opts, List attrNames, Map caps, Map buttons, Set childIds, Map fj) {
     Set f = opts.fieldSet
     Map row = [id: rec.id]
     if (f.contains("label")) row.label = rec.label
@@ -10505,6 +10637,9 @@ private Map _listDeviceRecord(Map rec, Map opts, List attrNames, Map caps, Set c
     if (f.contains("tags") && rec.tags) row.tags = rec.tags
     if (f.contains("notes")) row.notes = rec.notes
     if (f.contains("source")) row.source = rec.source
+    for (key in ["orphan", "user", "defaultCurrentState", "meshEnabled", "homekit", "showOnHome", "dashboardTypes", "defaultIcon", "remoteDeviceUrl"]) {
+        if (f.contains(key)) row.put(key, rec.get(key))
+    }
     if (f.contains("currentStates")) {
         Map states = [:]
         for (an in attrNames) {
@@ -10513,11 +10648,10 @@ private Map _listDeviceRecord(Map rec, Map opts, List attrNames, Map caps, Set c
         }
         row.currentStates = states
     }
-    boolean capsMissing = f.contains("capabilities") && caps != null && !caps.containsKey(rec.id)
+    boolean capsMissing = (f.contains("capabilities") || f.contains("buttonCount")) && caps != null && !caps.containsKey(rec.id)
     if (f.contains("capabilities") && caps != null && !capsMissing) row.capabilities = caps.get(rec.id)
-    Map shownBy = [disabled: f.contains("disabled"), room: f.contains("room") || f.contains("roomId"),
-                   lastActivity: f.contains("lastActivity"), currentStates: f.contains("currentStates")]
-    if (capsMissing || rec.missingFields.any { shownBy.get(it) }) row.metadataUnavailable = true
+    if (f.contains("buttonCount") && buttons?.get(rec.id) != null) row.buttonCount = buttons.get(rec.id)
+    if (capsMissing) row.metadataUnavailable = true
     if (!opts.wantFull) return row
     Map detail = null
     try {
@@ -10600,7 +10734,7 @@ private String _contextDeviceLine(Map rec, Map caps, List attrNames, boolean red
         def v = rec.currentStates.get(an)
         if (v != null) parts << "${an}=${_listStateValue(an, v, redact)}".toString()
     }
-    String room = "room" in rec.missingFields ? "room unknown" : (rec.roomName ?: "No room")
+    String room = rec.roomName ?: "No room"
     String line = "- ${rec.label} (${rec.id}, ${room})"
     List c = caps?.get(rec.id)
     if (c) line += " - ${c.join(', ')}"
@@ -10669,7 +10803,7 @@ def _buildContextJson() {
     def contextAttrs = _contextAttributeNames()
     def roomIndex = [:]
     for (d in allDevices) {
-        String r = "room" in d.missingFields ? "Room unknown" : (d.roomName ?: "No room")
+        String r = d.roomName ?: "No room"
         if (!roomIndex.containsKey(r)) roomIndex.put(r, [])
         roomIndex.get(r) << d.id
     }
@@ -10698,7 +10832,7 @@ def _buildContextJson() {
         }
         Map rec = [id: d.id, label: d.label, room: d.roomName, capabilities: caps?.get(d.id) ?: [], attributes: attrs]
         if (caps == null) rec.capabilitiesUnavailable = true
-        if (d.missingFields.any { it in ["room", "currentStates"] } || (caps != null && !caps.containsKey(d.id))) rec.metadataUnavailable = true
+        if (caps != null && !caps.containsKey(d.id)) rec.metadataUnavailable = true
         used += _escapedLen(groovy.json.JsonOutput.toJson(rec))
         if (used > budget) {
             truncated = true
@@ -11177,9 +11311,6 @@ private _readBypassAttrValueFrom(Map fullJson, attribute) {
     def entry = st.get(attribute)
     return _nativeDeviceStateValue(entry)
 }
-private _readBypassAttrValue(deviceId, attribute) {
-    return _readBypassAttrValueFrom(_fetchDeviceFullJson(deviceId), attribute)
-}
 private _devicePublicAttributeValue(name, value) {
     return value != null && _redactsCredentials() && _deviceConfigurationSecretKey(name) ? _appConfigRedactedMarker() : value
 }
@@ -11479,11 +11610,21 @@ private Map _deviceReadPage(Map result, String selection) {
     }
     return _deviceReadFragment(snapshot, token, 0)
 }
-def toolGetDevice(deviceId, mode = 'summary', sections = null, fields = null, cursor = null) {
+def toolGetDevice(deviceId, mode = 'summary', sections = null, fields = null, cursor = null, waitFor = null, reqT0 = null) {
+    def canonicalId = _canonicalDeviceIdArg(deviceId)
+    if (canonicalId == null) {
+        throw new IllegalArgumentException("deviceId must be a non-empty string or integral number (got: ${_describeValueForError(deviceId)})")
+    }
+    deviceId = canonicalId
     String selectedMode = mode == null ? 'summary' : mode.toString()
     if (!(selectedMode in ['summary', 'configuration', 'details'])) {
         throw new IllegalArgumentException("mode must be summary, configuration, or details.")
     }
+    if (waitFor != null && (selectedMode != 'summary' || cursor != null)) {
+        throw new IllegalArgumentException("waitFor applies to summary mode only, without cursor.")
+    }
+    Map waitSpec = waitFor != null ? _waitForSpec(waitFor, false, 60000, 200) : null
+    _refuseUnsettledWait(waitSpec, reqT0)
     if (sections != null && (selectedMode != 'details' || !(sections instanceof List) || sections.isEmpty() ||
         sections.any { !(it instanceof String) || !_deviceDetailSections().contains(it) })) {
         throw new IllegalArgumentException("sections is a non-empty array for mode=details; use ${_deviceDetailSections().join(', ')}.")
@@ -11503,11 +11644,15 @@ def toolGetDevice(deviceId, mode = 'summary', sections = null, fields = null, cu
                 note: 'Check the native Devices page and retry.']
     }
     if (selectedMode == 'summary') {
+        Map wait = waitSpec ? _waitForRun(waitSpec, [deviceId.toString()], false, full, reqT0) : null
+        Map result
         try {
-            return _getDeviceFromFullJson(deviceId, full)
+            result = _getDeviceFromFullJson(deviceId, wait?.last ?: full)
         } catch (IllegalStateException e) {
-            return [success: false, isError: true, error: e.message, note: 'Check the native Devices page and retry.']
+            result = [success: false, isError: true, error: e.message, note: 'Check the native Devices page and retry.']
         }
+        if (wait) result.waitFor = _waitForBlock(waitSpec, wait, false)
+        return result
     }
     def identity = [name: full?.device?.name, label: _bypassDeviceLabel(full, deviceId)]
     return _deviceReadPage(_deviceExpandedResult(deviceId, identity, full, selectedMode, sections, fields), selection)
@@ -11522,7 +11667,7 @@ def toolSendCommand(deviceId, command, parameters, waitFor = null, commands = nu
             throw new IllegalArgumentException("commands is mutually exclusive with ${conflicting.join(' and ')} -- pass EITHER a single deviceId+command OR a commands array, not both (per-entry parameters go inside each commands entry)")
         }
         if (waitFor != null) {
-            throw new IllegalArgumentException("waitFor is not supported with commands: it blocks a hub thread per device. Send the batch, then confirm the whole set in one call with hub_get_device_attribute using deviceIds + mode")
+            throw new IllegalArgumentException("waitFor is not supported with commands: it blocks a hub thread per device. Send the batch, then confirm the whole set in one call with hub_list_devices using deviceIds + waitFor")
         }
         return _sendCommandBatch(commands, reqT0)
     }
@@ -11545,9 +11690,8 @@ def toolSendCommand(deviceId, command, parameters, waitFor = null, commands = nu
     if (!supportedCommands?.contains(command)) {
         throw new IllegalArgumentException("Device ${deviceLabel} does not support command: ${command}. Available: ${supportedCommands}")
     }
-    def pollArgs = (waitFor != null) ? _buildWaitForPollArgs(deviceId, deviceLabel, waitFor) : null
-    String stableRefusal = (pollArgs != null) ? _pollStableRefusal(pollArgs, reqT0) : null
-    if (stableRefusal) throw new IllegalArgumentException("waitFor.${stableRefusal}")
+    Map waitSpec = (waitFor != null) ? _waitForSpec(waitFor, false, 30000, 250) : null
+    _refuseUnsettledWait(waitSpec, reqT0)
     if (parameters instanceof String && !parameters.trim()) parameters = null
     if (parameters && parameters.size() > 0) {
         def declaration = fullJson.commands?.find { it?.name == command }
@@ -11561,36 +11705,16 @@ def toolSendCommand(deviceId, command, parameters, waitFor = null, commands = nu
         command: command,
         parameters: parameters
     ]
-    if (pollArgs != null) {
-        def waitForBlock = [
-            attribute: pollArgs.attribute,
-            expected : (pollArgs.containsKey("expectedValues") ? pollArgs.expectedValues : pollArgs.expectedValue)
-        ]
+    if (waitSpec != null) {
         try {
-            def poll = toolPollUntilAttribute(reqT0 instanceof Number ? pollArgs + [__reqT0: reqT0] : pollArgs)
-            waitForBlock.converged  = poll.success == true
-            waitForBlock.finalValue = poll.finalValue
-            waitForBlock.elapsedMs  = poll.elapsedMs
-            if (poll.timedOut == true)      waitForBlock.timedOut = true
-            if (poll.interrupted == true)   waitForBlock.interrupted = true
-            if (poll.readError == true)     waitForBlock.readError = true
-            if (poll.neverReported == true) waitForBlock.neverReported = true
-            if (poll.nonNumericAttribute == true) waitForBlock.nonNumericAttribute = true
-            if (poll.note != null) waitForBlock.note = poll.note
-            if (poll.containsKey("transitioning")) waitForBlock.transitioning = poll.transitioning
-            if (poll.budgetLimited == true) {
-                waitForBlock.budgetLimited = true
-                waitForBlock.budgetNote = poll.budgetNote
-            }
+            result.waitFor = _waitForBlock(waitSpec, _waitForRun(waitSpec, [deviceId.toString()], false, null, reqT0), false)
         } catch (Throwable e) {
             def cls = e.class.simpleName
             mcpLog("error", "send-command", "waitFor poll failed for ${deviceLabel}: ${cls}: ${e.message ?: '(no message)'}")
-            waitForBlock.converged  = false
-            waitForBlock.finalValue = null
-            waitForBlock.error      = "waitFor poll failed: ${cls}: ${e.message ?: '(no message)'}".toString()
+            result.waitFor = [attribute: waitSpec.attribute, expected: waitSpec.expected, converged: false, finalValue: null,
+                              error: "waitFor poll failed: ${cls}: ${e.message ?: '(no message)'}".toString()]
             result.partial = true
         }
-        result.waitFor = waitForBlock
     }
     if (!includeState) return result
     def stateErr = []
@@ -11684,7 +11808,7 @@ private _sendCommandBatch(commands, reqT0 = null) {
         result.failedDeviceIds = results.findAll { it.success == false }.collect { it.deviceId }
         if (failed < results.size()) result.partial = true
         result.error = "${failed} of ${results.size()} device command(s) failed; ${sent} were sent. See results[] for the per-device cause.".toString()
-        result.note = "The entries that succeeded ALREADY actuated -- do NOT re-send the whole batch. Before re-sending a failed entry, read its error/note: an outcome the hub did not CONFIRM may still have actuated, so verify with hub_get_device_attribute first. See hub_get_tool_guide(section='device_authorization') for what makes an entry fail."
+        result.note = "The entries that succeeded ALREADY actuated -- do NOT re-send the whole batch. Before re-sending a failed entry, read its error/note: an outcome the hub did not CONFIRM may still have actuated, so verify with hub_get_device first. See hub_get_tool_guide(section='device_authorization') for what makes an entry fail."
     }
     if (remaining) {
         result.success = false
@@ -11696,107 +11820,84 @@ private _sendCommandBatch(commands, reqT0 = null) {
     }
     return result
 }
-private Map _buildWaitForPollArgs(deviceId, deviceLabel, waitFor) {
+private Map _waitForSpec(waitFor, boolean multi, int maxTimeoutMs, int defaultIntervalMs) {
     if (!(waitFor instanceof Map)) {
-        throw new IllegalArgumentException("waitFor must be an object with at least attribute and expectedValue/expectedValues")
+        throw new IllegalArgumentException("waitFor must be an object with attribute and expectedValue or expectedValues")
     }
-    def validKeys = ["attribute", "expectedValue", "expectedValues", "timeoutMs", "pollIntervalMs", "comparator", "stableForMs"] as Set
-    def unknownKeys = (waitFor.keySet() - validKeys).sort()
+    List validKeys = ["attribute", "comparator", "expectedValue", "expectedValues", "pollIntervalMs", "stableForMs", "timeoutMs"] + (multi ? ["mode"] : [])
+    List unknownKeys = (waitFor.keySet().collect { it.toString() } - validKeys).sort()
     if (unknownKeys) {
-        def label = unknownKeys.size() == 1 ? 'an unknown key' : 'unknown keys'
-        throw new IllegalArgumentException("waitFor has ${label}: ${unknownKeys.join(', ')}. Valid keys: ${validKeys.sort().join(', ')}")
+        throw new IllegalArgumentException("waitFor has ${unknownKeys.size() == 1 ? 'an unknown key' : 'unknown keys'}: ${unknownKeys.join(', ')}. Valid keys: ${validKeys.join(', ')}")
     }
     if (!(waitFor.attribute instanceof String) || !waitFor.attribute.trim()) {
         throw new IllegalArgumentException("waitFor.attribute is required and must be a non-empty string")
     }
     _refuseCredentialPoll(waitFor.attribute)
-    def hasExpectedValue  = waitFor.containsKey("expectedValue")
-    def hasExpectedValues = waitFor.containsKey("expectedValues")
-    if (hasExpectedValue && hasExpectedValues) {
+    boolean hasValue = waitFor.containsKey("expectedValue")
+    boolean hasValues = waitFor.containsKey("expectedValues")
+    if (hasValue && hasValues) {
         throw new IllegalArgumentException("waitFor: provide exactly one of expectedValue or expectedValues, not both")
     }
-    if (!hasExpectedValue && !hasExpectedValues) {
+    if (!hasValue && !hasValues) {
         throw new IllegalArgumentException("waitFor: exactly one of expectedValue or expectedValues is required")
     }
-    if (hasExpectedValue) {
-        if (!(waitFor.expectedValue instanceof String) || !waitFor.expectedValue.trim()) {
-            throw new IllegalArgumentException("waitFor.expectedValue must be a non-empty string (got: ${_describeValueForError(waitFor.expectedValue)})")
-        }
+    if (hasValue && (!(waitFor.expectedValue instanceof String) || !waitFor.expectedValue.trim())) {
+        throw new IllegalArgumentException("waitFor.expectedValue must be a non-empty string (got: ${_describeValueForError(waitFor.expectedValue)})")
     }
-    if (hasExpectedValues) {
+    if (hasValues) {
         if (!(waitFor.expectedValues instanceof List) || waitFor.expectedValues.isEmpty()) {
             throw new IllegalArgumentException("waitFor.expectedValues must be a non-empty list of strings")
         }
         waitFor.expectedValues.eachWithIndex { v, i ->
-            if (!(v instanceof String)) {
-                throw new IllegalArgumentException("waitFor.expectedValues[${i}] must be a string, got: ${_describeValueForError(v)}")
-            }
+            if (!(v instanceof String)) throw new IllegalArgumentException("waitFor.expectedValues[${i}] must be a string, got: ${_describeValueForError(v)}")
         }
     }
-    if (waitFor.containsKey("timeoutMs")) {
-        if (!(waitFor.timeoutMs instanceof Number) || waitFor.timeoutMs < 100 || waitFor.timeoutMs > 30000) {
-            throw new IllegalArgumentException("waitFor.timeoutMs must be a number between 100 and 30000 (got: ${waitFor.timeoutMs})")
+    Map bounds = [timeoutMs: [100, maxTimeoutMs, 5000], pollIntervalMs: [50, 5000, defaultIntervalMs], stableForMs: [0, null, 0]]
+    Map ms = [:]
+    bounds.each { key, b ->
+        def v = waitFor.containsKey(key) ? waitFor.get(key) : b[2]
+        if (!(v instanceof Number) || v < b[0] || (b[1] != null && v > b[1])) {
+            String range = b[1] != null ? "between ${b[0]} and ${b[1]}" : ">= 0"
+            throw new IllegalArgumentException("waitFor.${key} must be a number ${range} (got: ${_describeValueForError(v)})")
         }
+        ms.put(key, v as Integer)
     }
-    if (waitFor.containsKey("pollIntervalMs")) {
-        if (!(waitFor.pollIntervalMs instanceof Number) || waitFor.pollIntervalMs < 50 || waitFor.pollIntervalMs > 5000) {
-            throw new IllegalArgumentException("waitFor.pollIntervalMs must be a number between 50 and 5000 (got: ${waitFor.pollIntervalMs})")
-        }
-    }
-    def effectiveTimeoutMs = waitFor.containsKey("timeoutMs") ? (waitFor.timeoutMs as Integer) : 5000
-    def validComparators = ["eq", "ne", "gt", "gte", "lt", "lte", "between"]
-    if (waitFor.containsKey("comparator") && waitFor.comparator == null) {
-        throw new IllegalArgumentException("waitFor.comparator must not be null (omit the arg to use the default \"eq\")")
+    if (ms.stableForMs >= ms.timeoutMs) {
+        throw new IllegalArgumentException("waitFor.stableForMs (${ms.stableForMs}) must be less than timeoutMs (${ms.timeoutMs}) -- the condition could never hold long enough to converge")
     }
     def comparator = waitFor.containsKey("comparator") ? waitFor.comparator : "eq"
-    if (!(comparator instanceof String) || !validComparators.contains(comparator)) {
-        throw new IllegalArgumentException("waitFor.comparator must be one of ${validComparators} (got: ${_describeValueForError(waitFor.comparator)})")
+    if (!(comparator in ["eq", "ne", "gt", "gte", "lt", "lte", "between"])) {
+        throw new IllegalArgumentException("waitFor.comparator must be one of eq, ne, gt, gte, lt, lte, between (got: ${_describeValueForError(comparator)})")
     }
-    if (["gt", "gte", "lt", "lte"].contains(comparator)) {
-        if (hasExpectedValues) {
-            throw new IllegalArgumentException("waitFor.comparator '${comparator}' takes a single numeric threshold via expectedValue, not expectedValues")
-        }
-        if (_parseBigDecimalOrNull(waitFor.expectedValue) == null) {
+    Map spec = [attribute: waitFor.attribute, comparator: comparator, expected: hasValues ? waitFor.expectedValues : waitFor.expectedValue,
+                matchSet: (hasValues ? waitFor.expectedValues : [waitFor.expectedValue]) as Set,
+                timeoutMs: ms.timeoutMs, pollIntervalMs: Math.min(ms.pollIntervalMs, ms.timeoutMs), stableForMs: ms.stableForMs]
+    if (comparator in ["gt", "gte", "lt", "lte"]) {
+        if (hasValues) throw new IllegalArgumentException("waitFor.comparator '${comparator}' takes a single numeric threshold via expectedValue, not expectedValues")
+        spec.numericThreshold = _parseBigDecimalOrNull(waitFor.expectedValue)
+        if (spec.numericThreshold == null) {
             throw new IllegalArgumentException("waitFor.comparator '${comparator}' requires expectedValue to be a numeric-parseable string (got: ${_describeValueForError(waitFor.expectedValue)})")
         }
     } else if (comparator == "between") {
-        if (hasExpectedValue) {
-            throw new IllegalArgumentException("waitFor.comparator 'between' takes two numeric bounds via expectedValues, not expectedValue")
-        }
+        if (hasValue) throw new IllegalArgumentException("waitFor.comparator 'between' takes two numeric bounds via expectedValues, not expectedValue")
         if (waitFor.expectedValues.size() != 2) {
             throw new IllegalArgumentException("waitFor.comparator 'between' requires expectedValues to have exactly 2 numeric bounds [low, high] (got ${waitFor.expectedValues.size()})")
         }
-        def lo = _parseBigDecimalOrNull(waitFor.expectedValues[0])
-        def hi = _parseBigDecimalOrNull(waitFor.expectedValues[1])
-        if (lo == null || hi == null) {
+        spec.betweenLow = _parseBigDecimalOrNull(waitFor.expectedValues[0])
+        spec.betweenHigh = _parseBigDecimalOrNull(waitFor.expectedValues[1])
+        if (spec.betweenLow == null || spec.betweenHigh == null) {
             throw new IllegalArgumentException("waitFor.comparator 'between' requires both expectedValues bounds to be numeric-parseable strings (got: ${waitFor.expectedValues})")
         }
-        if (lo > hi) {
+        if (spec.betweenLow > spec.betweenHigh) {
             throw new IllegalArgumentException("waitFor.comparator 'between' requires low <= high (got low=${waitFor.expectedValues[0]}, high=${waitFor.expectedValues[1]})")
         }
     }
-    if (waitFor.containsKey("stableForMs") && waitFor.stableForMs == null) {
-        throw new IllegalArgumentException("waitFor.stableForMs must not be null (omit the arg to use default 0)")
+    if (multi) {
+        def mode = waitFor.containsKey("mode") ? waitFor.mode : "all"
+        if (!(mode in ["any", "all"])) throw new IllegalArgumentException("waitFor.mode must be any or all (got: ${_describeValueForError(mode)})")
+        spec.mode = mode
     }
-    if (waitFor.containsKey("stableForMs")) {
-        if (!(waitFor.stableForMs instanceof Number)) {
-            throw new IllegalArgumentException("waitFor.stableForMs must be an integer (got: ${_describeValueForError(waitFor.stableForMs)})")
-        }
-        if (waitFor.stableForMs < 0) {
-            throw new IllegalArgumentException("waitFor.stableForMs must be >= 0 (got: ${waitFor.stableForMs})")
-        }
-        if ((waitFor.stableForMs as Integer) >= effectiveTimeoutMs) {
-            throw new IllegalArgumentException("waitFor.stableForMs (${waitFor.stableForMs}) must be less than timeoutMs (${effectiveTimeoutMs}) -- the condition could never hold long enough to converge")
-        }
-    }
-    def pollArgs = [deviceId: deviceId.toString(), attribute: waitFor.attribute]
-    if (hasExpectedValue)  pollArgs.expectedValue  = waitFor.expectedValue
-    if (hasExpectedValues) pollArgs.expectedValues = waitFor.expectedValues
-    if (waitFor.containsKey("comparator"))  pollArgs.comparator  = waitFor.comparator
-    if (waitFor.containsKey("stableForMs")) pollArgs.stableForMs = waitFor.stableForMs
-    pollArgs.timeoutMs      = waitFor.containsKey("timeoutMs")      ? waitFor.timeoutMs      : 5000
-    pollArgs.pollIntervalMs = waitFor.containsKey("pollIntervalMs") ? waitFor.pollIntervalMs : 250
-    return pollArgs
+    return spec
 }
 private BigDecimal _parseBigDecimalOrNull(v) {
     if (v instanceof Number) return v as BigDecimal
@@ -11964,25 +12065,6 @@ def toolGetDeviceEvents(deviceId, limit) {
     def events = rows.take(limit as Integer).collect { _mapBypassEventRow(it) }
     return [device: label, events: events, count: events.size()]
 }
-def toolGetAttribute(deviceId, attribute) {
-    deviceId = _canonicalDeviceIdArg(deviceId)
-    if (deviceId == null) throw new IllegalArgumentException('deviceId must be a non-empty string or integral number')
-    if (!(attribute instanceof String) || !attribute) throw new IllegalArgumentException('attribute is required and must be a non-empty string')
-    _requireDeviceToolAccess(deviceId)
-    def full = _fetchDeviceFullJson(deviceId)
-    if (!(full?.device?.currentStates instanceof Map)) {
-        return [success: false, isError: true, deviceId: deviceId, attribute: attribute,
-                error: 'Native device current states could not be read.', note: 'Check the native Devices page and retry.']
-    }
-    def result = [device: _bypassDeviceLabel(full, deviceId), attribute: attribute,
-                  value: _devicePublicAttributeValue(attribute, _readBypassAttrValueFrom(full, attribute))]
-    if (!full.device.currentStates.containsKey(attribute)) {
-        result.neverReported = true
-        result.reportedAttributes = _fullJsonAttributeNames(full)
-        result.note = 'Reported names can help identify a typo; an omitted name may also be a driver attribute that has never reported.'
-    }
-    return result
-}
 def _evalAttrCondition(value, comparator, matchSet, numericThreshold, betweenLow, betweenHigh) {
     if (comparator == "eq" || comparator == "ne") {
         def inSet = matchSet.contains(value?.toString()) ||
@@ -12004,37 +12086,14 @@ def _evalAttrCondition(value, comparator, matchSet, numericThreshold, betweenLow
     else throw new IllegalArgumentException("Unsupported comparator: ${comparator}")
     return [matched, true]
 }
-def toolPollUntilAttribute(args) {
-    if (args instanceof Map) _refuseCredentialPoll(args.attribute)
-    if (!(args instanceof Map) || !args.containsKey("__reqT0")) return _pollUntilAttributeCore(args)
-    Map pollArgs = [:] + (args as Map)
-    def t0 = pollArgs.remove("__reqT0")
-    long budget = _isCloudRequest() ? _relayBudgetMs() : _lanBudgetMs()
-    def asked = pollArgs.containsKey("timeoutMs") ? pollArgs.timeoutMs : 5000
-    if (!(t0 instanceof Number) || budget <= 0L || !(asked instanceof Number) || asked < 100 || asked > 60000) return _pollUntilAttributeCore(pollArgs)
-    long deadline = (t0 as long) + budget
-    long left = deadline - now()
-    String why = _isCloudRequest() ? 'the cloud relay drops a request that runs much longer' : 'the LAN time budget is set'
-    String refusal = _pollStableRefusal(pollArgs, t0)
-    if (refusal) throw new IllegalArgumentException(refusal)
-    if (left < 100L) {
-        return [success: false, timedOut: true, budgetLimited: true, requestedTimeoutMs: asked, timeoutMs: 0,
-                budgetNote: "Not polled: the request had ${Math.max(0L, left)} ms left (${why}). Poll again in a new call.".toString()]
-    }
-    if (left < (asked as long)) pollArgs.timeoutMs = left as Integer
-    def result = _pollUntilAttributeCore(pollArgs, deadline)
-    if (result instanceof Map && (result.remove("budgetStopped") == true || left < (asked as long)) && result.success != true) {
-        result.requestedTimeoutMs = asked
-        result.timeoutMs = Math.min(left, asked as long)
-        result.budgetLimited = true
-        result.budgetNote = "The poll stopped after ${result.elapsedMs ?: 0} ms instead of waiting ${asked} ms: ${why}. Poll again to keep waiting.".toString()
-    }
-    return result
-}
 private void _refuseCredentialPoll(attribute) {
     if (attribute != null && _redactsCredentials() && _deviceConfigurationSecretKey(attribute)) {
-        throw new IllegalArgumentException("Cannot wait for a value of ${attribute}: credential-named attributes are hidden while 'Hide passwords and credentials' is on")
+        throw new IllegalArgumentException("Cannot wait for a value of ${attribute}: credential-named attributes are hidden while 'Hide passwords and credentials' is on.")
     }
+}
+private void _refuseUnsettledWait(Map spec, reqT0) {
+    String refusal = spec != null ? _pollStableRefusal(spec, reqT0) : null
+    if (refusal) throw new IllegalArgumentException("waitFor.${refusal}")
 }
 private String _pollStableRefusal(Map pollArgs, t0) {
     long budget = _isCloudRequest() ? _relayBudgetMs() : _lanBudgetMs()
@@ -12046,293 +12105,169 @@ private String _pollStableRefusal(Map pollArgs, t0) {
     String why = _isCloudRequest() ? 'the cloud relay drops a request that runs much longer' : 'the LAN time budget is set'
     return "stableForMs ${stable} cannot settle in the ${Math.max(0L, left)} ms this request has left (${why}); use a shorter stableForMs.".toString()
 }
-def _pollUntilAttributeCore(args, Long deadlineMs = null) {
-    def validArgKeys = ["deviceId", "deviceIds", "mode", "attribute", "expectedValue", "expectedValues", "timeoutMs", "pollIntervalMs", "comparator", "stableForMs"] as Set
-    if (args instanceof Map) {
-        def unknownKeys = (args.keySet() - validArgKeys).sort()
-        if (unknownKeys) {
-            throw new IllegalArgumentException("Unknown arg(s): ${unknownKeys}. Valid args: ${validArgKeys.sort()}. Common gotcha: timeout is 'timeoutMs' in milliseconds, not 'timeoutSeconds'.")
-        }
+private Map _waitForRun(Map spec, List ids, boolean page, first, reqT0) {
+    long budget = _isCloudRequest() ? _relayBudgetMs() : _lanBudgetMs()
+    if (!(reqT0 instanceof Number) || budget <= 0L) return _waitForCore(spec, ids, page, first, null)
+    String refusal = _pollStableRefusal(spec, reqT0)
+    if (refusal) throw new IllegalArgumentException("waitFor.${refusal}")
+    long deadline = (reqT0 as long) + budget
+    long left = deadline - now()
+    int asked = spec.timeoutMs
+    String why = _isCloudRequest() ? 'the cloud relay drops a request that runs much longer' : 'the LAN time budget is set'
+    if (left < 100L) {
+        return [converged: false, timedOut: true, elapsedMs: 0, polledCount: 0, convergedCount: 0, last: first,
+                devices: ids.collect { [deviceId: it, finalValue: null, matched: false] },
+                budgetLimited: true, requestedTimeoutMs: asked, timeoutMs: 0,
+                budgetNote: "Not polled: the request had ${Math.max(0L, left)} ms left (${why}). Wait again in a new call.".toString()]
     }
-    def hasDeviceId  = args.containsKey("deviceId")  && args.deviceId  != null
-    def hasDeviceIds = args.containsKey("deviceIds") && args.deviceIds != null
-    if (args.containsKey("deviceId") && args.deviceId == null) {
-        throw new IllegalArgumentException("deviceId must not be null (omit the arg or pass a non-empty string)")
+    Map run = left < asked ? spec + [timeoutMs: left as Integer, pollIntervalMs: Math.min(spec.pollIntervalMs as long, left) as Integer] : spec
+    Map result = _waitForCore(run, ids, page, first, deadline)
+    if ((result.remove("budgetStopped") == true || left < asked) && !result.converged) {
+        result.requestedTimeoutMs = asked
+        result.timeoutMs = Math.min(left, asked as long)
+        result.budgetLimited = true
+        result.budgetNote = "The wait stopped after ${result.elapsedMs} ms instead of ${asked} ms: ${why}. Wait again to keep waiting.".toString()
     }
-    if (args.containsKey("deviceIds") && args.deviceIds == null) {
-        throw new IllegalArgumentException("deviceIds must not be null (omit the arg or pass a non-empty list of device IDs)")
-    }
-    if (hasDeviceId && hasDeviceIds) {
-        throw new IllegalArgumentException("provide exactly one of deviceId or deviceIds, not both")
-    }
-    if (!hasDeviceId && !hasDeviceIds) {
-        throw new IllegalArgumentException("deviceId (single device) or deviceIds (a list of device IDs) is required -- provide exactly one")
-    }
-    def multiDevice = hasDeviceIds
-    def MAX_POLL_DEVICES = 20
-    def deviceIdList
-    if (multiDevice) {
-        if (!(args.deviceIds instanceof List) || args.deviceIds.isEmpty()) {
-            throw new IllegalArgumentException("deviceIds must be a non-empty list of device-ID strings")
-        }
-        def coercedIds = []
-        args.deviceIds.eachWithIndex { v, i ->
-            def id = _canonicalDeviceIdArg(v)
-            if (!(id instanceof String) || !id) {
-                throw new IllegalArgumentException("deviceIds[${i}] must be a non-empty string or integral number, got: ${_describeValueForError(v)}")
-            }
-            coercedIds << id
-        }
-        if (coercedIds.size() > MAX_POLL_DEVICES) {
-            throw new IllegalArgumentException("deviceIds has ${coercedIds.size()} device IDs -- the cap is ${MAX_POLL_DEVICES} per poll")
-        }
-        def dupes = coercedIds.countBy { it }.findAll { k, c -> c > 1 }.keySet().sort()
-        if (dupes) {
-            throw new IllegalArgumentException("deviceIds contains duplicate entries: ${dupes} -- each device may appear once")
-        }
-        deviceIdList = coercedIds
-    } else {
-        def singleId = _canonicalDeviceIdArg(args.deviceId)
-        if (!(singleId instanceof String) || !singleId) {
-            throw new IllegalArgumentException("deviceId is required and must be a non-empty string or integral number (got: ${_describeValueForError(args.deviceId)})")
-        }
-        deviceIdList = [singleId]
-    }
-    if (args.containsKey("attribute") && args.attribute == null) {
-        throw new IllegalArgumentException("attribute must not be null (omit the arg or pass a non-empty string)")
-    }
-    if (!(args.attribute instanceof String) || !args.attribute) {
-        throw new IllegalArgumentException("attribute is required and must be a non-empty string")
-    }
-    deviceIdList.each { did -> _requireDeviceToolAccess(did) }
-    def validModes = ["any", "all"]
-    if (args.containsKey("mode") && args.mode == null) {
-        throw new IllegalArgumentException("mode must not be null (omit the arg to use the default \"all\")")
-    }
-    if (args.mode != null && !(args.mode instanceof String && validModes.contains(args.mode))) {
-        throw new IllegalArgumentException("mode must be one of ${validModes} (got: ${_describeValueForError(args.mode)})")
-    }
-    if (args.mode != null && !multiDevice) {
-        throw new IllegalArgumentException("mode applies only to deviceIds (multi-device polling); omit it for a single deviceId")
-    }
-    def mode = (args.mode != null) ? args.mode : "all"
-    if (args.containsKey("expectedValue") && args.expectedValue == null) {
-        throw new IllegalArgumentException("expectedValue must not be null (omit the arg or pass a non-empty string)")
-    }
-    if (args.containsKey("expectedValues") && args.expectedValues == null) {
-        throw new IllegalArgumentException("expectedValues must not be null (omit the arg or pass a non-empty list)")
-    }
-    def hasExpectedValue  = (args.expectedValue  != null)
-    def hasExpectedValues = (args.expectedValues != null)
-    if (hasExpectedValue && hasExpectedValues) {
-        throw new IllegalArgumentException("provide exactly one of expectedValue or expectedValues, not both")
-    }
-    if (!hasExpectedValue && !hasExpectedValues) {
-        throw new IllegalArgumentException("At least one of expectedValue or expectedValues must be provided")
-    }
-    if (hasExpectedValue && !(args.expectedValue instanceof String)) {
-        throw new IllegalArgumentException("expectedValue must be a string")
-    }
-    if (hasExpectedValue && args.expectedValue == "") {
-        throw new IllegalArgumentException("expectedValue must not be empty (omit the arg or pass a non-empty value)")
-    }
-    if (hasExpectedValues) {
-        if (!(args.expectedValues instanceof List)) {
-            throw new IllegalArgumentException("expectedValues must be a list of strings")
-        }
-        if (args.expectedValues.isEmpty()) {
-            throw new IllegalArgumentException("expectedValues must not be empty (omit the arg or pass at least one value)")
-        }
-        args.expectedValues.eachWithIndex { v, i ->
-            if (!(v instanceof String)) {
-                throw new IllegalArgumentException("expectedValues[${i}] must be a string, got: ${_describeValueForError(v)}")
-            }
-        }
-    }
-    if (args.containsKey("timeoutMs") && args.timeoutMs == null) {
-        throw new IllegalArgumentException("timeoutMs must not be null (omit the arg to use default 5000ms)")
-    }
-    def timeoutMs = (args.timeoutMs != null) ? args.timeoutMs : 5000
-    if (!(timeoutMs instanceof Number)) {
-        throw new IllegalArgumentException("timeoutMs must be an integer (got: ${timeoutMs})")
-    }
-    timeoutMs = timeoutMs as Integer
-    if (timeoutMs < 100 || timeoutMs > 60000) {
-        throw new IllegalArgumentException("timeoutMs must be between 100 and 60000 (got: ${timeoutMs})")
-    }
-    if (args.containsKey("pollIntervalMs") && args.pollIntervalMs == null) {
-        throw new IllegalArgumentException("pollIntervalMs must not be null (omit the arg to use default 200ms)")
-    }
-    def pollIntervalMs = (args.pollIntervalMs != null) ? args.pollIntervalMs : 200
-    if (!(pollIntervalMs instanceof Number)) {
-        throw new IllegalArgumentException("pollIntervalMs must be an integer (got: ${pollIntervalMs})")
-    }
-    pollIntervalMs = pollIntervalMs as Integer
-    if (pollIntervalMs < 50 || pollIntervalMs > 5000) {
-        throw new IllegalArgumentException("pollIntervalMs must be between 50 and 5000 (got: ${pollIntervalMs})")
-    }
-    if (pollIntervalMs > timeoutMs) {
-        pollIntervalMs = timeoutMs
-    }
-    if (args.containsKey("comparator") && args.comparator == null) {
-        throw new IllegalArgumentException("comparator must not be null (omit the arg to use the default \"eq\")")
-    }
-    def validComparators = ["eq", "ne", "gt", "gte", "lt", "lte", "between"]
-    def comparator = (args.comparator != null) ? args.comparator : "eq"
-    if (!(comparator instanceof String) || !validComparators.contains(comparator)) {
-        throw new IllegalArgumentException("comparator must be one of ${validComparators} (got: ${_describeValueForError(args.comparator)})")
-    }
-    def numericComparators = ["gt", "gte", "lt", "lte"] as Set
-    def numericThreshold = null
-    def betweenLow = null
-    def betweenHigh = null
-    if (numericComparators.contains(comparator)) {
-        if (hasExpectedValues) {
-            throw new IllegalArgumentException("comparator '${comparator}' takes a single numeric threshold via expectedValue, not expectedValues")
-        }
-        numericThreshold = _parseBigDecimalOrNull(args.expectedValue)
-        if (numericThreshold == null) {
-            throw new IllegalArgumentException("comparator '${comparator}' requires expectedValue to be a numeric-parseable string (got: ${_describeValueForError(args.expectedValue)})")
-        }
-    } else if (comparator == "between") {
-        if (hasExpectedValue) {
-            throw new IllegalArgumentException("comparator 'between' takes two numeric bounds via expectedValues, not expectedValue")
-        }
-        if (args.expectedValues.size() != 2) {
-            throw new IllegalArgumentException("comparator 'between' requires expectedValues to have exactly 2 numeric bounds [low, high] (got ${args.expectedValues.size()})")
-        }
-        betweenLow  = _parseBigDecimalOrNull(args.expectedValues[0])
-        betweenHigh = _parseBigDecimalOrNull(args.expectedValues[1])
-        if (betweenLow == null || betweenHigh == null) {
-            throw new IllegalArgumentException("comparator 'between' requires both expectedValues bounds to be numeric-parseable strings (got: ${args.expectedValues})")
-        }
-        if (betweenLow > betweenHigh) {
-            throw new IllegalArgumentException("comparator 'between' requires low <= high (got low=${args.expectedValues[0]}, high=${args.expectedValues[1]})")
-        }
-    }
-    if (args.containsKey("stableForMs") && args.stableForMs == null) {
-        throw new IllegalArgumentException("stableForMs must not be null (omit the arg to use default 0)")
-    }
-    def stableForMs = (args.stableForMs != null) ? args.stableForMs : 0
-    if (!(stableForMs instanceof Number)) {
-        throw new IllegalArgumentException("stableForMs must be an integer (got: ${_describeValueForError(args.stableForMs)})")
-    }
-    stableForMs = stableForMs as Integer
-    if (stableForMs < 0) {
-        throw new IllegalArgumentException("stableForMs must be >= 0 (got: ${stableForMs})")
-    }
-    if (stableForMs >= timeoutMs) {
-        throw new IllegalArgumentException("stableForMs (${stableForMs}) must be less than timeoutMs (${timeoutMs}) -- the condition could never hold long enough to converge")
-    }
-    def devices = []
-    def deviceLabels = []
-    for (did in deviceIdList) {
-        def full = _fetchDeviceFullJson(did)
-        if (!(full?.device instanceof Map)) {
-            return [success: false, isError: true, readError: true, deviceId: did,
-                    error: "Native device identity is unavailable for device ${did}; polling was not started.",
-                    note: 'Verify the device ID and native connectivity before starting a new poll.']
-        }
-        devices << [initial: full]
-        deviceLabels << _bypassDeviceLabel(full, did)
-    }
-    def deviceLabel = deviceLabels[0]
+    return result
+}
+def _waitForCore(Map spec, List ids, boolean page, first, Long deadlineMs) {
+    int n = ids.size()
+    int timeoutMs = spec.timeoutMs
     boolean budgetCut = false
     if (deadlineMs != null && deadlineMs - now() < timeoutMs) {
         timeoutMs = Math.max(0L, deadlineMs - now()) as Integer
         budgetCut = true
     }
-    def matchSet = [] as Set
-    if (hasExpectedValue)  matchSet << args.expectedValue
-    if (hasExpectedValues) matchSet.addAll(args.expectedValues)
-    if (multiDevice) {
-        return _pollMultiDevice(args, devices, deviceLabels, deviceIdList, mode, comparator,
-                                matchSet, numericThreshold, betweenLow, betweenHigh,
-                                timeoutMs, pollIntervalMs, stableForMs, deadlineMs, budgetCut)
-    }
-    def maxPolls    = ((timeoutMs / pollIntervalMs) as Integer) + 1
-    def startMs     = now()
-    def polledCount = 0
-    def finalValue  = null
-    def everNonNull = false
-    def sawChange      = false
-    def lastNonNull    = null
-    def sawNumeric     = false
-    def sawReadError   = false
-    def conditionTrueSince = null
+    String attribute = spec.attribute
+    String comparator = spec.comparator
+    int maxPolls = ((timeoutMs / (spec.pollIntervalMs as Integer)) as Integer) + 1
+    long startMs = now()
+    int polledCount = 0
+    int elapsedMs = 0
+    List values = (0..<n).collect { null }
+    List matched = (0..<n).collect { false }
+    List everNonNull = (0..<n).collect { false }
+    List sawNumeric = (0..<n).collect { false }
+    List sawChange = (0..<n).collect { false }
+    List lastNonNull = (0..<n).collect { null }
+    List readError = (0..<n).collect { false }
+    def last = page ? [:] : first
+    def pending = first
+    Long conditionTrueSince = null
+    boolean pastDeadline = false
+    String outcome
     while (true) {
         long tickStartMs = now()
-        try {
-            finalValue = _readPollValue(devices[0], deviceIdList[0], args.attribute)
-        } catch (Exception e) {
-            finalValue = null
-            if (!sawReadError) mcpLog("warn", "device", "poll_until_attribute read failed for '${deviceLabel}' on poll ${polledCount + 1}: ${e.message ?: e.toString()}")
-            sawReadError = true
+        if (page) {
+            Map records = pending
+            pending = null
+            if (records == null) {
+                records = [:]
+                try {
+                    for (rec in _readDevicesPage(ids as Set)) records.put(rec.id, rec)
+                } catch (IllegalStateException e) {
+                    if (!readError.any()) mcpLog("warn", "device", "waitFor Devices page read failed on check ${polledCount + 1}: ${e.message}")
+                }
+            }
+            last.putAll(records)
+            for (int i = 0; i < n; i++) {
+                Map rec = records.get(ids[i])
+                if (rec == null) readError[i] = true
+                values[i] = rec?.currentStates?.get(attribute)
+            }
+        } else {
+            Map fj = pending ?: _fetchDeviceFullJson(ids[0])
+            pending = null
+            if (fj?.device?.currentStates instanceof Map) {
+                last = fj
+                values[0] = _readBypassAttrValueFrom(fj, attribute)
+            } else {
+                values[0] = null
+                readError[0] = true
+            }
         }
         polledCount++
-        if (finalValue != null) {
-            everNonNull = true
-            def cur = finalValue.toString()
-            if (lastNonNull != null && cur != lastNonNull) sawChange = true
-            lastNonNull = cur
-        }
-        def elapsedMs = (now() - startMs) as Integer
-        def evalResult = _evalAttrCondition(finalValue, comparator, matchSet, numericThreshold, betweenLow, betweenHigh)
-        def condition = evalResult[0]
-        if (evalResult[1]) sawNumeric = true
-        if (condition) {
-            if (conditionTrueSince == null) conditionTrueSince = now()
-            if ((now() - conditionTrueSince) >= stableForMs) {
-                def okResponse = [
-                    success     : true,
-                    finalValue  : finalValue,
-                    elapsedMs   : elapsedMs,
-                    polledCount : polledCount,
-                    timedOut    : false
-                ]
-                if (sawReadError) okResponse.readError = true
-                return okResponse
+        for (int i = 0; i < n; i++) {
+            def v = values[i]
+            if (v != null) {
+                everNonNull[i] = true
+                String cur = v.toString()
+                if (lastNonNull[i] != null && cur != lastNonNull[i]) sawChange[i] = true
+                lastNonNull[i] = cur
             }
+            def eval = _evalAttrCondition(v, comparator, spec.matchSet, spec.numericThreshold, spec.betweenLow, spec.betweenHigh)
+            matched[i] = eval[0]
+            if (eval[1]) sawNumeric[i] = true
+        }
+        elapsedMs = (now() - startMs) as Integer
+        int count = matched.count { it }
+        if (spec.mode == "any" ? count > 0 : count == n) {
+            if (conditionTrueSince == null) conditionTrueSince = now()
+            if (now() - conditionTrueSince >= (spec.stableForMs as long)) { outcome = "converged"; break }
         } else {
             conditionTrueSince = null
         }
-        boolean pastDeadline = deadlineMs != null && now() + (now() - tickStartMs) >= deadlineMs
-        if (elapsedMs >= timeoutMs || polledCount >= maxPolls || pastDeadline) {
-            def response = [
-                success     : false,
-                finalValue  : finalValue,
-                elapsedMs   : elapsedMs,
-                polledCount : polledCount,
-                timedOut    : true,
-                transitioning : sawChange
-            ]
-            if (sawReadError) response.readError = true
-            if (!everNonNull) response.neverReported = true
-            if (budgetCut || pastDeadline) response.budgetStopped = true
-            if (comparator != "eq" && comparator != "ne" && everNonNull && !sawNumeric) {
-                response.nonNumericAttribute = true
-                response.note = "comparator '${comparator}' can never match attribute '${args.attribute}' -- it reported a non-numeric value the whole window (use eq/ne for a string attribute)".toString()
-                response.transitioning = false
-            }
-            return response
-        }
-        def sleepMs = _pollSleepMs(pollIntervalMs, timeoutMs - elapsedMs, now() - tickStartMs)
+        long tickMs = now() - tickStartMs
+        int sleepMs = _pollSleepMs(spec.pollIntervalMs, timeoutMs - elapsedMs, tickMs)
+        pastDeadline = deadlineMs != null && now() + sleepMs + tickMs >= deadlineMs
+        if (elapsedMs >= timeoutMs || polledCount >= maxPolls || pastDeadline) { outcome = "timedOut"; break }
         try {
             if (sleepMs > 0) pauseExecution(sleepMs)
         } catch (InterruptedException e) {
             elapsedMs = (now() - startMs) as Integer
-            mcpLog("warn", "device", "poll_until_attribute interrupted after ${polledCount} poll(s) (elapsed=${elapsedMs}ms): ${e.message}")
-            def intResponse = [
-                success     : false,
-                interrupted : true,
-                finalValue  : finalValue,
-                elapsedMs   : elapsedMs,
-                polledCount : polledCount
-            ]
-            if (sawReadError) intResponse.readError = true
-            return intResponse
+            mcpLog("warn", "device", "waitFor interrupted after ${polledCount} check(s) (${elapsedMs} ms): ${e.message}")
+            outcome = "interrupted"
+            break
         }
     }
+    boolean timedOut = outcome == "timedOut"
+    boolean numericComparator = !(comparator in ["eq", "ne"])
+    int nonNumeric = 0
+    boolean transitioning = false
+    List rows = (0..<n).collect { i ->
+        Map row = [deviceId: ids[i], finalValue: values[i], matched: matched[i]]
+        if (readError[i]) row.readError = true
+        if (timedOut) {
+            if (!everNonNull[i]) row.neverReported = true
+            if (numericComparator && everNonNull[i] && !sawNumeric[i]) {
+                row.nonNumericAttribute = true
+                nonNumeric++
+            } else if (sawChange[i]) {
+                transitioning = true
+            }
+        }
+        row
+    }
+    Map result = [converged: outcome == "converged", elapsedMs: elapsedMs, polledCount: polledCount,
+                  convergedCount: matched.count { it }, devices: rows, last: last]
+    if (timedOut) {
+        result.timedOut = true
+        result.transitioning = transitioning
+        if (budgetCut || pastDeadline) result.budgetStopped = true
+    }
+    if (outcome == "interrupted") result.interrupted = true
+    if (readError.any()) result.readError = true
+    if (nonNumeric > 0) {
+        result.note = "comparator '${comparator}' can never match attribute '${attribute}' on ${nonNumeric} device(s) that reported a non-numeric value the whole window (use eq/ne for a string attribute)".toString()
+    }
+    return result
+}
+private Map _waitForBlock(Map spec, Map r, boolean multi) {
+    Map block = [attribute: spec.attribute, expected: spec.expected]
+    if (multi) block.mode = spec.mode
+    block.converged = r.converged == true
+    Map row = r.devices ? r.devices[0] : [:]
+    if (multi) block.convergedCount = r.convergedCount
+    else block.finalValue = row.finalValue
+    block.elapsedMs = r.elapsedMs
+    block.polledCount = r.polledCount
+    if (multi) block.devices = r.devices
+    for (k in ["timedOut", "transitioning", "interrupted", "readError", "neverReported", "nonNumericAttribute",
+               "note", "budgetLimited", "budgetNote", "requestedTimeoutMs", "timeoutMs"]) {
+        def v = multi || r.containsKey(k) ? r.get(k) : row.get(k)
+        if (v != null && v != false || (k == "transitioning" && r.containsKey(k))) block.put(k, v)
+    }
+    return block
 }
 private Integer _pollSleepMs(pollIntervalMs, remainingMs, tickElapsedMs) {
     long requested = pollIntervalMs as Long
@@ -12340,148 +12275,6 @@ private Integer _pollSleepMs(pollIntervalMs, remainingMs, tickElapsedMs) {
     long interval = Math.max(requested - (tickElapsedMs as Long), floor)
     long remaining = remainingMs > 0 ? (remainingMs as Long) : interval
     return Math.min(interval, remaining) as Integer
-}
-private _readPollValue(dev, deviceId, attribute) {
-    def full = dev instanceof Map && dev.containsKey('initial') ? dev.remove('initial') : _fetchDeviceFullJson(deviceId)
-    if (!(full?.device instanceof Map) || !(full.device.currentStates instanceof Map)) {
-        throw new RuntimeException("Native current states unavailable for device ${deviceId}")
-    }
-    return _readBypassAttrValueFrom(full, attribute)
-}
-def _pollMultiDevice(args, devices, deviceLabels, deviceIdList, mode, comparator,
-                     matchSet, numericThreshold, betweenLow, betweenHigh,
-                     timeoutMs, pollIntervalMs, stableForMs, Long deadlineMs = null, boolean budgetCut = false) {
-    timeoutMs      = (timeoutMs != null && (timeoutMs > 0 || deadlineMs != null)) ? timeoutMs : 5000
-    pollIntervalMs = (pollIntervalMs && pollIntervalMs > 0) ? pollIntervalMs : 200
-    stableForMs    = (stableForMs && stableForMs > 0) ? stableForMs : 0
-    def n           = devices.size()
-    def maxPolls    = ((timeoutMs / pollIntervalMs) as Integer) + 1
-    def startMs     = now()
-    def polledCount = 0
-    def everNonNull = (0..<n).collect { false }
-    def sawNumeric  = (0..<n).collect { false }
-    def sawChange   = (0..<n).collect { false }
-    def lastNonNull = (0..<n).collect { null }
-    def finalValue  = (0..<n).collect { null }
-    def matched     = (0..<n).collect { false }
-    def sawReadError = (0..<n).collect { false }
-    def conditionTrueSince = null
-    while (true) {
-        long tickStartMs = now()
-        for (int i = 0; i < n; i++) {
-            def v
-            try {
-                v = _readPollValue(devices[i], deviceIdList[i], args.attribute)
-            } catch (Exception e) {
-                v = null
-                if (!sawReadError[i]) mcpLog("warn", "device", "poll_until_attribute (multi-device) read failed for '${deviceLabels[i]}' on poll ${polledCount + 1}: ${e.message ?: e.toString()}")
-                sawReadError[i] = true
-            }
-            finalValue[i] = v
-            if (v != null) {
-                everNonNull[i] = true
-                def cur = v.toString()
-                if (lastNonNull[i] != null && cur != lastNonNull[i]) sawChange[i] = true
-                lastNonNull[i] = cur
-            }
-            def evalResult = _evalAttrCondition(v, comparator, matchSet, numericThreshold, betweenLow, betweenHigh)
-            if (evalResult[1]) sawNumeric[i] = true
-            matched[i] = evalResult[0]
-        }
-        polledCount++
-        def elapsedMs = (now() - startMs) as Integer
-        def convergedCount = matched.count { it }
-        def aggregate = (mode == "any") ? (convergedCount > 0) : (convergedCount == n)
-        if (aggregate) {
-            if (conditionTrueSince == null) conditionTrueSince = now()
-            if ((now() - conditionTrueSince) >= stableForMs) {
-                return [
-                    success        : true,
-                    mode           : mode,
-                    devices        : (0..<n).collect { i ->
-                        def entry = [
-                            deviceId  : deviceIdList[i],
-                            device    : deviceLabels[i],
-                            finalValue: finalValue[i],
-                            matched   : matched[i]
-                        ]
-                        if (sawReadError[i]) entry.readError = true
-                        entry
-                    },
-                    convergedCount : convergedCount,
-                    elapsedMs      : elapsedMs,
-                    polledCount    : polledCount,
-                    timedOut       : false
-                ]
-            }
-        } else {
-            conditionTrueSince = null
-        }
-        boolean pastDeadline = deadlineMs != null && now() + (now() - tickStartMs) >= deadlineMs
-        if (elapsedMs >= timeoutMs || polledCount >= maxPolls || pastDeadline) {
-            def numericComparator = (comparator != "eq" && comparator != "ne")
-            def nonNumericCount = 0
-            def anyTransitioning = false
-            def deviceResults = (0..<n).collect { i ->
-                def entry = [
-                    deviceId  : deviceIdList[i],
-                    device    : deviceLabels[i],
-                    finalValue: finalValue[i],
-                    matched   : matched[i]
-                ]
-                if (sawReadError[i]) entry.readError = true
-                if (!everNonNull[i]) entry.neverReported = true
-                def deviceNonNumeric = numericComparator && everNonNull[i] && !sawNumeric[i]
-                if (deviceNonNumeric) {
-                    entry.nonNumericAttribute = true
-                    nonNumericCount++
-                } else if (sawChange[i]) {
-                    anyTransitioning = true
-                }
-                entry
-            }
-            def response = [
-                success        : false,
-                mode           : mode,
-                devices        : deviceResults,
-                convergedCount : convergedCount,
-                elapsedMs      : elapsedMs,
-                polledCount    : polledCount,
-                timedOut       : true,
-                transitioning  : anyTransitioning
-            ]
-            if (nonNumericCount > 0) {
-                response.note = "comparator '${comparator}' can never match attribute '${args.attribute}' on ${nonNumericCount} device(s) that reported a non-numeric value the whole window (use eq/ne for a string attribute)"
-            }
-            if (budgetCut || pastDeadline) response.budgetStopped = true
-            return response
-        }
-        def sleepMs = _pollSleepMs(pollIntervalMs, timeoutMs - elapsedMs, now() - tickStartMs)
-        try {
-            if (sleepMs > 0) pauseExecution(sleepMs)
-        } catch (InterruptedException e) {
-            elapsedMs = (now() - startMs) as Integer
-            mcpLog("warn", "device", "poll_until_attribute (multi-device, ${n}) interrupted after ${polledCount} poll(s) (elapsed=${elapsedMs}ms): ${e.message}")
-            return [
-                success        : false,
-                interrupted    : true,
-                mode           : mode,
-                devices        : (0..<n).collect { i ->
-                    def entry = [
-                        deviceId  : deviceIdList[i],
-                        device    : deviceLabels[i],
-                        finalValue: finalValue[i],
-                        matched   : matched[i]
-                    ]
-                    if (sawReadError[i]) entry.readError = true
-                    entry
-                },
-                convergedCount : matched.count { it },
-                elapsedMs      : elapsedMs,
-                polledCount    : polledCount
-            ]
-        }
-    }
 }
 def _resolveSinceWindow(args, hoursBack) {
     if (args.since == null) {
@@ -13998,11 +13791,23 @@ private boolean _deviceSwapCleanup(Integer appId) {
         return false
     }
 }
+private Map _waitForSchema(boolean multi) {
+    Map props = [attribute: [type: "string"],
+        expectedValue: [type: "string", description: "Value or numeric threshold"],
+        expectedValues: [type: "array", items: [type: "string"], description: "Value set, or between [low, high]"],
+        comparator: [type: "string", enum: ["eq", "ne", "gt", "gte", "lt", "lte", "between"], description: "Default eq"],
+        stableForMs: [type: "integer", minimum: 0, description: "Default 0"],
+        timeoutMs: [type: "integer", minimum: 100, maximum: 60000, description: "Default 5000"],
+        pollIntervalMs: [type: "integer", minimum: 50, maximum: 5000, description: "Default 200"]]
+    if (multi) props.mode = [type: "string", enum: ["any", "all"], description: "Default all"]
+    return [type: "object", description: multi ? "Wait until deviceIds (max 20) match" : "Wait until it matches; summary mode",
+            properties: props, required: ["attribute"]]
+}
 def _getAllToolDefinitions_partDevices() {
     def defs = { [
         [
             name: "hub_list_devices",
-            description: """List devices with current states from the hub's Devices page, filtered and paged on the hub. format='context' = plain-text house snapshot, the best first call for "what's going on". unfilteredTotal = devices in scope before filters. Control only devices the user named exactly. Guide: hub_get_tool_guide(section='performance_devices').""",
+            description: """List devices with current states from the hub's Devices page, filtered and paged on the hub. format='context' = plain-text house snapshot, the best first call for "what's going on". unfilteredTotal = devices in scope before filters. deviceIds + waitFor blocks until an attribute matches, e.g. to confirm a command batch. Control only devices the user named exactly. Guide: hub_get_tool_guide(section='performance_devices').""",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -14015,16 +13820,18 @@ def _getAllToolDefinitions_partDevices() {
                     staleHours: [type: "number", description: "Inactive this many hours"],
                     changedSince: [type: ["string", "integer"], description: "Active since: epoch ms or ISO-8601 with offset"],
                     stateFilter: [type: "object", description: "e.g. {\"switch\":\"on\"}"],
-                    attributeNames: [type: "array", items: [type: "string"], description: "Attributes to show in currentStates and context lines"],
-                    fields: [type: "array", items: [type: "string"], description: "Record fields (names in the guide)"],
+                    attributeNames: [type: "array", items: [type: "string"], description: "Attributes shown; summary/context only"],
+                    fields: [type: "array", items: [type: "string"], description: "Record fields (names in guide); summary/detailed only"],
                     limit: [type: "integer", description: "Page size; omit for all"],
-                    cursor: [type: "string", description: "\"\" first, then nextCursor"]
+                    cursor: [type: "string", description: "\"\" first, then nextCursor"],
+                    deviceIds: [type: "array", items: [type: ["string", "integer"]], description: "Only these devices"],
+                    waitFor: _waitForSchema(true)
                 ]
             ]
         ],
         [
             name: "hub_get_device",
-            description: """Inspect one device. Default summary gives capabilities, current attributes and commands. Use mode='configuration' before updates[[FLAT_TRIM]] to discover editable fields, saved preferences, types/defaults/options and driver information; mode='details' exposes configuration and other device information by section[[/FLAT_TRIM]].[[FLAT_TRIM]] Read status distinguishes unavailable information from unset values.[[/FLAT_TRIM]]""",
+            description: """Inspect one device. Default summary gives capabilities, current attributes and commands; waitFor blocks until an attribute matches. Use mode='configuration' before updates[[FLAT_TRIM]] to discover editable fields, saved preferences, types/defaults/options and driver information; mode='details' exposes configuration and other device information by section[[/FLAT_TRIM]].[[FLAT_TRIM]] Read status distinguishes unavailable information from unset values.[[/FLAT_TRIM]]""",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -14034,41 +13841,17 @@ def _getAllToolDefinitions_partDevices() {
                     sections: [type: "array", items: [type: "string", enum: _deviceDetailSections()],
                                description: "details mode only: non-empty section selection. Omit for all sections.[[FLAT_TRIM]] Large histories remain reachable through read-tool references.[[/FLAT_TRIM]]"],
                     fields: [type: "array", items: [type: "string"], description: "configuration/details only: omit for all values, [] for availableFields name discovery, or select exact field/preference names.[[FLAT_TRIM]] For commands/jobs use row indices from availableFields; attributes also accepts individual attribute names.[[/FLAT_TRIM]]"],
-                    cursor: [type: "string", description: "Oversized reads return contentFormat=json-fragment and nextCursor. Repeat with unchanged arguments within five minutes, concatenate content, then parse JSON.[[FLAT_TRIM]] Expired/evicted snapshots require restarting. Prefer fields/sections for smaller reads.[[/FLAT_TRIM]]"]
+                    cursor: [type: "string", description: "Oversized reads return contentFormat=json-fragment and nextCursor. Repeat with unchanged arguments within five minutes, concatenate content, then parse JSON.[[FLAT_TRIM]] Expired/evicted snapshots require restarting. Prefer fields/sections for smaller reads.[[/FLAT_TRIM]]"],
+                    waitFor: _waitForSchema(false)
                 ],
                 required: ["deviceId"]
             ]
         ],
         [
-            name: "hub_get_device_attribute",
-            description: """Get a device attribute's current value, or block-poll until it reaches an expected value.
-
-[[FLAT_TRIM]]
-One-shot read by default (deviceId + attribute). Provide expectedValue or expectedValues (exactly one) to block-poll until currentValue matches, returning immediately on match or when timeoutMs elapses.
-[[/FLAT_TRIM]]
-""",
-            inputSchema: [
-                type: "object",
-                properties: [
-                    deviceId: [type: ["string", "integer"], description: "Device ID from hub_list_devices."],
-                    deviceIds: [type: "array", items: [type: ["string", "integer"]], description: "Array of device IDs for a multi-device poll (mutually exclusive with deviceId; max 20)."],
-                    mode: [type: "string", enum: ["any", "all"], description: "Multi-device aggregate.", default: "all"],
-                    attribute: [type: "string", description: "Attribute name."],
-                    expectedValue: [type: "string", description: "If set, block-poll until currentValue matches per comparator (enables poll mode). Single value, e.g. \"72\".[[FLAT_TRIM]] Provide exactly one of expectedValue or expectedValues.[[/FLAT_TRIM]]"],
-                    expectedValues: [type: "array", items: [type: "string"], description: "If set, block-poll until currentValue matches per comparator (enables poll mode). For between, two numeric bounds [low, high].[[FLAT_TRIM]] Provide exactly one of expectedValue or expectedValues.[[/FLAT_TRIM]]"],
-                    comparator: [type: "string", enum: ["eq", "ne", "gt", "gte", "lt", "lte", "between"], description: "Match operator. Default eq (value in the expected set).", default: "eq"],
-                    stableForMs: [type: "integer", description: "Debounce: the match must hold continuously for this many MILLISECONDS before converging. Default 0 (first match).", default: 0, minimum: 0],
-                    timeoutMs: [type: "integer", description: "Poll mode only: max wait in MILLISECONDS. Default 5000, min 100, max 60000. Requires expectedValue/expectedValues — passing a timeout without one is rejected.", default: 5000, minimum: 100, maximum: 60000],
-                    pollIntervalMs: [type: "integer", description: "Poll mode: re-check interval in MILLISECONDS. Default 200, min 50, max 5000. Clamped to timeoutMs if larger.[[FLAT_TRIM]] Target cadence: each tick's native read latency is subtracted from the sleep, down to a floor of half the interval, so slow reads space ticks by the reads plus that floor; the final tick can still sleep less than that floor because the remaining timeoutMs window clamps it. (hub_call_device_command's waitFor defaults to 250 instead: a post-command poll follows a write, so wider spacing reduces read contention.)[[/FLAT_TRIM]]", default: 200, minimum: 50, maximum: 5000]
-                ],
-                required: ["attribute"]
-            ]
-        ],
-        [
             name: "hub_call_device_command",
-            description: """Send a command (e.g. on, off, setLevel) to one device, or to SEVERAL at once via `commands`. Use to actuate or control a device; for read-only checks use hub_get_device_attribute instead.
+            description: """Send a command (e.g. on, off, setLevel) to one device, or to SEVERAL at once via `commands`. Use to actuate or control a device; for read-only checks use hub_get_device instead.
 
-For more than one device pass `commands` (max 20) rather than calling this repeatedly: one round trip instead of N.[[FLAT_TRIM]] Entries are independent -- one failing entry does not stop the others; check results[] for per-entry success. Confirm a batch with hub_get_device_attribute's deviceIds form. The round trip, not the hub actuating the device, is most of the wall-clock time, so this is the biggest win available on a multi-device intent; mixed devices and mixed commands go in one batch. For a set commanded repeatedly a group or scene is better still - one device to command, with the hub fanning out; `commands` is for the ad-hoc set nobody defined in advance.[[/FLAT_TRIM]]
+For more than one device pass `commands` (max 20) rather than calling this repeatedly: one round trip instead of N.[[FLAT_TRIM]] Entries are independent -- one failing entry does not stop the others; check results[] for per-entry success. Confirm a batch with hub_list_devices' deviceIds + waitFor. The round trip, not the hub actuating the device, is most of the wall-clock time, so this is the biggest win available on a multi-device intent; mixed devices and mixed commands go in one batch. For a set commanded repeatedly a group or scene is better still - one device to command, with the hub fanning out; `commands` is for the ad-hoc set nobody defined in advance.[[/FLAT_TRIM]]
 
 If no exact device match: suggest similar devices and get user confirmation before sending any command.""",
             inputSchema: [
@@ -14097,7 +13880,7 @@ If no exact device match: suggest similar devices and get user confirmation befo
                         attribute: [type: "string", description: "Attribute to poll until it converges, e.g. \"switch\". NOT checked before the command fires (native metadata lists reported attributes only): a name the device never reports times out with neverReported after the command has already executed."],
                         expectedValue: [type: "string", description: "Awaited value: eq/ne in-set, or gt/gte/lt/lte numeric threshold."],
                         expectedValues: [type: "array", items: [type: "string"], description: "Awaited set: eq/ne value list (OR), or between's two bounds [low, high]."],
-                        comparator: [type: "string", enum: ["eq", "ne", "gt", "gte", "lt", "lte", "between"], description: "Match operator, as on hub_get_device_attribute. Default eq.", default: "eq"],
+                        comparator: [type: "string", enum: ["eq", "ne", "gt", "gte", "lt", "lte", "between"], description: "Match operator. Default eq.", default: "eq"],
                         stableForMs: [type: "integer", description: "Debounce ms; match must hold this long before converging. Default 0, < timeoutMs.", default: 0, minimum: 0],
                         timeoutMs: [type: "integer", description: "Max wait in MILLISECONDS. Default 5000, min 100, max 30000. BLOCKS a hub thread for the full timeout, so keep it tight.", default: 5000, minimum: 100, maximum: 30000],
                         pollIntervalMs: [type: "integer", description: "Re-check interval in MILLISECONDS. Default 250, min 50, max 5000. Clamped to timeoutMs if larger.[[FLAT_TRIM]] Target cadence: read latency is subtracted from the sleep down to a floor of half the interval; the final tick can still sleep less than that floor because the remaining timeoutMs window clamps it.[[/FLAT_TRIM]]", default: 250, minimum: 50, maximum: 5000]
@@ -14218,7 +14001,7 @@ Pre-flight: backup <24h (hub_create_backup) + user OK.""",
 }
 def _readOnlyToolNames_partDevices() {
     return [
-        "hub_list_devices", "hub_get_device", "hub_get_device_attribute", "hub_list_device_events",
+        "hub_list_devices", "hub_get_device", "hub_list_device_events",
         "hub_get_compatible_devices"
     ]
 }
@@ -14231,7 +14014,6 @@ def _toolDisplayMeta_partDevices() {
     return [
         hub_list_devices: [title: "List Devices", summary: "List devices from the hub's Devices page with state filters, projection, a house snapshot and paging."],
         hub_get_device: [title: "Get Device Details", summary: "Inspect a device summary, configuration and preferences, or detailed information by section."],
-        hub_get_device_attribute: [title: "Get Device Attribute", summary: "Read one attribute value, optionally waiting until it matches an expected value."],
         hub_list_device_events: [title: "List Device Events", summary: "Recent events for a device or app, or location and hub events when neither is given."],
         hub_call_device_command: [title: "Send Device Command", summary: "Send a command like on, off, or setLevel to one device, or up to 20 in one call."],
         hub_call_device_swap: [title: "Swap Device", summary: "Exchange two devices' identities so the apps on one run on the other's hardware."],
@@ -28932,7 +28714,9 @@ def handleToolsCall(msg) {
             if (readLeaf) {
                 Map readArgs = _mrtrCopyMap(args as Map)
                 readArgs.__reqT0 = reqT0
-                if (_mrtrSnapshotReadTools().contains(leafName)) readSnapshotId = java.util.UUID.randomUUID().toString()
+                if (_deviceSnapshotRead(leafName, _mrtrLeafArguments(toolName?.toString(), leafName, args as Map))) {
+                    readSnapshotId = java.util.UUID.randomUUID().toString()
+                }
                 def readResult = _executeWithDeviceReadContext(toolName, readArgs,
                     readSnapshotId ? [id: readSnapshotId, fresh: true] : null)
                 if (!(readResult instanceof Map && readResult.status == "in_progress")) {
@@ -29286,7 +29070,7 @@ def _budgetAwareTools() {
             "hub_get_logs", "hub_get_info",
             "hub_report_issue", "hub_get_custom_rule",
             "hub_get_device", "hub_list_devices", "hub_get_device_health", "hub_list_libraries",
-            "hub_get_device_attribute", "hub_list_rules"] as Set
+            "hub_list_rules"] as Set
 }
 def _mrtrWriteTools() {
     return ["hub_set_native_app", "hub_set_rule", "hub_call_rule",
@@ -29301,6 +29085,9 @@ def _mrtrReadTools() {
             "hub_get_device_health", "hub_list_libraries", "hub_list_rules"] as Set
 }
 private Set _mrtrSnapshotReadTools() { ["hub_get_device", "hub_list_devices", "hub_get_device_health", "hub_list_rules"] as Set }
+private boolean _deviceSnapshotRead(leaf, leafArgs) {
+    return _mrtrSnapshotReadTools().contains(leaf?.toString()) && !(leafArgs instanceof Map && leafArgs.waitFor != null)
+}
 private def _executeWithDeviceReadContext(tool, Map args, Map context, boolean bpsChecked = false) {
     Map previous = deviceReadContext
     if (context != null) context.outerTool = tool?.toString()
@@ -31339,20 +31126,18 @@ def getGatewayConfig() {
             ]
         ],
         hub_read_devices: [
-            description: "Read-only device inspection: list devices with current states; inspect one device in summary, configuration, or sectioned details mode; read or block-poll an attribute; read device/location event history; search Hubitat's compatible-device catalog; and read Hub Mesh (hub-to-hub device/variable sharing between Hubitat hubs on the LAN). All operations are read-only; device commands, updates, and Hub Mesh writes live in hub_manage_devices.",
-            tools: ["hub_list_devices", "hub_get_device", "hub_get_device_attribute", "hub_list_device_events", "hub_get_compatible_devices", "hub_get_hub_mesh"],
+            description: "Read-only device inspection: list devices with current states; inspect one device in summary, configuration, or sectioned details mode; wait for an attribute to reach a value on one device or several; read device/location event history; search Hubitat's compatible-device catalog; and read Hub Mesh (hub-to-hub device/variable sharing between Hubitat hubs on the LAN). All operations are read-only; device commands, updates, and Hub Mesh writes live in hub_manage_devices.",
+            tools: ["hub_list_devices", "hub_get_device", "hub_list_device_events", "hub_get_compatible_devices", "hub_get_hub_mesh"],
             summaries: [
-                hub_list_devices: "List devices with current states from the hub's Devices page; format='context' = plain-text house snapshot (mode + one line per device). Args: scope? (authorized/all/owned), format? (summary/detailed/ids/context), labelFilter?, capabilityFilter?, roomFilter?, disabled?, staleHours?, changedSince?, stateFilter?, attributeNames?, fields?, limit?, cursor?",
-                hub_get_device: "Inspect one device. Args: deviceId, mode? (summary/configuration/details), sections? (details mode), fields? (configuration/details field selector), cursor? (continue one oversized scalar). Configuration mode discovers editable fields, saved preferences, driver identity, and read status before an update.",
-                hub_get_device_attribute: "Read one attribute's value, or block-poll one OR several devices (deviceIds + mode any/all) until it reaches expectedValue/expectedValues. Args: deviceId | deviceIds (max 20), mode? (any/all), attribute, expectedValue?, expectedValues?, timeoutMs?, pollIntervalMs?, comparator?, stableForMs?",
+                hub_list_devices: "List devices with current states from the hub's Devices page; format='context' = plain-text house snapshot (mode + one line per device). Args: scope? (authorized/all/owned), format? (summary/detailed/ids/context), labelFilter?, capabilityFilter?, roomFilter?, disabled?, staleHours?, changedSince?, stateFilter?, attributeNames?, fields?, limit?, cursor?, deviceIds?, waitFor? (needs deviceIds, max 20: block until an attribute matches, mode any/all)",
+                hub_get_device: "Inspect one device. Args: deviceId, mode? (summary/configuration/details), sections? (details mode), fields? (configuration/details field selector), cursor? (continue one oversized scalar), waitFor? (summary mode: block until an attribute matches). Configuration mode discovers editable fields, saved preferences, driver identity, and read status before an update.",
                 hub_list_device_events: "Recent device events, a time-windowed history (hoursBack, max 168), an absolute bookmark (since -- events after an exact timestamp; round-trip a returned date) with an optional end (until), per-app events (appId), or location and hub events (mode/HSM/hub-variable, reboots/low memory; omit deviceId/appId). Args: deviceId?, appId?, hoursBack?, since?, until?, attribute?, limit?",
                 hub_get_compatible_devices: "Search Hubitat's compatible-device catalog (brands/models + pairing/exclude/factory-reset instructions). Args: query?, brand?, protocol?, deviceType?, includeInstructions?, cursor?",
                 hub_get_hub_mesh: "Read Hub Mesh (hub-to-hub device/variable sharing on the LAN): enabled state, peer hubs, shared/linked devices + hub variables, sync interval, mode-following hub. Args: include_token?"
             ],
             searchHints: [
-                hub_list_devices: "show all devices switches lights sensors locks state inventory enumerate context summary snapshot overview house whats on right now changed since room stale disabled virtual owned",
-                hub_get_device: "device detail capabilities attributes commands info inspect one configuration editable fields preferences driver identity saved settings",
-                hub_get_device_attribute: "read attribute value poll wait until threshold sensor verify state changed inclusion compare numeric range debounce stable multiple devices deviceIds any all converge across",
+                hub_list_devices: "show all devices switches lights sensors locks state inventory enumerate context summary snapshot overview house whats on right now changed since room stale disabled virtual owned deviceIds wait until poll verify confirm batch multiple devices any all converge across",
+                hub_get_device: "device detail capabilities attributes commands info inspect one configuration editable fields preferences driver identity saved settings read attribute value wait until poll threshold sensor verify state changed inclusion compare numeric range debounce stable",
                 hub_list_device_events: "device history events timeline recent location mode hsm variable activity hub reboot restart low memory lowMemory startup app rule automation emitted since bookmark timestamp after new events change watch why caused produced by triggered button command source provenance",
                 hub_get_compatible_devices: "compatible devices catalog supported hardware brands models pairing join exclude factory reset instructions how to pair driver protocol zigbee zwave matter lan",
                 hub_get_hub_mesh: "hub mesh share devices between hubs link remote second hub peer hubs multi hub connect two hubs mesh token follow modes another hub sync interval linked device shared variable hub to hub"
@@ -31398,16 +31183,15 @@ def getGatewayConfig() {
         ],
         hub_manage_devices: [
             description: "Control and inspect devices: send commands; inspect configuration before changing identity, preferences, native properties, integration assignments, or driver; create a device from a driver type; and swap/replace a device across all referencing apps; plus Hub Mesh read+write (hub-to-hub device/variable sharing between Hubitat hubs on the LAN — enable/disable, sync interval, follow a peer's modes, peer mesh token). Device and Hub Mesh reads are also in hub_read_devices.",
-            tools: ["hub_call_device_command", "hub_call_device_swap", "hub_call_device_replace", "hub_update_device", "hub_create_device", "hub_list_devices", "hub_get_device", "hub_get_device_attribute", "hub_list_device_events", "hub_get_hub_mesh", "hub_update_hub_mesh"],
+            tools: ["hub_call_device_command", "hub_call_device_swap", "hub_call_device_replace", "hub_update_device", "hub_create_device", "hub_list_devices", "hub_get_device", "hub_list_device_events", "hub_get_hub_mesh", "hub_update_hub_mesh"],
             summaries: [
                 hub_call_device_command: "Send one device command, or batch up to 20 mixed commands in one call (commands cannot be combined with waitFor). Args: deviceId, command, parameters?, waitFor? | commands: [{deviceId, command, parameters?}]",
                 hub_call_device_swap: "Swap a device: apps/rules using from_device_id run on to_device_id's hardware afterwards (the hub exchanges the two identities). Args: from_device_id, to_device_id, confirm",
                 hub_call_device_replace: "Replace a dead device's hardware while KEEPING its id + all app/rule references (re-points to new_device_id; list_options=true reads compatible candidates). Args: old_device_id, new_device_id?, list_options?, confirm",
                 hub_update_device: "Change a device's Device Info fields, driver preferences, assistants or enabled state after hub_get_device(mode='configuration'). Args: deviceId, fields?, preferences?, confirm (for requiresConfirmation fields)",
                 hub_create_device: "Create a device from a driver-type id (hub_list_drivers include='all'); for LAN/integration/software drivers, NOT radio hardware (pair those). Args: deviceTypeId, label?, confirm",
-                hub_list_devices: "List devices with current states from the hub's Devices page; format='context' = plain-text house snapshot. Args: scope?, format?, labelFilter?, capabilityFilter?, roomFilter?, disabled?, staleHours?, changedSince?, stateFilter?, attributeNames?, fields?, limit?, cursor?",
-                hub_get_device: "Inspect one device. Args: deviceId, mode? (summary/configuration/details), sections? (details mode), fields? (configuration/details field selector), cursor? (continue one oversized scalar). Configuration mode discovers editable fields and preference definitions/current values before an update.",
-                hub_get_device_attribute: "Read one attribute's value, or block-poll one OR several devices (deviceIds + mode any/all) until it reaches expectedValue/expectedValues. Args: deviceId | deviceIds (max 20), mode? (any/all), attribute, expectedValue?, expectedValues?, timeoutMs?, pollIntervalMs?, comparator?, stableForMs?",
+                hub_list_devices: "List devices with current states from the hub's Devices page; format='context' = plain-text house snapshot. Args: scope?, format?, labelFilter?, capabilityFilter?, roomFilter?, disabled?, staleHours?, changedSince?, stateFilter?, attributeNames?, fields?, limit?, cursor?, deviceIds?, waitFor? (needs deviceIds, max 20: block until an attribute matches, mode any/all)",
+                hub_get_device: "Inspect one device. Args: deviceId, mode? (summary/configuration/details), sections? (details mode), fields? (configuration/details field selector), cursor? (continue one oversized scalar), waitFor? (summary mode: block until an attribute matches). Configuration mode discovers editable fields and preference definitions/current values before an update.",
                 hub_list_device_events: "Recent device events, a time-windowed history, an absolute bookmark (since) with an optional end (until), per-app events (appId), or location and hub events (reboots, low memory). Args: deviceId?, appId?, hoursBack?, since?, until?, attribute?, limit?",
                 hub_get_hub_mesh: "Read Hub Mesh (hub-to-hub device/variable sharing on the LAN): enabled state, peer hubs, shared/linked devices + hub variables, sync interval, mode-following hub. Args: include_token?",
                 hub_update_hub_mesh: "Change Hub Mesh settings (enable/disable needs a hub reboot; per-device sharing is hub_update_device fields.meshEnabled). Args: enabled?, full_refresh_interval? (0/120/300/3600), mode_hub_id? ('none'=local modes), peer_hub_id?+peer_token?"
@@ -31418,9 +31202,8 @@ def getGatewayConfig() {
                 hub_call_device_replace: "replace device hardware failed dead broken re-point preserve keep id references rules dashboard compatible replacement candidates getReplacementOptions",
                 hub_update_device: "rename relabel move room device edit configuration preferences driver type zigbee history limits dashboard mesh retry homekit alexa google assistant tags",
                 hub_create_device: "create add device from driver type instantiate lan integration cloud software component install new deviceTypeId driverId",
-                hub_list_devices: "show all devices switches lights sensors locks state inventory context summary snapshot overview house whats on right now changed since room stale disabled virtual owned",
-                hub_get_device: "device detail capabilities attributes commands info inspect one configuration editable fields preferences driver identity saved settings",
-                hub_get_device_attribute: "read attribute value poll wait until threshold sensor verify state changed compare numeric range debounce stable multiple devices deviceIds any all converge across",
+                hub_list_devices: "show all devices switches lights sensors locks state inventory context summary snapshot overview house whats on right now changed since room stale disabled virtual owned deviceIds wait until poll verify confirm batch multiple devices any all converge across",
+                hub_get_device: "device detail capabilities attributes commands info inspect one configuration editable fields preferences driver identity saved settings read attribute value wait until poll threshold sensor verify state changed inclusion compare numeric range debounce stable",
                 hub_list_device_events: "device history events timeline recent location mode hsm variable activity hub reboot restart low memory lowMemory startup app rule automation emitted since bookmark timestamp after new events change watch why caused produced by triggered button command source provenance",
                 hub_get_hub_mesh: "hub mesh share devices between hubs link remote second hub peer hubs multi hub connect two hubs mesh token follow modes another hub sync interval linked device shared variable hub to hub",
                 hub_update_hub_mesh: "enable disable hub mesh share devices between hubs link remote second hub peer hubs multi hub connect two hubs mesh token follow modes another hub sync interval full refresh linked device hub to hub"
@@ -31457,30 +31240,28 @@ def getGatewayConfig() {
             ]
         ],
         hub_manage_dashboards: [
-            description: "Manage Hubitat dashboards -- both Easy Dashboards and legacy Hubitat® Dashboards: list, view, create, update, delete, and clone. Easy update REPLACES the config wholesale (read it first with hub_get_dashboard); legacy update edits name, authorized devices, or the tile layout (grid, background, colors) either wholesale or via granular tile ops. Delete is destructive (confirm + recent backup). Reads are also in hub_read_dashboards.",
-            tools: ["hub_list_dashboards", "hub_get_dashboard", "hub_create_dashboard", "hub_update_dashboard", "hub_delete_dashboard", "hub_clone_dashboard"],
+            description: "Manage Hubitat dashboards -- both Easy Dashboards and legacy Hubitat® Dashboards: list, view, create or copy, update, and delete. Easy update REPLACES the config wholesale (read it first with hub_get_dashboard); legacy update edits name, authorized devices, or the tile layout (grid, background, colors) either wholesale or via granular tile ops. Delete is destructive (confirm + recent backup). Reads are also in hub_read_dashboards.",
+            tools: ["hub_list_dashboards", "hub_get_dashboard", "hub_create_dashboard", "hub_update_dashboard", "hub_delete_dashboard"],
             summaries: [
-                hub_list_dashboards: "List Easy + legacy Hubitat® Dashboards (id, name, type). No args",
+                hub_list_dashboards: "List Easy + legacy Hubitat® Dashboards (id, name, type). Args: cursor?",
                 hub_get_dashboard: "Get one dashboard's full config by id: Easy tiles/theme or legacy layout. Args: dashboardId",
-                hub_create_dashboard: "Create an Easy Dashboard, or an empty legacy one (type='legacy'). Args: name, type?, deviceIds, options?",
+                hub_create_dashboard: "Create an Easy or empty legacy dashboard, or copy one. Args: name, type?, deviceIds, options? | sourceId, name?",
                 hub_update_dashboard: "Update by id: Easy wholesale, or legacy name/deviceIds/layout (or tile ops). Args: dashboardId, name?, deviceIds?, options?/layout?/addTiles?/updateTiles?/removeTileIds?/setOptions?",
-                hub_delete_dashboard: "Permanently delete an Easy or legacy dashboard (DESTRUCTIVE). Args: dashboardId, confirm=true",
-                hub_clone_dashboard: "Clone an Easy or legacy dashboard into a copy (clone-by-value). Args: dashboardId"
+                hub_delete_dashboard: "Permanently delete an Easy or legacy dashboard (DESTRUCTIVE). Args: dashboardId, confirm=true"
             ],
             searchHints: [
                 hub_list_dashboards: "list show easy legacy hubitat dashboards dashboard tiles panels touch UI screen wall tablet",
                 hub_get_dashboard: "view read inspect easy legacy hubitat dashboard tiles layout grid template config one",
-                hub_create_dashboard: "add new easy legacy hubitat dashboard tiles devices panel touch screen wall tablet build",
+                hub_create_dashboard: "add new copy duplicate clone easy legacy hubitat dashboard tiles devices layout template panel touch screen wall tablet build",
                 hub_update_dashboard: "edit modify change replace easy legacy hubitat dashboard tile layout grid background color move resize template devices theme navigation config",
-                hub_delete_dashboard: "remove delete destroy easy legacy hubitat dashboard panel tiles",
-                hub_clone_dashboard: "copy duplicate clone easy legacy hubitat dashboard template layout"
+                hub_delete_dashboard: "remove delete destroy easy legacy hubitat dashboard panel tiles"
             ]
         ],
         hub_read_dashboards: [
-            description: "Read-only dashboard inspection: list dashboards (Easy and legacy Hubitat®) and view one dashboard's full config -- Easy tiles/navigation/theme/devices, or a legacy dashboard's authorized devices and tile layout (grid, colors). All operations are read-only; create/update/delete/clone live in hub_manage_dashboards.",
+            description: "Read-only dashboard inspection: list dashboards (Easy and legacy Hubitat®) and view one dashboard's full config -- Easy tiles/navigation/theme/devices, or a legacy dashboard's authorized devices and tile layout (grid, colors). Create/copy/update/delete live in hub_manage_dashboards.",
             tools: ["hub_list_dashboards", "hub_get_dashboard"],
             summaries: [
-                hub_list_dashboards: "List Easy + legacy Hubitat® Dashboards (id, name, type). No args",
+                hub_list_dashboards: "List Easy + legacy Hubitat® Dashboards (id, name, type). Args: cursor?",
                 hub_get_dashboard: "Get one dashboard's full config by id: Easy tiles/theme or legacy layout. Args: dashboardId"
             ],
             searchHints: [
@@ -31649,7 +31430,7 @@ def getToolDisplayMeta() {
         hub_manage_rule_machine: [title: "Manage Rule Machine", summary: "Author, trigger, pause, inspect, and delete Visual Rules Builder and Rule Machine rules."],
         hub_manage_native_rules_and_apps: [title: "Manage Native Rules and Apps", summary: "Runtime control of Rule Machine rules plus create, edit, clone, export, import, and delete classic native apps."],
         hub_manage_mcp: [title: "Manage MCP Server", summary: "Self-administer the MCP app's own settings (Developer Mode)."],
-        hub_manage_dashboards: [title: "Manage Dashboards", summary: "List, view, create, update, delete, and clone Easy and legacy Hubitat® Dashboards."]
+        hub_manage_dashboards: [title: "Manage Dashboards", summary: "List, view, create, copy, update, and delete Easy and legacy Hubitat® Dashboards."]
     ])
     return _toolMetadataPut("getToolDisplayMeta", meta)
 }
@@ -32002,12 +31783,12 @@ def executeTool(toolName, args, boolean bpsChecked = false) {
         }
     }
     _rejectUnknownArgs(toolName, args)
-    if (deviceReadContext != null && _mrtrSnapshotReadTools().contains(toolName?.toString())) {
+    if (deviceReadContext != null && _deviceSnapshotRead(toolName, args)) {
         return _deviceReadSnapshot(toolName.toString(), args as Map, deviceReadContext)
     }
     switch (toolName) {
         case "hub_list_devices": return toolListDevices(args)
-        case "hub_get_device": return toolGetDevice(args.deviceId, args.mode ?: "summary", args.sections, args.get("fields"), args.cursor)
+        case "hub_get_device": return toolGetDevice(args.deviceId, args.mode ?: "summary", args.sections, args.get("fields"), args.cursor, args.waitFor, args.__reqT0)
         case "hub_call_device_command": return toolSendCommand(args.deviceId, args.command, args.parameters, args.waitFor, args.commands, args.__reqT0, args.includeState != false)
         case "hub_call_device_swap": return toolCallDeviceSwap(args)
         case "hub_call_device_replace": return toolCallDeviceReplace(args)
@@ -32017,18 +31798,6 @@ def executeTool(toolName, args, boolean bpsChecked = false) {
             if (args.deviceId != null && args.hoursBack == null && args.attribute == null && args.since == null && args.until == null)
                 return toolGetDeviceEvents(args.deviceId, args.limit != null ? args.limit : 10)
             return toolGetDeviceHistory(args)
-        case "hub_get_device_attribute":
-            if (args.expectedValue != null || args.expectedValues != null || args.timeoutMs != null || args.pollIntervalMs != null || args.comparator != null || args.stableForMs != null || args.containsKey("deviceIds") || args.containsKey("mode")) {
-                return toolPollUntilAttribute(args)
-            }
-            def oneShotId = _canonicalDeviceIdArg(args.deviceId)
-            if (oneShotId == null) {
-                boolean missing = args.deviceId == null || (args.deviceId instanceof CharSequence && !args.deviceId.toString().trim())
-                throw new IllegalArgumentException(missing
-                    ? "deviceId is required (or use deviceIds for multi-device polling)"
-                    : "deviceId must be a non-empty string or integral number (got: ${_describeValueForError(args.deviceId)})".toString())
-            }
-            return toolGetAttribute(oneShotId, args.attribute)
         case "hub_get_custom_rule":
             if (args.detailed == true && args.ruleId == null)
                 throw new IllegalArgumentException("detailed=true requires a ruleId (it returns per-rule diagnostics). Omit detailed to list all rules.")
@@ -32139,7 +31908,6 @@ def executeTool(toolName, args, boolean bpsChecked = false) {
         case "hub_create_dashboard": return _dashboardPublic(toolCreateDashboard(args))
         case "hub_update_dashboard": return _dashboardPublic(toolUpdateDashboard(args))
         case "hub_delete_dashboard": return toolDeleteDashboard(args)
-        case "hub_clone_dashboard": return _dashboardPublic(toolCloneDashboard(args))
         case "hub_get_tool_guide": return toolGetToolGuide(args.section, args.cursor, [platform_api_search: args.platform_api_search, platform_api_page: args.platform_api_page])
         case "hub_search_tools": return toolSearchTools(args)
         case "hub_read_apps_code":
@@ -33580,10 +33348,9 @@ Map _fileManagerListing(String folder = null) {
         files = parsed.containsKey("files") ? parsed.files : parsed.values()?.flatten()
     }
     if (!(files instanceof List)) throw new IllegalStateException("/hub/fileManager/json returned an unrecognised shape")
-    Closure asLong = { v -> v != null && v.toString().isLong() ? v.toString().toLong() : null }
     List entries = (files as List).collect { f ->
         f instanceof Map
-            ? [name: f.name?.toString(), type: f.type?.toString(), size: asLong(f.size), date: asLong(f.date),
+            ? [name: f.name?.toString(), type: f.type?.toString(), size: _fileManagerLong(f.size), date: _fileManagerLong(f.date),
                backupIncluded: f.backupIncluded instanceof Boolean ? f.backupIncluded : null]
             : [name: f?.toString(), type: null, size: null, date: null, backupIncluded: null]
     }.findAll { it.name }
@@ -33594,11 +33361,20 @@ Map _fileManagerListing(String folder = null) {
     }
     Map selection = (parsed instanceof Map && parsed.backupSelection instanceof Map) ? parsed.backupSelection : null
     return [files: entries,
-            freeSpace: parsed instanceof Map ? asLong(parsed.freeSpace) : null,
+            freeSpace: parsed instanceof Map ? _fileManagerLong(parsed.freeSpace) : null,
             excludedFiles: selection?.excludedFiles]
 }
+private Long _fileManagerLong(v) {
+    return v != null && v.toString().isLong() ? v.toString().toLong() : null
+}
+List _fileManagerRootEntries() {
+    def files = getHubFiles()
+    if (!(files instanceof Collection)) throw new IllegalStateException("getHubFiles() returned no file list")
+    return files.collect { f -> [name: f?.name?.toString(), type: f?.type?.toString(), size: _fileManagerLong(f?.size), date: _fileManagerLong(f?.date)] }
+        .findAll { it.name }
+}
 List _fileManagerRootFiles() {
-    return _fileManagerListing().files.findAll { it.type != "dir" }.collect { [name: it.name, size: it.size, date: it.date] }
+    return _fileManagerRootEntries().findAll { it.type != "dir" }.collect { [name: it.name, size: it.size, date: it.date] }
 }
 private void _commitItemBackupManifest(Map manifest) {
     String owner = _stateOwnerKey()
@@ -34945,7 +34721,7 @@ private Map _rmForceDeleteApp(Integer appId) {
     return resp
 }
 def currentVersion() {
-    return "5.1.12"
+    return "5.2.0"
 }
 def hubBpsGuideKey(String section, Long atMs = null) {
     long bucket = ((atMs != null ? atMs : now()) as long).intdiv(3600000L)
@@ -35026,7 +34802,7 @@ def _guideSectionForTool(toolName) {
               'hub_set_rule_private_boolean']) return 'builtin_app_tools_rules'
     if (t in ['hub_get_device', 'hub_update_device']) return 'update_device'
     if (t == 'hub_manage_virtual_device') return 'virtual_devices'
-    if (t in ['hub_create_dashboard', 'hub_update_dashboard', 'hub_delete_dashboard', 'hub_clone_dashboard']) return 'dashboards'
+    if (t in ['hub_create_dashboard', 'hub_update_dashboard', 'hub_delete_dashboard']) return 'dashboards'
     if (t in ['hub_create_room', 'hub_update_room']) return 'rooms'
     if (t in ['hub_create_backup', 'hub_restore_backup']) return 'backup'
     if (t in ['hub_install_bundle', 'hub_delete_bundle', 'hub_export_bundle']) return 'bundles'
@@ -35039,7 +34815,6 @@ def _guideSectionForTool(toolName) {
               'hub_update_firmware', 'hub_call_destructive_ops']) return 'hub_admin_write_destructive'
     if (t in ['hub_update_app', 'hub_update_driver', 'hub_update_library', 'hub_create_app', 'hub_create_driver',
               'hub_create_library', 'hub_update_package']) return 'hub_admin_write_code'
-    if (t == 'hub_get_device_attribute') return 'device_authorization'
     if (t == 'hub_report_issue') return 'performance_diagnostics'
     return null
 }
@@ -35123,7 +34898,6 @@ If you are calling one of these tools, you must read its section for that sectio
 - hub_delete_bundle -> bundles
 - hub_export_bundle -> bundles
 - hub_install_bundle -> bundles
-- hub_clone_dashboard -> dashboards
 - hub_create_dashboard -> dashboards
 - hub_delete_dashboard -> dashboards
 - hub_update_dashboard -> dashboards
@@ -35335,18 +35109,18 @@ hub_update_driver bulk mode: `updates=[{driverId, sourceFile|source|importUrl|re
 
 **Uncertain command outcome:** `outcomeUnknown: true` means the native command request failed without proving whether the device acted. Read the device state or event history before deciding whether to retry; blindly repeating a non-idempotent command can apply it twice.
 
-**Response `state` snapshot (single-device form only -- the `commands` form returns none).** Returns a native `state` snapshot with per-attribute values and freshness timestamps after dispatch. It may still show the previous state if the driver has not reported the effect. To confirm the resulting state, pass `waitFor` and check convergence, or read hub_get_device_attribute separately. With `waitFor`, the snapshot follows polling and the `waitFor` result reports whether the expected value converged. Native command rejection returns success: false for both selected and bypass-accessible devices.
+**Response `state` snapshot (single-device form only -- the `commands` form returns none).** Returns a native `state` snapshot with per-attribute values and freshness timestamps after dispatch. It may still show the previous state if the driver has not reported the effect. To confirm the resulting state, pass `waitFor` and check convergence, or read hub_get_device separately. With `waitFor`, the snapshot follows polling and the `waitFor` result reports whether the expected value converged. Native command rejection returns success: false for both selected and bypass-accessible devices.
 
 **`parameters` arg.** Omit for no-arg commands like on/off. Each element is a string; numbers and JSON-object values are passed as strings (e.g. `["{\"hue\":0,\"saturation\":100,\"level\":50}"]`) and coerced hub-side.
 
-**`waitFor` arg.** comparator (eq/ne/gt/gte/lt/lte/between) and stableForMs (debounce) work as on hub_get_device_attribute. BLOCKS the request up to timeoutMs and queues concurrent MCP calls; reuses the hub_get_device_attribute poll engine.
+**`waitFor` arg.** Same keys and `waitFor` result as hub_get_device's waitFor (see that section), with timeoutMs up to 30000 and a 250 ms default pollIntervalMs. BLOCKS the request up to timeoutMs and queues concurrent MCP calls.
 
 A malformed `waitFor` spec is rejected before the command fires, so the device is not actuated. The attribute name is the exception: a mistyped name still fires the command, then times out with `neverReported`.
 
 **`commands` arg (several devices in one call).** Up to 20 entries of `{deviceId, command, parameters?}`, sent in the order given. Reach for it whenever an intent touches more than one device ("turn off the kitchen lights", "close all the shades"): the per-call round trip -- not the hub actuating the device -- is nearly the whole cost. Measured on a live hub over LAN: one command ~1.0s end to end; six sent separately ~4.4s (~0.73s each); the same six Z-Wave switches as one batch ~1.5s; a batch of 1, 2 or 4 flat at ~0.95s. Firing separate calls in parallel does NOT help; the hub serialises them anyway. Devices behind a bridge carry real per-device time that batching cannot remove -- six Bond-bridged shades batched came back at ~2.75s, against ~5.0s sent separately.
 
 - **Mutually exclusive with `deviceId`/`command`**, and cannot be combined with `waitFor` -- that would block a hub thread per device.
-- **Batch entries return no state snapshot.** Confirm with hub_get_device_attribute's `deviceIds` form: one call to fire, one to confirm.
+- **Batch entries return no state snapshot.** Confirm with hub_list_devices `deviceIds` + `waitFor`: one call to fire, one to confirm each target state (a waitFor applies one condition to every listed device).
 - **What it does NOT change.** The hub still actuates the devices one at a time, so they do not all move simultaneously. What disappears is the protocol overhead, not the hub's own work.
 - **Entries are independent.** Mixed devices and mixed commands. A bad entry (unknown id, unsupported command) is reported in its own `results[]` slot and the remaining entries are still sent; `success` is true only when every entry was sent. A partly-failed batch carries `failedDeviceIds` plus `partial: true` -- re-send ONLY those ids, because the successful entries have already actuated. Malformed input -- a missing deviceId, a `parameters` value that is neither an array nor a string, more than 20 entries -- is rejected before anything is sent, so a bad request never actuates part of a batch.
 - **A very large batch of slow bridged devices can stop early.** As the request nears the relay time budget the batch returns `stoppedEarly: true` with `remainingCommands` -- the untried tail, verbatim. Re-send exactly that in a new call; the attempted entries already went.
@@ -35856,7 +35630,7 @@ Files download from http://<hub IP>/local/<filename> (`downloadUrlBase` in hub_l
 
 Use to discover available files before reading one with hub_read_file, or to confirm a write/backup landed. Each file carries `size` (bytes) and `lastModified` (epoch ms). **`filter`:** case-insensitive substring match on the file name -- pass `filter: "backup"` to find backups instead of paging the whole listing and matching client-side. **Cursor pagination:** page size 100 -- omit the cursor for an unbounded list; pass "" for the first page and iterate `nextCursor`.
 
-**Folders:** the root listing includes subfolders as entries with `type: "dir"` (no size); list one with `folder: "<name>"` (nested as `a/b`; letters, digits, dot, underscore and hyphen, no spaces -- the hub can neither create nor list a folder with a space). Files carry `type: "file"`, and `backupIncluded: false` marks a file a full local backup leaves out (past its 100 MiB File Manager limit). The response adds `freeSpaceBytes` and `filesExcludedFromFullBackup` (a count). A folder that is empty or does not exist lists no files. A file in a subfolder downloads from that listing's `downloadUrlBase` + its name.
+**Folders:** the root listing includes subfolders as entries with `type: "dir"` (no size); list one with `folder: "<name>"` (nested as `a/b`; letters, digits, underscore and hyphen; no spaces or dots -- the hub can neither create nor list a folder with either). Files carry `type: "file"`, and `backupIncluded: false` marks a file a full local backup leaves out (past its 100 MiB File Manager limit). The response adds `freeSpaceBytes` and `filesExcludedFromFullBackup` (a count). A folder that is empty or does not exist lists no files. A file in a subfolder downloads from that listing's `downloadUrlBase` + its name.
 
 ### hub_read_file
 
@@ -35871,7 +35645,7 @@ Use after hub_list_files to fetch a named file (config, backup, exported rule/ap
 - Entries are independent, so mixed devices and mixed commands go in one batch. Max 20. A partly-failed batch reports failedDeviceIds plus partial:true -- re-send only those ids; the rest already actuated.
 - The batch result always carries `count` (entries attempted), `sentCount`, `failedCount` and a per-entry `results[]`. Any failure adds `failedDeviceIds`, `error` and `note`. A result with `success: false` (a failed entry or an early stop) is sent with `isError: true`. An entry's `deviceId` may be a string or an integer.
 
-- Batch entries return NO state snapshot, and waitFor is not accepted with `commands`. To confirm, follow with hub_get_device_attribute using deviceIds (multi-device convergence): one batch to fire, one poll to confirm -- two round trips for the whole group.
+- Batch entries return NO state snapshot, and waitFor is not accepted with `commands`. To confirm, follow with hub_list_devices using deviceIds + waitFor (multi-device convergence): one batch to fire, one poll to confirm -- two round trips for a group that shares a target state (one poll per target state otherwise).
 - A very large batch of slow bridged devices can stop early at the relay time budget: the result carries stoppedEarly:true with remainingCommands, the untried tail verbatim, to re-send in a new call; it is `success: false` and flagged `isError: true` even when no entry failed.
 - For a set commanded repeatedly, a group or scene beats both: one device to command and the hub fans out. `commands` is for the ad-hoc set that was never defined in advance.
 
@@ -35894,7 +35668,7 @@ Use after hub_list_files to fetch a named file (config, backup, exported rule/ap
 
 **Cursor pagination.** List tools that take `cursor` return the whole list when it is omitted, subject to the guard. These always return one page: `hub_list_backups` (scope=source), with `hasMore: true` and `nextCursor` when more backups follow; `hub_list_drivers(include='all')`, whose full catalog is too large for one response through the cloud relay; and `hub_list_devices` in `format='context'` when `limit` is unset. Pass `cursor: ""` for the first page, then pass each returned `nextCursor` until it is absent. A malformed or out-of-range cursor is rejected as a validation error. Page sizes:
 - 25: `hub_list_hpm_packages`.
-- 50: `hub_list_apps` (pages the filtered set), `hub_list_drivers`, `hub_list_libraries`, `hub_list_bundles`, `hub_list_rules`, `hub_get_custom_rule` (list mode), `hub_list_captured_states`, `hub_list_backups` (scope=source, newest first), and `hub_list_devices` in `format='context'` when `limit` is unset (the other formats are unpaged until a `cursor` or a positive `limit` is given).
+- 50: `hub_list_apps` (pages the filtered set), `hub_list_drivers`, `hub_list_libraries`, `hub_list_bundles`, `hub_list_dashboards`, `hub_list_rules`, `hub_get_custom_rule` (list mode), `hub_list_captured_states`, `hub_list_backups` (scope=source, newest first), and `hub_list_devices` in `format='context'` when `limit` is unset (the other formats are unpaged until a `cursor` or a positive `limit` is given).
 - 100: `hub_list_variables` (hubVariables; ruleVariables stay whole), `hub_list_files`, `hub_list_rooms`, `hub_list_device_dependents` (appsUsing), `hub_get_logs` (50 per tab when several are listed), `hub_get_memory_history`, and `hub_get_device_health` (staleDevices).
 - `hub_get_device` and `hub_get_tool_guide` page oversized responses automatically.
 
@@ -35971,41 +35745,29 @@ Issue-type routing: `issueType` picks the GitHub issue template behind `submitUr
 
 **Summary record.** `{id, label, name, driver, room, disabled, deviceNetworkId, lastActivity, currentStates}` plus `protocol` (zigbee/zwave/matter/network/bluetooth/virtual), `parentDeviceId` on child devices, `mcpManaged`, `linked` (Hub Mesh) and `tags` when they apply. `label` is the display name; group by `parentDeviceId` to count a parent's children.
 
-**Filters** apply before paging, in this order: scope, `disabled` (true = only disabled, false = only enabled), `labelFilter` (label substring), `capabilityFilter` (exact capability name), `roomFilter` (exact room name), `stateFilter` (`{"switch":"on"}`: every named attribute must read that value; a credential-named attribute is refused while Hide passwords and credentials is on), `staleHours` (no activity for that long; never-active devices count as stale), `changedSince` (active at or after epoch ms or ISO-8601 with an offset; a returned `lastActivity` round-trips). A device whose page entry carries no usable value for a filtered field is excluded and named in `metadataUnavailableIds` with `partial: true`; a record missing such a field carries `metadataUnavailable: true`. A zero match carries `capabilityFilterMatchedKnownCapability` or `roomFilterMatchedKnownRoom` to tell a typo from an empty result. If the capability feed cannot be read or lists no device the response carries `capabilitiesUnavailable: true` and capabilityFilter matches nothing.
+**Filters** apply before paging, in this order: scope, `disabled` (true = only disabled, false = only enabled), `labelFilter` (label substring), `capabilityFilter` (exact capability name), `roomFilter` (exact room name), `stateFilter` (`{"switch":"on"}`: every named attribute must read that value; a credential-named attribute is refused while Hide passwords and credentials is on), `staleHours` (no activity for that long; never-active devices count as stale), `changedSince` (active at or after epoch ms or ISO-8601 with an offset; a returned `lastActivity` round-trips). A device the capability feed does not list (for `capabilityFilter`) or whose `lastActivity` does not parse (for `staleHours`/`changedSince`) is excluded and named in `metadataUnavailableIds` with `partial: true`; a record showing `capabilities` or `buttonCount` for a device the feed does not list carries `metadataUnavailable: true`. A zero match carries `capabilityFilterMatchedKnownCapability` or `roomFilterMatchedKnownRoom` to tell a typo from an empty result. If the capability feed cannot be read or lists no device the response carries `capabilitiesUnavailable: true` and capabilityFilter matches nothing.
 
-**Projection.** `fields` picks record fields (`id` always kept): id, label, name, driver, room, roomId, disabled, deviceNetworkId, lastActivity, protocol, parentDeviceId, mcpManaged, linked, tags, notes, source, currentStates, capabilities, attributes, commands. `attributeNames` picks the attributes in `currentStates` and context lines; the default set is switch, level, motion, contact, presence, lock, temperature, humidity, illuminance, battery, power, energy, thermostatMode, thermostatOperatingState, heatingSetpoint, coolingSetpoint, speed, position, valve, water and smoke. An explicit set that matches nothing in context returns `attributeNamesMatchedNoAttributes: true`.
+**Projection.** `fields` (format summary or detailed only) picks record fields (`id` always kept): id, label, name, driver, room, roomId, disabled, deviceNetworkId, lastActivity, protocol, parentDeviceId, mcpManaged, linked, tags, notes, source, currentStates, capabilities, attributes, commands, orphan (its parent device is gone), user (user-installed driver), defaultCurrentState, meshEnabled (shared over Hub Mesh), homekit (exposed to HomeKit; false while the HomeKit integration is off), showOnHome, dashboardTypes, defaultIcon, remoteDeviceUrl (a linked device's page on its source hub), buttonCount (button devices only; 1 when the driver reports no numberOfButtons). With `scope='all'`, `fields` takes identity fields only (the refusal lists them). `attributeNames` (format summary or context only) picks the attributes in `currentStates` and context lines; the default set is switch, level, motion, contact, presence, lock, temperature, humidity, illuminance, battery, power, energy, thermostatMode, thermostatOperatingState, heatingSetpoint, coolingSetpoint, speed, position, valve, water and smoke. An explicit set that matches nothing in context returns `attributeNamesMatchedNoAttributes: true`.
 
 **format='ids'** returns `{deviceIds, count, total}`. **format='context'** returns `summary`: `Mode:`, `HSM:` when available, `Devices: N of M` (with the next cursor when more remain), then `- Label (id, room) - Cap1, Cap2; attr=value` lines; it pages at 50 unless `limit` is set. A cursor past the end (the result shrank between pages) returns an empty last page.
 
+**deviceIds** keeps only those devices (string or integer ids), applied with the other filters before paging. Ids outside the scope come back in `deviceIdsNotFound`; duplicates are refused.
+
+**waitFor** (needs `deviceIds`, 1 to 20; not with a cursor or `scope='all'`) takes hub_get_device's waitFor keys plus `mode`: `all` (default) converges when every listed device matches, `any` on the first. An id outside the scope is refused before waiting. Each check reads the Devices page once for all of them (string values, no units). The listing comes from the last check, plus a `waitFor` block `{attribute, expected, mode, converged, convergedCount, elapsedMs, polledCount, devices: [{deviceId, finalValue, matched}]}`; `readError`, `neverReported` and `nonNumericAttribute` are per device. Use it to confirm a hub_call_device_command `commands` batch: one call to fire, one to confirm.
+
 ### hub_get_device
 
-Use when you need a single device's complete profile — e.g. to discover which commands it supports and which attributes it has reported before calling hub_call_device_command or hub_get_device_attribute. Attributes are reported current states only (details mode says so via `attributeCoverage`): an attribute the driver declares but has never set is absent, not unsupported. For a multi-device listing use hub_list_devices instead.
+Use when you need a single device's complete profile — e.g. to discover which commands it supports and which attributes it has reported before calling hub_call_device_command. Attributes are reported current states only (details mode says so via `attributeCoverage`): an attribute the driver declares but has never set is absent, not unsupported. For a multi-device listing use hub_list_devices instead.
 
 Only query devices the user has mentioned or that are relevant to their request. Do not probe random devices.
 
-### hub_get_device_attribute
+To read one attribute, take it from `attributes[]` by name; an absent entry means the driver never reported it.
 
-Get a device attribute's current value, or block-poll until it reaches an expected value. Polls one device, or several at once via deviceIds.
-
-One-shot read by default (deviceId + attribute). Provide expectedValue and/or expectedValues to block-poll until currentValue matches, returning immediately on match or when timeoutMs elapses. A credential-named attribute (lockCodes, a PIN or code) reads as the redaction marker while Hide passwords and credentials is on, and a poll or `hub_call_device_command` `waitFor` on one is refused, since a match would confirm a guess.
-
-A single round-trip that replaces N client-side reads + sleeps (verify a command took effect, wait for a sensor threshold, detect Z-Wave inclusion finished). comparator controls the match: eq (default, in-set), ne (not in-set), gt/gte/lt/lte (numeric threshold via expectedValue), between (numeric inclusive range via expectedValues [low, high]). stableForMs requires the condition to hold continuously for that many ms before converging (debounce). For MULTI-DEVICE convergence pass deviceIds (a list, mutually exclusive with deviceId, max 20) instead of deviceId: the same condition is applied to every device and mode controls the aggregate -- "all" (default) converges when every device matches, "any" on the first to match; the result is a compact per-device array (not full device objects) plus convergedCount. Poll mode BLOCKS up to timeoutMs (default 5000ms, max 60000ms) and queues concurrent MCP requests; prefer event-driven flows where possible. First read fires immediately; subsequent reads are spaced by pollIntervalMs.
-
-Only query devices the user has mentioned or that are relevant to their request.
-
-**Parameters:**
-
-- **deviceId** (Device ID from hub_list_devices): Required for single-device mode; omit when using deviceIds. Provide exactly ONE of deviceId or deviceIds, not both.
-- **deviceIds** (multi-device poll): Mutually exclusive with deviceId. The same condition (attribute + comparator + expectedValue(s) + stableForMs) is applied to every device; mode controls the aggregate (any/all). Max 20 devices, no duplicates. The result is a compact per-device array (deviceId/device/finalValue/matched, plus per-device neverReported/nonNumericAttribute on timeout) plus convergedCount -- not full device objects.
-- **mode** (multi-device aggregate): Used with deviceIds. all (default) converges when EVERY device matches; any on the first to match. Rejected if passed with a single deviceId. Also drives stableForMs (the whole any/all condition must hold for the window).
-- **attribute** (attribute name): The same attribute is read on every device in multi-device mode.
-- **expectedValue**: For eq/ne it is one of the in-set values; for gt/gte/lt/lte it is the single numeric threshold (e.g. "72"). Provide exactly ONE of expectedValue or expectedValues, not both.
-- **expectedValues**: For eq/ne it is the value set (OR semantics -- match any member); for between it is exactly two numeric bounds [low, high]. Provide exactly ONE of expectedValue or expectedValues, not both.
-- **comparator** (default eq, value in the expected set): ne = NOT in the set. gt/gte/lt/lte = numeric compare against expectedValue. between = numeric inclusive low<=value<=high from expectedValues (exactly 2). Numeric comparators never match a null/non-numeric value (keep polling).
-- **stableForMs** (debounce, default 0 = first match): Must be < timeoutMs. A value that flaps out of the condition restarts the window.
-- **pollIntervalMs** (poll mode re-check interval, default 200): the TARGET cadence. Every tick costs one native read per device, and that latency is subtracted from the sleep so fast reads keep the requested spacing; the sleep never drops below half the interval, so slow reads (or many devices) space ticks by the reads plus that floor rather than saturating the hub. (hub_call_device_command's waitFor defaults to 250 instead: a post-command poll follows a write, so wider spacing reduces read contention.)
-- **Poll result:** on convergence, `success: true, finalValue, elapsedMs, polledCount, timedOut: false`. On timeout, `success: false, timedOut: true` with the last `finalValue` and `transitioning` (value still changing), plus `neverReported: true` (no non-null value all window) or `nonNumericAttribute: true` with a `note` (numeric comparator on a non-numeric value). `readError: true` (success or timeout) means a read threw on some tick, e.g. the device was removed, and that tick counted as unread. A hub reload mid-poll returns `interrupted: true`. Multi-device results carry these per device, with `transitioning`/`note` at the top level on timeout.
-- `ne` never matches a null or never-reported value. Any poll argument (comparator, stableForMs, timeoutMs, pollIntervalMs, deviceIds, mode) switches to poll mode, which then requires expectedValue or expectedValues.
+**waitFor** (summary mode only) blocks until an attribute matches, then returns the summary from the last check plus a `waitFor` block `{attribute, expected, converged, finalValue, elapsedMs, polledCount}`. One call replaces client-side read-and-sleep loops: confirm a command took effect, wait for a sensor threshold, detect that Z-Wave inclusion finished. Each check reads the device once; the first check is the summary read itself.
+- Keys: `attribute` plus exactly one of `expectedValue` / `expectedValues`. `comparator`: eq (default, value in the set), ne (a non-null value not in the set), gt/gte/lt/lte (numeric threshold in `expectedValue`), between (inclusive `[low, high]` in `expectedValues`); a numeric comparator never matches a null or non-numeric value. `stableForMs` (default 0, below timeoutMs): the match must hold that long, and a value that leaves the condition restarts the window. `timeoutMs` 100-60000 (default 5000). `pollIntervalMs` 50-5000 (default 200, clamped to timeoutMs) is the target cadence: each check's read time comes off the sleep, down to half the interval. Unknown keys are refused.
+- A wait that does not converge is not an error: `converged: false`, `timedOut: true`, the last `finalValue` and `transitioning` (the value was still changing). `neverReported: true` means no value all window (often a misspelled attribute); `nonNumericAttribute: true` with a `note` means a numeric comparator met a non-numeric value. `readError: true` means a read failed on some check, which counted as no value; `interrupted: true` means the hub reloaded mid-wait.
+- On the cloud relay, or with a LAN time budget set, the wait ends by the request deadline: `budgetLimited: true` with `budgetNote`, `requestedTimeoutMs` and `timeoutMs`; wait again in a new call. A `stableForMs` that cannot settle in the time left is refused.
+- The wait BLOCKS the request and queues concurrent MCP calls; keep timeoutMs tight. A credential-named attribute (lockCodes, a PIN or code) reads as the redaction marker while Hide passwords and credentials is on, and a wait on one is refused, since a match would confirm a guess.
 
 ### hub_list_device_events
 - Higher limits (50+) may slow the hub; default limit applies otherwise.
@@ -36315,26 +36077,29 @@ Read the current mesh variable state (shared/linked/available lists) with `hub_g
     ,
         dashboards: '''## Dashboards
 
-Reference for the dashboard tools (hub_list_dashboards, hub_get_dashboard, hub_create_dashboard, hub_update_dashboard, hub_delete_dashboard, hub_clone_dashboard). These cover TWO kinds of dashboard, distinguished by the `type` field every tool reports:
+Reference for the dashboard tools (hub_list_dashboards, hub_get_dashboard, hub_create_dashboard, hub_update_dashboard, hub_delete_dashboard). The single-dashboard tools take `dashboardId`: an entry's `id` from `hub_list_dashboards`. They cover TWO kinds of dashboard, distinguished by the `type` field every tool reports:
 
 - **Easy Dashboard** (`type: "easy"`) — the modern touch-friendly device dashboard: a device list plus tile toggles, navigation, theme, and optional PINs. Config is replaced wholesale.
 - **Legacy Hubitat® Dashboard** (`type: "legacy"`) — the classic, richly-customizable dashboard app: an explicit tile grid you lay out yourself (each tile's position, size, template, plus grid colors and fonts). Edited via a full layout replace or granular tile ops.
 
-Per-tool details below.
-
 ### hub_list_dashboards
 
-Read-only; each entry carries id, name, and `type` ('easy' or 'legacy'). Easy entries also include tile/theme config.
+Read-only; each entry carries `id`, `name`, and `type`. Easy entries also carry their tile/theme config and `localOnly`; legacy entries add only `deviceIds`. A list built from the dashboard parents' child apps (when the hub's own list is unreadable) carries id + name + type only; `partial: true` marks a list that may be missing dashboards. With `cursor` (page size 50) the result also carries `total`, the whole list's size; `count` is the page's.
 
 ### hub_get_dashboard
 
-Read-only. For an Easy Dashboard: tiles, navigation, devices, and PINs (read `***redacted (password)***` while Hide passwords and credentials is on; passing that back to `hub_update_dashboard` keeps the stored PIN). For a legacy dashboard: its authorized `deviceIds` plus a nested `layout` object (see "Legacy layout shape" below). Read before the wholesale `hub_update_dashboard` and pass its output straight back. A read that partly fails returns `partial: true` with a note — the missing fields are unavailable, not defaulted.
+Read-only. For an Easy Dashboard: tiles, navigation, theme, devices, PINs, and `localOnly`. For a legacy dashboard: its authorized `deviceIds` plus a nested `layout` object (see "Legacy layout shape" below). This is the read `hub_update_dashboard` takes back: `name` and `deviceIds` go top level, and an Easy dashboard's config fields (tile toggles, `navigationSelection`, `theme`, PINs, `localOnly`) go inside `options`; sent top level they are refused as unknown arguments.
+
+- PINs read `***redacted (password)***` while Hide passwords and credentials is on; passing that back to `hub_update_dashboard` keeps the stored PIN.\n- When the dashboard list is unreadable, an Easy Dashboard is read from its app config, which carries no `theme`; the result says so in its `note`. Pass the known theme in `options` before updating, or it reverts to `legacy`. A legacy read whose device list can't be read returns `partial: true` with the layout and no `deviceIds`.
+- A read that partly fails returns `partial: true` with a note — the missing fields are unavailable, not defaulted.
 
 ### hub_create_dashboard
 
 Write op. `type` selects the kind: `easy` (default) or `legacy`.
 
-- **Easy** — needs >=1 device. Tiles default off; theme defaults to `legacy` (the theme name, unrelated to the dashboard kind).
+**Pre-flight:** 1) verify the `deviceIds` exist with `hub_list_devices` (for a copy, verify `sourceId` with `hub_list_dashboards`); 2) tell the user what will be created.
+
+- **Easy** — needs >=1 device. The tile toggles (`showModeTile`, `showClockTile`, `showCalendarTile`, `showHSMTile`, `showTutorial`) default off; `showEdit` and `showNavigation` default on, the hub's own default; theme defaults to `legacy` (the theme name, unrelated to the dashboard kind). The hub's create turns `showEdit` and `showNavigation` on whatever it is sent, so when either is set to `false` the create is followed by an update that turns it off; the result lists them in `offAfterCreate`. If that update fails, the result is still `success: true` with the new `id` and a warning naming the two settings; set them with `hub_update_dashboard`.
 
   **`options` (optional config object):**
   - `showModeTile`, `showClockTile`, `showCalendarTile`, `showHSMTile` (bool)
@@ -36343,48 +36108,54 @@ Write op. `type` selects the kind: `easy` (default) or `legacy`.
   - `theme` — one of `legacy` | `light` | `dark` | `auto`
   - `dashboardPin`
   - `hsmPin`
-- **Legacy** (`type: "legacy"`) — creates the dashboard with an EMPTY layout (no tiles). `name` is required; `deviceIds` is OPTIONAL and sets the dashboard's authorized-device list (NOT tiles). The `options` arg is REJECTED (Easy-only) — a legacy dashboard's look lives in its layout, set via `hub_update_dashboard` after creation. Requires the built-in "Hubitat® Dashboard" app to be installed.
+  - `localOnly` (bool) — the "Local access only" setting; left as the hub's default when omitted on create
+- **Legacy** (`type: "legacy"`) — creates the dashboard with an EMPTY layout (no tiles). `name` is required; `deviceIds` is OPTIONAL and sets the dashboard's authorized-device list (NOT tiles). The `options` arg is REJECTED (Easy-only) — a legacy dashboard's look lives in its layout, set via `hub_update_dashboard` after creation. Requires the built-in "Hubitat® Dashboard" app (installed automatically through Add Built-In App when missing).
+- **MCP device selection:** while Bypass Device Allowlist is off, every id in `deviceIds` must be a device selected in the MCP app's device list (or a device this app created); otherwise the call is refused before anything is written, naming the ids. A copy is checked the same way against the source's devices. Select the devices, or turn on Bypass Device Allowlist.
+- **Copy** (`sourceId`) — copies an existing dashboard by value; the source is never touched. An Easy copy takes the source's devices and config (PINs and `localOnly` included; `showEdit` / `showNavigation` that are off are set by the follow-up update described above, and take the default when the source's value can't be read); when the hub's dashboard list is unreadable the source's theme can't be read, so the copy gets the default theme and the result carries a warning. A legacy copy is a new legacy dashboard with the same authorized devices, then the source's layout saved into it. Only `name` may accompany `sourceId` (default `"<source name> (copy)"`); `type`, `deviceIds` and `options` are rejected — change the copy afterwards with `hub_update_dashboard`. The result carries the new `id` and the `sourceId`; a legacy copy whose layout could not be written returns `success: false` with the new `id`, so the layout can be re-applied.
 
 ### hub_update_dashboard
 
 Update by id; the behavior depends on the dashboard's kind.
 
+**Pre-flight:** 1) read the dashboard with `hub_get_dashboard` to confirm the target id and its current config (an Easy update is wholesale); 2) tell the user what will change.
+
 **Easy Dashboard** — wholesale config replace:
-- **Read `hub_get_dashboard` first** and pass the FULL config back; this is a wholesale replace, not a partial patch. `name` and `deviceIds` (>=1) are required; any omitted field (PINs included) reverts to its default.
-- `options`: same keys as `hub_create_dashboard.options`.
+- **Read `hub_get_dashboard` first** and pass the FULL config back; this is a wholesale replace, not a partial patch. `name` and `deviceIds` (>=1) are required; any omitted field reverts to its default (see `hub_create_dashboard`), except an omitted PIN or `localOnly`, which is read and re-sent (the result flags `pinPreserveFailed` / `localOnlyPreserveFailed` when it could not be read). Pass `dashboardPin: ""` or `hsmPin: ""` to clear a PIN.
+- `options`: same keys as `hub_create_dashboard.options`. Every config field goes inside `options`; only `name` and `deviceIds` are top level.
 - Passing any legacy-only arg (`layout`, `setOptions`, `addTiles`, `updateTiles`, `removeTileIds`) at an Easy Dashboard is rejected.
 
 **Legacy Hubitat® Dashboard** — edit the label, devices, and/or layout:
 - `name` — renames the dashboard's app label.
 - `deviceIds` — wholesale-replaces the authorized-device list.
 - Layout edits are EITHER `layout` OR the granular ops, never both:
-  - `layout` — a full layout object (as returned by `hub_get_dashboard`), replaced wholesale.
+  - `layout` — the whole layout object `hub_get_dashboard` returns, edited, and replaced wholesale. Send every top-level field: the hub refuses a partial object such as `{cols, rows, tiles}` (HTTP 500).
   - Granular ops — `removeTileIds`, `updateTiles`, `addTiles`, `setOptions`. They apply in that fixed order in ONE save: removals → updates → adds → options. All validation runs before the save, so a bad op leaves the layout untouched.
 - Retry-safe semantics: `removeTileIds` skips an id that is already gone (with a warning), and `addTiles` skips a tile identical to an existing one (with a warning), so a retried call cannot stack duplicates. An `updateTiles` entry for an unknown tile id throws.
 - The `options` arg does NOT apply to legacy — pass grid/color/font fields via `setOptions` instead.
 - Result: `applied` (the ops that ran), `tileCount`, the saved `layout` echo, and any `warnings`.
 
+**Both kinds:**
+- An id that is not a dashboard (another app's id) is refused before any write with the same "No dashboard found" result `hub_get_dashboard` gives; `hub_delete_dashboard` refuses it the same way.
+- **MCP device selection:** while Bypass Device Allowlist is off, only the devices whose membership changes (added to or dropped from `deviceIds`) are checked: each must be selected in the MCP app's device list (or created by this app), or the call is refused before anything is written. An id `hub_get_dashboard` returns stays in the list you send, so a rename, or a re-send that keeps an unselected device, still works. When the current device list cannot be read, the update is refused with `success: false` and nothing is changed.
+- **One at a time:** send dashboard updates one at a time. An update reads the dashboard and then saves it, so a change made on the hub's Dashboards page between the read and the save is overwritten.
+
 **Legacy layout shape:**
 - Top-level fields: `cols`, `rows`, `colWidth`, `rowHeight`, `gridGap`, `bgColor`, `iconSize`, `fontSize`, `customColors`, `roundedCorners`, `hideLabels`, and `tiles`. `setOptions` merges any of the top-level fields (the `tiles` and `name` keys are rejected there).
-- Each tile: `id` (integer, auto-assigned max+1 on add), `template`, `device` (a device id), `col`, `row` (1-indexed, top-left cell is col 1 / row 1), `colSpan`, `rowSpan` (default 1), and optional `templateExtra`. `addTiles` requires `template`, `col`, and `row`.
+- Each tile: `id` (integer, auto-assigned on add: one above the highest existing id, 0 on an empty layout), `template`, `device` (a device id), `col`, `row` (1-indexed, top-left cell is col 1 / row 1), `colSpan`, `rowSpan` (default 1), and the optional keys the hub's tile editor saves: `templateExtra`, `globalVar` (the hub variable a `global-variable` tile shows), `linkName` (a `links` tile's caption), `bgImage`, `hideUnit`, `refreshInterval`. `addTiles` requires `template`, `col`, and `row`; an `addTiles`/`updateTiles` key outside this list is rejected.
 - **Device authorization:** a tile's `device` must be in the dashboard's authorized `deviceIds` or the tile renders empty. Adds/updates referencing an unauthorized device still apply but surface a warning; authorize it via `deviceIds`.
-- Tile `template` names: acceleration, attribute, battery, bulb, bulb-color, buttons, carbon-dioxide, carbon-monoxide, clock, clock-analog, clock-date, contact, dashboard, date, dimmer, door, door-control, energy, fan, garage, garage-control, generic, hsm, humidity, illuminance, images, level-step, level-vertical, links, lock, mode, momentary, motion, multi, music-player, outlet, power, presence, relay, scene, shades, shock, smoke, switches, temperature, texttile, thermostat, valve, variable-bool, variable-date, variable-decimal, variable-number, variable-string, variable-time, video-player, volume, water, weather, window.
-- **localAccess caveat:** a legacy dashboard with 'Allow LAN access' disabled can block its layout endpoint; reads/writes then report the layout as unavailable and note the LAN-access setting.
+- Tile `template` names: acceleration, attribute, battery, bulb, bulb-color, buttons, carbon-dioxide, carbon-monoxide, clock, clock-analog, clock-date, contact, dashboard, date, dimmer, door, door-control, energy, fan, garage, garage-control, generic, global-variable, hsm, humidity, illuminance, images, level-step, level-vertical, links, lock, mode, momentary, motion, multi, music-player, outlet, power, presence, relay, scene, shades, shock, smoke, switches, temperature, texttile, thermostat, valve, variable-bool, variable-date, variable-decimal, variable-number, variable-string, variable-time, video-player, volume, water, weather, window.
+- **localAccess caveat:** a legacy dashboard with 'Allow LAN access' disabled can block its layout endpoint; reads, granular edits and wholesale saves then report the layout as unavailable or not saved and mention the LAN-access setting.
 
 ### hub_delete_dashboard
 
 Devices are NOT deleted. Write op; needs `confirm=true` + a backup within 24h.
 
+**Pre-flight:** 1) verify the id with `hub_list_dashboards` / `hub_get_dashboard`; 2) a hub backup within 24h; 3) explicit user approval naming the dashboard; 4) `confirm=true`.
+
 - `confirm` (param) — Confirms a recent backup + user approval.
-- A legacy dashboard is removed through the classic force-delete (the Easy `/dashboard/delete` endpoint is a no-op for it); removal is confirmed by effect and the result carries its `type`.
-- If the protected-app inventory check confirms the target is already absent, returns `success: true, alreadyAbsent: true` without a delete. This also covers an ID that never existed; it does not prove a previous call deleted it.
-
-### hub_clone_dashboard
-
-Write op; clone-by-value (the source is never touched).
-
-- **Easy** — copies the source's config into a new dashboard (theme may default).
-- **Legacy** — creates a new legacy dashboard with the same authorized devices, then copies the source's layout into it wholesale.
+- A legacy dashboard is removed through the classic force-delete (the Easy `/dashboard/delete` endpoint is a no-op for it); the result carries its `type`.
+- Removal is confirmed by effect; when it cannot be confirmed the result says so instead of claiming success.
+- When the target is already absent (from the protected-app inventory check or the dashboard's own status), returns `success: true, alreadyAbsent: true` without a delete. This also covers an ID that never existed; it does not prove a previous call deleted it.
 '''
     ,
         bundles: '''## Bundles
