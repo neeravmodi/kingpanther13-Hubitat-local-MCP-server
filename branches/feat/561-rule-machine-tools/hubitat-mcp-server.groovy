@@ -4,7 +4,7 @@
  * A native MCP (Model Context Protocol) server that runs directly on Hubitat
  * with a built-in custom rule engine for creating automations via Claude.
  *
- * Version: 5.2.0 - Enriched list_devices summary + server-side filter (disabled, enabled, stale:N)
+ * Version: 5.2.1 - Enriched list_devices summary + server-side filter (disabled, enabled, stale:N)
  *
  * Installation:
  * 1. Go to Hubitat > Apps Code > New App
@@ -3744,12 +3744,66 @@ def _toolDisplayMeta_partVisualRules() {
 private String _filesFoldCase(value) {
     return value?.toString()?.tr('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
 }
-private List _filesApplyListFilters(List fileList, String filterLower) {
-    def out = fileList
-    if (filterLower) {
-        out = out.findAll { _filesFoldCase(it?.name)?.contains(filterLower) }
+private String _filesDownloadUrl(String name) {
+    String hubIp = null
+    try { hubIp = location?.hub?.localIP?.toString() } catch (Exception ignored) {   }
+    return "http://${hubIp ?: '<HUB_IP>'}/local/${name}".toString()
+}
+@groovy.transform.Field static final String FILES_GUIDE_POINTER = "See hub_get_tool_guide(section='file_manager')."
+@groovy.transform.Field static final String FILES_KIND_UNKNOWN = "unknown"
+private void _filesRequireRootName(String fileName, String toolName) {
+    if (fileName.contains("/")) {
+        String folder = fileName.substring(0, fileName.lastIndexOf('/'))
+        String rootOnly = "'${fileName}' names a file in a subfolder; ${toolName} acts on root files only."
+        throw new IllegalArgumentException(toolName == "hub_write_file"
+            ? "'${fileName}' names a file in a subfolder. hub_write_file writes root files only; it cannot write into a subfolder.".toString()
+            : _filesValidFolder(folder)
+                ? "${rootOnly} List the folder with hub_list_files(folder: '${folder}'); its files download from that listing's downloadUrlBase.".toString()
+                : rootOnly)
     }
-    return out
+    if (!(fileName ==~ /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/)) {
+        throw new IllegalArgumentException("Invalid file name '${fileName}'. Only letters, numbers, hyphens, underscores and periods; cannot start with a period.")
+    }
+}
+private boolean _filesValidFolder(String folder) {
+    return folder ==~ /[A-Za-z0-9_\/-]+/ && !folder.split("/").any { it == "" }
+}
+private boolean _filesDownloadMissing(Exception e) {
+    return e.class.simpleName == "NoSuchFileException"
+}
+private String _filesRootEntryKind(String name) {
+    try {
+        def entry = _fileManagerRootEntries().find { it.name == name }
+        return entry == null ? null : (entry.type == "dir" ? "dir" : "file")
+    } catch (Exception e) {
+        mcpLog("warn", "file-manager", "Could not list File Manager to check '${name}': ${e.message}")
+        return FILES_KIND_UNKNOWN
+    }
+}
+private Map _filesFolderResult(String name) {
+    return [success: false, fileName: name, error: "'${name}' is a folder, not a file.",
+            note: "List it with hub_list_files(folder: '${name}'). ${FILES_GUIDE_POINTER}".toString()]
+}
+private Map _filesMissing(String fileName, String error, String extraNote = null) {
+    return [success: false, fileName: fileName, error: error,
+            note: "Use hub_list_files (filter narrows it) to find the exact file name.${extraNote ? ' ' + extraNote : ''} ${FILES_GUIDE_POINTER}".toString()]
+}
+private int _filesIntArg(Map args, String key, int defaultValue, int min, int max) {
+    def v = args?.get(key)
+    if (v == null) return defaultValue
+    String t = (v instanceof Number || v instanceof CharSequence) ? v.toString().trim() : ""
+    String outOfRange = "${key} must be an integer from ${min} to ${max}; got ${v}."
+    if (v instanceof Number && !t.isLong() && t.isBigDecimal()) {
+        BigDecimal d = new BigDecimal(t)
+        if (d.compareTo(new BigDecimal(min)) < 0 || d.compareTo(new BigDecimal(max)) > 0) {
+            throw new IllegalArgumentException(outOfRange)
+        }
+        if (d.signum() == 0 || d.stripTrailingZeros().scale() <= 0) t = d.toBigInteger().toString()
+    }
+    if (!t.isLong() || t.toLong() < min || t.toLong() > max) {
+        throw new IllegalArgumentException(outOfRange)
+    }
+    return t.toInteger()
 }
 private List _filesBackupNameParts(String fileName) {
     int dotIndex = fileName.lastIndexOf('.')
@@ -3805,274 +3859,255 @@ def toolListFiles(args = null) {
     if (args?.filter != null && !(args.filter instanceof CharSequence)) {
         throw new IllegalArgumentException("filter must be a string (a case-insensitive substring of the file name), not ${args.filter instanceof Number ? 'a number' : args.filter instanceof Map ? 'an object' : args.filter instanceof List ? 'an array' : 'a non-string value'}")
     }
-    mcpLog("debug", "file-manager", "Listing files in File Manager")
     def cursor = args?.cursor
-    def filterText = args?.filter?.toString()?.trim()
-    def filterLower = _filesFoldCase(filterText)
+    def filterLower = _filesFoldCase(args?.filter?.toString()?.trim())
     def folder = args?.folder?.toString()?.trim()?.replaceAll(/^\/+|\/+$/, "")
-    if (folder && (!(folder ==~ /[A-Za-z0-9_.\/ -]+/) || folder.split("/").any { it == ".." || it == "." || it == "" })) {
-        throw new IllegalArgumentException("folder must be a relative File Manager folder path such as 'webcore' (letters, digits, space, dot, underscore, hyphen, '/' between parts; no '..').")
+    if (folder && !_filesValidFolder(folder)) {
+        throw new IllegalArgumentException("folder must be a relative File Manager folder path such as 'webcore' (letters, digits, underscore and hyphen, '/' between parts; no spaces or dots).")
     }
-    if (folder && _hubFirmwareBefore("2.5.2")) throw new IllegalArgumentException("folder needs firmware 2.5.2 or later; older File Manager has no subfolders.")
-    def endpoints = folder ? ["/hub/fileManager/json"] : ["/hub/fileManager/json", "/hub/fileManager"]
-    def responseText = null
-    def endpointUsed = null
-    for (endpoint in endpoints) {
-        try {
-            responseText = hubInternalGet(endpoint, folder ? [folder: folder] : null)
-            if (responseText) {
-                endpointUsed = endpoint
-                mcpLog("debug", "file-manager", "Got response from ${endpoint} (${responseText.length()} chars): ${responseText.take(300)}")
-                break
-            }
-        } catch (Exception e) {
-            mcpLog("debug", "file-manager", "Endpoint ${endpoint} failed: ${e.message}")
-        }
+    Map listing
+    try { listing = _fileManagerListing(folder ?: null) }
+    catch (Exception e) {
+        mcpLogError("file-manager", "File Manager listing failed${folder ? " for folder '${folder}'" : ''}", e)
+        return [success: false, error: "Could not list File Manager: ${e.message}",
+                note: "Nothing was changed. Retry in a moment; if it keeps failing, check Settings > File Manager in the hub web UI. ${FILES_GUIDE_POINTER}".toString()]
     }
-    if (!responseText) {
-        return [
-            files: [],
-            total: 0,
-            message: "File Manager API not available on this firmware. Use Hubitat > Settings > File Manager to view files.",
-            manualAccess: "Go to Hubitat > Settings > File Manager to view files in the web UI."
-        ]
-    }
-    try {
-        def parsed = new groovy.json.JsonSlurper().parseText(responseText)
-        def fileList = []
-        String prefix = folder ? "${folder}/" : ""
-        if (parsed instanceof List) {
-            fileList = parsed.collect { f ->
-                def name = (f instanceof Map) ? (f.name ?: f.toString()) : f.toString()
-                def entry = [name: name, directDownload: "http://<HUB_IP>/local/${prefix}${name}"]
-                if (f instanceof Map) {
-                    if (f.size != null) entry.size = f.size
-                    if (f.date) entry.lastModified = f.date
-                }
-                return entry
-            }
-        } else if (parsed instanceof Map) {
-            def files = parsed.containsKey("files") ? parsed.get("files") : parsed.values()?.flatten()
-            if (files instanceof List) {
-                fileList = files.collect { f ->
-                    def name = (f instanceof Map) ? (f.name ?: f.toString()) : f.toString()
-                    def entry = [name: name]
-                    if (f instanceof Map) {
-                        if (f.type) entry.type = f.type
-                        if (f.type != "dir") entry.directDownload = "http://<HUB_IP>/local/${prefix}${name}"
-                        if (f.size != null && f.type != "dir") entry.size = f.size
-                        if (f.date) entry.lastModified = f.date
-                        if (f.backupIncluded != null) entry.backupIncluded = f.backupIncluded
-                    } else {
-                        entry.directDownload = "http://<HUB_IP>/local/${prefix}${name}"
-                    }
-                    return entry
-                }
-            }
-        }
-        fileList = fileList.sort { a, b -> (a.name <=> b.name) }
-        if (fileList.isEmpty() && parsed && !(parsed instanceof Map && parsed.containsKey("files"))) {
-            def shapeHint = (parsed instanceof Map) ? "Map with keys=${parsed.keySet()?.take(10)?.toList()}" :
-                            (parsed instanceof List) ? "empty List" : _typeName(parsed)
-            mcpLog("warn", "file-manager", "hub_list_files: parsed response yielded zero files (${shapeHint}) -- shape may not be recognized", null, [details: [endpoint: endpointUsed, shape: shapeHint]])
-        }
-        fileList = _filesApplyListFilters(fileList, filterLower)
-        mcpLog("info", "file-manager", "Listed ${fileList.size()}${filterLower ? ' matching' : ''} files in File Manager (via ${endpointUsed})")
-        def pagedFM = _paginateList(fileList, cursor, 100, "hub_list_files")
-        def res = [
-            files: pagedFM.page,
-            total: fileList.size(),
-            storage: "Files are stored locally on the hub's file system. Access via http://<HUB_IP>/local/<filename> or Hubitat > Settings > File Manager."
-        ]
-        if (folder) res.folder = folder
-        if (folder && fileList.isEmpty() && !filterLower) res.note = "Folder '${folder}' is empty or does not exist; the root listing shows the folders as type:'dir'."
-        if (parsed instanceof Map) {
-            if (parsed.freeSpace != null) res.freeSpaceBytes = parsed.freeSpace
-            if (parsed.backupSelection instanceof Map && parsed.backupSelection.excludedFiles != null) res.filesExcludedFromFullBackup = parsed.backupSelection.excludedFiles
-        }
-        if (cursor != null && pagedFM.nextCursor != null) res.nextCursor = pagedFM.nextCursor
-        return res
-    } catch (Exception jsonErr) {
-        mcpLog("debug", "file-manager", "Response from ${endpointUsed} was not JSON: ${jsonErr.message}")
-        def fileList = []
-        try {
-            def matcher = responseText =~ /(?i)href=["']?\/local\/([^"'\s>]+)/
-            while (matcher.find()) {
-                def name = java.net.URLDecoder.decode(matcher.group(1), "UTF-8")
-                if (!fileList.any { it.name == name }) {
-                    fileList << [name: name, directDownload: "http://<HUB_IP>/local/${name}"]
-                }
-            }
-        } catch (Exception htmlErr) {
-            mcpLog("debug", "file-manager", "HTML parsing also failed: ${htmlErr.message}")
-        }
-        if (fileList) {
-            fileList = fileList.sort { a, b -> (a.name <=> b.name) }
-            fileList = _filesApplyListFilters(fileList, filterLower)
-            mcpLog("info", "file-manager", "Listed ${fileList.size()}${filterLower ? ' matching' : ''} files from File Manager HTML page")
-            def pagedHtml = _paginateList(fileList, cursor, 100, "hub_list_files")
-            def res = [
-                files: pagedHtml.page,
-                total: fileList.size(),
-                note: "File list extracted from File Manager HTML page. Sizes not available. Use Hubitat > Settings > File Manager for full details.",
-                storage: "Files are stored locally on the hub's file system. Access via http://<HUB_IP>/local/<filename> or Hubitat > Settings > File Manager."
-            ]
-            if (cursor != null && pagedHtml.nextCursor != null) res.nextCursor = pagedHtml.nextCursor
-            return res
-        }
-        return [
-            files: [],
-            total: 0,
-            error: "Could not parse File Manager response. The API format may have changed.",
-            rawResponsePreview: responseText.take(500),
-            manualAccess: "Go to Hubitat > Settings > File Manager to view files in the web UI."
-        ]
-    }
+    List fileList = listing.files.collect { f ->
+        Map entry = [name: f.name]
+        if (f.type) entry.type = f.type
+        if (f.size != null && f.type != "dir") entry.size = f.size
+        if (f.date != null) entry.lastModified = f.date
+        if (f.backupIncluded != null) entry.backupIncluded = f.backupIncluded
+        return entry
+    }.sort { a, b -> a.name <=> b.name }
+    if (filterLower) fileList = fileList.findAll { _filesFoldCase(it.name).contains(filterLower) }
+    mcpLog("info", "file-manager", "Listed ${fileList.size()}${filterLower ? ' matching' : ''} files in File Manager")
+    def paged = _paginateList(fileList, cursor, 100, "hub_list_files")
+    def res = [files: paged.page, total: fileList.size(), downloadUrlBase: _filesDownloadUrl(folder ? "${folder}/" : "")]
+    if (folder) res.folder = folder
+    if (folder && fileList.isEmpty() && !filterLower) res.note = "Folder '${folder}' is empty or does not exist; the root listing shows the folders as type:'dir'."
+    if (listing.freeSpace != null) res.freeSpaceBytes = listing.freeSpace
+    if (listing.excludedFiles != null) res.filesExcludedFromFullBackup = listing.excludedFiles
+    if (cursor != null && paged.nextCursor != null) res.nextCursor = paged.nextCursor
+    return res
 }
 def toolReadFile(args) {
-    if (!args.fileName) throw new IllegalArgumentException("fileName is required")
-    def maxChunkSize = 60000
-    def requestedOffset = args.offset ? args.offset as int : 0
-    def requestedLength = args.length ? Math.min(args.length as int, maxChunkSize) : defaultReadChunkChars()
-    mcpLog("debug", "file-manager", "Reading file: ${args.fileName} (offset: ${requestedOffset}, length: ${requestedLength})")
+    if (!args.fileName) throw new IllegalArgumentException("fileName is required.")
+    String fileName = args.fileName.toString()
+    _filesRequireRootName(fileName, "hub_read_file")
+    int requestedOffset = _filesIntArg(args, "offset", 0, 0, Integer.MAX_VALUE)
+    int requestedLength = _filesIntArg(args, "length", defaultReadChunkChars() as int, 1, 60000)
+    mcpLog("debug", "file-manager", "Reading file: ${fileName} (offset: ${requestedOffset}, length: ${requestedLength})")
     def content
     try {
-        def bytes = downloadHubFile(args.fileName)
-        if (bytes == null) throw new Exception("File not found in File Manager")
+        def bytes = downloadHubFile(fileName)
+        if (bytes == null) throw new Exception("the hub returned no content")
         content = new String(bytes, "UTF-8")
     } catch (Exception e) {
-        mcpLogError("file-manager", "Failed to read file '${args.fileName}'", e)
+        String kind = _filesDownloadMissing(e) ? null : _filesRootEntryKind(fileName)
+        if (kind == null) {
+            mcpLog("info", "file-manager", "Read of '${fileName}' refused: no such file")
+            return _filesMissing(fileName, "File '${fileName}' does not exist in File Manager.")
+        }
+        if (kind == "dir") return _filesFolderResult(fileName)
+        mcpLogError("file-manager", "Failed to read file '${fileName}'", e)
         return [
             success: false,
-            error: "File '${args.fileName}' could not be read: ${e.message}",
-            suggestion: "Check that the file name is correct. Go to Hubitat > Settings > File Manager to see available files.",
-            directDownload: "http://<HUB_IP>/local/${args.fileName}"
+            fileName: fileName,
+            error: "File '${fileName}' could not be read: ${e.message}",
+            note: "Check the exact name with hub_list_files, or download it from directDownload. ${FILES_GUIDE_POINTER}".toString(),
+            directDownload: _filesDownloadUrl(fileName)
         ]
     }
     def totalLength = content.length()
-    def endIndex = Math.min(requestedOffset + requestedLength, totalLength)
+    long requestedEnd = (long) requestedOffset + requestedLength
+    int endIndex = (int) Math.min(requestedEnd, (long) totalLength)
     def chunk = (requestedOffset < totalLength) ? content.substring(requestedOffset, endIndex) : ""
     def hasMore = endIndex < totalLength
     def result = [
         success: true,
-        fileName: args.fileName,
+        fileName: fileName,
         totalLength: totalLength,
         offset: requestedOffset,
         chunkLength: chunk.length(),
         hasMore: hasMore,
         content: chunk,
-        directDownload: "http://<HUB_IP>/local/${args.fileName}"
+        directDownload: _filesDownloadUrl(fileName)
     ]
     if (hasMore) {
         result.nextOffset = endIndex
         result.remainingChars = totalLength - endIndex
         result.hint = "Call again with offset: ${endIndex} to get the next chunk."
     }
-    mcpLog("info", "file-manager", "Read file '${args.fileName}' (${totalLength} chars total, returned offset ${requestedOffset}..${endIndex}${hasMore ? ', more available' : ''})")
+    mcpLog("info", "file-manager", "Read file '${fileName}' (${totalLength} chars total, returned offset ${requestedOffset}..${endIndex}${hasMore ? ', more available' : ''})")
     return result
 }
 def toolWriteFile(args) {
     requireDestructiveConfirm(args.confirm)
-    if (!args.fileName) throw new IllegalArgumentException("fileName is required")
-    if (args.content == null) throw new IllegalArgumentException("content is required")
-    if (!(args.fileName ==~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/)) {
-        throw new IllegalArgumentException("Invalid file name '${args.fileName}'. Only letters, numbers, hyphens, underscores, and periods are allowed. Cannot start with a period.")
-    }
-    def backedUp = false
-    def backupFileName = null
-    def identicalContent = false
+    if (!args.fileName) throw new IllegalArgumentException("fileName is required.")
+    if (args.content == null) throw new IllegalArgumentException("content is required.")
+    String fileName = args.fileName.toString()
+    _filesRequireRootName(fileName, "hub_write_file")
+    String content = args.content.toString()
     byte[] existingBytes = null
-    try { existingBytes = downloadHubFile(args.fileName) }
-    catch (Exception e) {
-        mcpLog("debug", "file-manager", "No existing file '${args.fileName}' to back up: ${e.message}")
-    }
-    byte[] incomingBytes = args.content.toString().getBytes("UTF-8")
-    if (existingBytes != null && existingBytes.length == incomingBytes.length && (existingBytes as List) == (incomingBytes as List)) {
-        identicalContent = true
-        mcpLog("info", "file-manager", "Existing '${args.fileName}' already matches the incoming content -- skipping backup")
-    } else if (existingBytes != null) {
-        try {
-            backupFileName = _filesWriteBackupCopy(args.fileName.toString(), existingBytes)
-        } catch (Exception e) {
-            mcpLogError("file-manager", "Could not back up existing '${args.fileName}' before overwriting", e)
+    String downloadError = "the hub returned no content"
+    boolean missing = false
+    try { existingBytes = downloadHubFile(fileName) }
+    catch (Exception e) { downloadError = e.message ?: e.class.simpleName; missing = _filesDownloadMissing(e) }
+    if (existingBytes == null) {
+        String kind = missing ? null : _filesRootEntryKind(fileName)
+        if (kind == "dir") return _filesFolderResult(fileName)
+        if (kind != null) {
+            mcpLog("warn", "file-manager", "Write of '${fileName}' refused: its current content could not be read (${downloadError})")
+            String cause = kind == FILES_KIND_UNKNOWN
+                ? "The File Manager listing also failed, so whether '${fileName}' exists is unknown."
+                : "'${fileName}' exists but its content could not be downloaded."
             return [
                 success: false,
-                error: "Could not back up existing '${args.fileName}' before overwriting: ${e.message}",
-                note: "Nothing was written; '${args.fileName}' still holds its previous content. Retry once File Manager accepts writes."
+                fileName: fileName,
+                error: "Could not read the current '${fileName}' to take its backup copy (${downloadError}); nothing was written.".toString(),
+                note: "${cause} Retry once the read recovers, write the content under a new name, or save the current content from directDownload, then upload the new content over the file in Settings > File Manager. ${FILES_GUIDE_POINTER}".toString(),
+                directDownload: _filesDownloadUrl(fileName)
             ]
         }
-        backedUp = true
-        mcpLog("info", "file-manager", "Backed up existing '${args.fileName}' to '${backupFileName}' before overwriting (${existingBytes.length} bytes)")
+        mcpLog("debug", "file-manager", "No existing file '${fileName}' to back up")
+    }
+    byte[] incomingBytes = content.getBytes("UTF-8")
+    if (existingBytes != null && existingBytes.length == incomingBytes.length && (existingBytes as List) == (incomingBytes as List)) {
+        mcpLog("info", "file-manager", "Existing '${fileName}' already matches the incoming content -- nothing written")
+        return [
+            success: true,
+            unchanged: true,
+            message: "File '${fileName}' already holds this exact content; nothing was written.",
+            fileName: fileName,
+            contentLength: content.length(),
+            directDownload: _filesDownloadUrl(fileName)
+        ]
+    }
+    String backupFileName = null
+    if (existingBytes != null) {
+        try {
+            backupFileName = _filesWriteBackupCopy(fileName, existingBytes)
+        } catch (Exception e) {
+            mcpLogError("file-manager", "Could not back up existing '${fileName}' before overwriting", e)
+            return [
+                success: false,
+                fileName: fileName,
+                error: "Could not back up existing '${fileName}' before overwriting: ${e.message}".toString(),
+                note: "Nothing was written; '${fileName}' still holds its previous content. Retry once File Manager accepts writes. ${FILES_GUIDE_POINTER}".toString()
+            ]
+        }
+        mcpLog("info", "file-manager", "Backed up existing '${fileName}' to '${backupFileName}' before overwriting (${existingBytes.length} bytes)")
     }
     try {
-        uploadHubFile(args.fileName, args.content.getBytes("UTF-8"))
-        mcpLog("info", "file-manager", "Wrote file '${args.fileName}' (${args.content.length()} chars)")
+        uploadHubFile(fileName, incomingBytes)
+        mcpLog("info", "file-manager", "Wrote file '${fileName}' (${content.length()} chars)")
         def result = [
             success: true,
-            message: backedUp
-                ? "File '${args.fileName}' updated. Previous version backed up as '${backupFileName}'."
-                : (identicalContent
-                    ? "File '${args.fileName}' already contained this exact content (no backup needed)."
-                    : "File '${args.fileName}' created."),
-            fileName: args.fileName,
-            contentLength: args.content.length(),
-            directDownload: "http://<HUB_IP>/local/${args.fileName}"
+            message: backupFileName
+                ? "File '${fileName}' updated. Previous version backed up as '${backupFileName}'."
+                : "File '${fileName}' created.",
+            fileName: fileName,
+            contentLength: content.length(),
+            directDownload: _filesDownloadUrl(fileName)
         ]
-        if (backedUp) {
+        if (backupFileName) {
             result.backupFile = backupFileName
-            result.backupDownload = "http://<HUB_IP>/local/${backupFileName}"
-            _filesReportCopyRetention(result, args.fileName.toString(), _filesPruneBackupCopies(args.fileName.toString(), backupFileName))
+            result.backupDownload = _filesDownloadUrl(backupFileName)
+            _filesReportCopyRetention(result, fileName, _filesPruneBackupCopies(fileName, backupFileName))
         }
         return result
     } catch (Exception e) {
-        mcpLogError("file-manager", "Failed to write file '${args.fileName}'", e)
+        mcpLogError("file-manager", "Failed to write file '${fileName}'", e)
         return [
             success: false,
-            error: "Failed to write file '${args.fileName}': ${e.message}"
+            fileName: fileName,
+            error: "Failed to write file '${fileName}': ${e.message}",
+            note: backupFileName
+                ? "Its previous content is kept in the backup copy '${backupFileName}'. Read '${fileName}' to see what it holds now before retrying. ${FILES_GUIDE_POINTER}".toString()
+                : "The hub reported the upload failed; check with hub_list_files whether '${fileName}' now exists before retrying. ${FILES_GUIDE_POINTER}".toString()
         ]
     }
 }
 def toolDeleteFile(args) {
     requireDestructiveConfirm(args.confirm)
-    if (!args.fileName) throw new IllegalArgumentException("fileName is required")
-    def isBackupFile = args.fileName.contains("_backup_") || args.fileName.startsWith("mcp-backup-") ||
-        args.fileName.startsWith("mcp-rm-backup-") || args.fileName.startsWith("mcp-prerestore-")
-    def backedUp = false
-    def backupFileName = null
+    if (!args.fileName) throw new IllegalArgumentException("fileName is required.")
+    String fileName = args.fileName.toString()
+    _filesRequireRootName(fileName, "hub_delete_file")
+    String missingError = "File '${fileName}' does not exist in File Manager; nothing was deleted."
+    def isBackupFile = fileName.contains("_backup_") || fileName.startsWith("mcp-backup-") ||
+        fileName.startsWith("mcp-rm-backup-") || fileName.startsWith("mcp-prerestore-")
+    String backupFileName = null
+    boolean existenceUnknown = false
     if (!isBackupFile) {
-        try {
-            def bytes = downloadHubFile(args.fileName)
-            if (bytes == null) throw new Exception("File not found")
-            backupFileName = _filesWriteBackupCopy(args.fileName.toString(), bytes)
-            backedUp = true
-            mcpLog("info", "file-manager", "Backed up '${args.fileName}' to '${backupFileName}' before deletion (${bytes.length} bytes)")
-        } catch (Exception e) {
-            mcpLog("warn", "file-manager", "Could not back up '${args.fileName}' before deletion: ${e.message}")
+        byte[] bytes = null
+        boolean missing = false
+        String downloadError = null
+        try { bytes = downloadHubFile(fileName) }
+        catch (Exception e) {
+            downloadError = e.message ?: e.class.simpleName
+            missing = _filesDownloadMissing(e)
+            mcpLog("debug", "file-manager", "Could not download '${fileName}' before deletion: ${downloadError}")
+        }
+        if (bytes == null && _loadLimiterRefusedMessage(downloadError)) {
+            mcpLog("warn", "file-manager", "Delete of '${fileName}' refused: the load limiter refused its backup download (${downloadError})")
+            return [
+                success: false,
+                fileName: fileName,
+                error: "Could not read '${fileName}' to take its backup copy (${downloadError}); nothing was deleted.".toString(),
+                note: "The hub's load limiter refused the download, which is temporary. Nothing was deleted; retry in a moment. ${FILES_GUIDE_POINTER}".toString()
+            ]
+        }
+        if (bytes == null) {
+            String kind = missing ? null : _filesRootEntryKind(fileName)
+            if (kind == "dir") return _filesFolderResult(fileName)
+            if (kind == null) {
+                String base = _filesBackupNameParts(fileName)[0]
+                return _filesMissing(fileName, missingError,
+                    "An earlier call may already have deleted it; its backup copy is listed by hub_list_files(filter: '${base}_backup_').")
+            }
+            existenceUnknown = kind == FILES_KIND_UNKNOWN
+            mcpLog("warn", "file-manager", existenceUnknown
+                ? "Could not check whether '${fileName}' exists before deletion: its download and the listing both failed"
+                : "Could not back up '${fileName}' before deletion: its content could not be downloaded")
+        } else {
+            try {
+                backupFileName = _filesWriteBackupCopy(fileName, bytes)
+                mcpLog("info", "file-manager", "Backed up '${fileName}' to '${backupFileName}' before deletion (${bytes.length} bytes)")
+            } catch (Exception e) {
+                mcpLog("warn", "file-manager", "Could not back up '${fileName}' before deletion: ${e.message}")
+            }
         }
     } else {
-        mcpLog("debug", "file-manager", "Skipping auto-backup for '${args.fileName}' -- file is itself a backup")
+        String kind = _filesRootEntryKind(fileName)
+        if (kind == "dir") return _filesFolderResult(fileName)
+        if (kind == null) return _filesMissing(fileName, missingError)
+        existenceUnknown = kind == FILES_KIND_UNKNOWN
+        mcpLog("debug", "file-manager", "Skipping auto-backup for '${fileName}' -- file is itself a backup")
     }
     try {
-        Map deletionDetails = _deleteHubFileAndUnlinkBackups(args.fileName.toString())
-        mcpLog("info", "file-manager", "Deleted file '${args.fileName}'")
+        Map deletionDetails = _deleteHubFileAndUnlinkBackups(fileName)
+        mcpLog("info", "file-manager", "Deleted file '${fileName}'")
         def result = [
             success: true,
-            message: backedUp
-                ? "File '${args.fileName}' deleted. Backup saved as '${backupFileName}'."
+            message: backupFileName
+                ? "File '${fileName}' deleted. Backup saved as '${backupFileName}'."
                 : isBackupFile
-                    ? "Backup file '${args.fileName}' deleted permanently (no backup-of-backup created)."
-                    : "File '${args.fileName}' deleted. WARNING: Could not create backup before deletion.",
-            fileName: args.fileName
+                    ? "Backup file '${fileName}' deleted permanently (no backup-of-backup created)."
+                    : "File '${fileName}' deleted. WARNING: Could not create backup before deletion.",
+            fileName: fileName
         ]
-        if (backedUp) {
+        if (backupFileName) {
             result.backupFile = backupFileName
-            String hubIp = null
-            try { hubIp = location?.hub?.localIP?.toString() } catch (Exception ignored) {   }
-            result.backupDownload = "http://${hubIp ?: '<HUB_IP>'}/local/${backupFileName}"
-            result.undoHint = "To recover: use 'hub_read_file' on '${backupFileName}' to view contents, or 'hub_write_file' to recreate '${args.fileName}' from the backup."
-            _filesReportCopyRetention(result, args.fileName.toString(), _filesPruneBackupCopies(args.fileName.toString(), backupFileName))
+            result.backupDownload = _filesDownloadUrl(backupFileName)
+            result.undoHint = "To recover a text file, read '${backupFileName}' with hub_read_file (every chunk, following nextOffset) and recreate '${fileName}' with hub_write_file. For a binary file, download backupDownload and upload it in Settings > File Manager."
+            _filesReportCopyRetention(result, fileName, _filesPruneBackupCopies(fileName, backupFileName))
         }
-        if (!backedUp && !isBackupFile) {
+        if (existenceUnknown) {
+            String failed = isBackupFile ? "the File Manager listing failed" : "its download and the File Manager listing both failed"
+            result.message = "Could not check whether '${fileName}' exists: ${failed}. The hub was asked to delete it; it may not have existed.".toString()
+            result.warning = "${isBackupFile ? '' : 'No backup copy was taken. '}Check with hub_list_files whether '${fileName}' is still listed.".toString()
+        } else if (!backupFileName && !isBackupFile) {
             result.warning = "The file contents could not be backed up before deletion. The data may be permanently lost."
         }
         result.putAll(deletionDetails)
@@ -4083,13 +4118,18 @@ def toolDeleteFile(args) {
         }
         return result
     } catch (Exception e) {
-        mcpLogError("file-manager", "Failed to delete file '${args.fileName}'", e)
+        mcpLogError("file-manager", "Failed to delete file '${fileName}'", e)
+        if (!backupFileName) {
+            Map unavailable = _itemBackupIndexUnavailableResult(e)
+            if (unavailable != null) return unavailable + [fileName: fileName, note: "${unavailable.note} ${FILES_GUIDE_POINTER}".toString()]
+        }
         return [
             success: false,
-            message: "Failed to delete file '${args.fileName}': ${e.message}",
-            fileName: args.fileName,
-            error: "Failed to delete '${args.fileName}': ${e.message}",
-            suggestion: "Check that the file exists. Use 'hub_list_files' to see available files."
+            fileName: fileName,
+            error: "Failed to delete '${fileName}': ${e.message}",
+            note: backupFileName
+                ? "Its backup copy '${backupFileName}' was taken first. Check with hub_list_files whether '${fileName}' is still listed before retrying. ${FILES_GUIDE_POINTER}".toString()
+                : "Check with hub_list_files whether '${fileName}' is still listed before retrying. ${FILES_GUIDE_POINTER}".toString()
         ]
     }
 }
@@ -4097,7 +4137,7 @@ def _getAllToolDefinitions_partFiles() {
     return [
         [
             name: "hub_list_files",
-            description: "List files stored in the hub's File Manager (the local web-accessible file store), returning each file's name, size, last-modified date, and direct download URL[[FLAT_TRIM]], plus subfolders[[/FLAT_TRIM]]. Optionally filter by a case-insensitive substring of the file name[[FLAT_TRIM]], or list a subfolder[[/FLAT_TRIM]]. Use this to discover available files before reading one with hub_read_file, or to confirm a write/backup landed. Read-only.",
+            description: "List files in the hub's File Manager (its local web file store): name, size in bytes and last-modified epoch ms per file[[FLAT_TRIM]], subfolders as type 'dir'[[/FLAT_TRIM]]; a file downloads from downloadUrlBase + name. Optionally filter by a case-insensitive name substring[[FLAT_TRIM]], or list a subfolder[[/FLAT_TRIM]]. Use it to find a file before hub_read_file, or to confirm a write or backup landed. Read-only.",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -4113,34 +4153,34 @@ def _getAllToolDefinitions_partFiles() {
             inputSchema: [
                 type: "object",
                 properties: [
-                    fileName: [type: "string", description: "The exact file name (e.g., 'dashboard-backup.json', 'mcp-backup-app-123.groovy')"],
-                    offset: [type: "integer", description: "Character offset to start reading from. Default: 0"],
-                    length: [type: "integer", description: "Max chars (default 30000, max 60000)."]
+                    fileName: [type: "string", description: "The exact root file name (e.g., 'dashboard-backup.json', 'mcp-backup-app-123.groovy'); a folder or a name with '/' is refused."],
+                    offset: [type: "integer", description: "Character offset to start from, 0 or more. Default 0."],
+                    length: [type: "integer", description: "Max chars, 1-60000 (default 30000)."]
                 ],
                 required: ["fileName"]
             ]
         ],
         [
             name: "hub_write_file",
-            description: "⚠️ Write (create or overwrite) a text file in the hub's File Manager. If a file of the same name exists this OVERWRITES it wholesale; the prior version is auto-backed up first (see backupFile in the result for recovery; the newest ${FILE_BACKUP_COPIES} copies per file are kept). Requires Write master and confirm=true — confirm the write with the user before calling.",
+            description: "⚠️ Create or overwrite a text file in the hub's File Manager. An existing file is OVERWRITTEN wholesale after a backup copy is taken (backupFile in the result; the newest ${FILE_BACKUP_COPIES} copies per file are kept); identical content writes nothing; if the current content cannot be read, nothing is written. Requires confirm=true and a hub backup from the last 24 hours — confirm with the user first.",
             inputSchema: [
                 type: "object",
                 properties: [
-                    fileName: [type: "string", description: "The file name to write (e.g., 'my-config.json'). Only A-Za-z0-9, hyphens, underscores, and periods allowed."],
-                    content: [type: "string", description: "The text content to write to the file"],
-                    confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms user approved the write."]
+                    fileName: [type: "string", description: "The root file name to write (e.g., 'my-config.json'): letters, numbers, hyphens, underscores and periods only, not starting with a period; a name with '/' is refused."],
+                    content: [type: "string", description: "The text content to write."],
+                    confirm: [type: "boolean", description: "Must be true: the user approved the write."]
                 ],
                 required: ["fileName", "content", "confirm"]
             ]
         ],
         [
             name: "hub_delete_file",
-            description: "⚠️ Permanently delete a file from the hub's File Manager. The file is auto-backed up first (see backupFile/undoHint for recovery). Requires Write master, confirm=true, and a recent hub backup — get user approval before calling.",
+            description: "⚠️ Permanently delete a file from the hub's File Manager. A backup copy is taken first when possible (backupFile/undoHint in the result); a file that is itself a backup gets none, and if no copy can be taken (unreadable content or a failed upload) the delete still runs with a warning[[FLAT_TRIM]], except that a download the load limiter refused deletes nothing (retry)[[/FLAT_TRIM]]. Requires confirm=true and a hub backup from the last 24 hours — get user approval first.",
             inputSchema: [
                 type: "object",
                 properties: [
-                    fileName: [type: "string", description: "The exact file name to delete"],
-                    confirm: [type: "boolean", description: "REQUIRED: Must be true. Confirms user approved the deletion."]
+                    fileName: [type: "string", description: "The exact root file name to delete; a folder or a name with '/' is refused."],
+                    confirm: [type: "boolean", description: "Must be true: the user approved the deletion."]
                 ],
                 required: ["fileName", "confirm"]
             ]
@@ -4161,8 +4201,8 @@ def _toolDisplayMeta_partFiles() {
     return [
         hub_list_files: [title: "List Files", summary: "List files in the hub File Manager, optionally filtered by a name substring."],
         hub_read_file: [title: "Read File", summary: "Read a File Manager file's contents."],
-        hub_write_file: [title: "Write File", summary: "Create or update a File Manager file (auto-backs up existing)."],
-        hub_delete_file: [title: "Delete File", summary: "Delete a File Manager file (auto-backs up first)."]
+        hub_write_file: [title: "Write File", summary: "Create or update a File Manager file (backs up the existing one; identical content writes nothing)."],
+        hub_delete_file: [title: "Delete File", summary: "Delete a File Manager file (takes a backup copy first when possible)."]
     ]
 }
 def toolListItemBackups(args = null) {
@@ -22279,7 +22319,7 @@ def _getAllToolDefinitions_partNativeRM() {
         ],
         [
             name: "hub_get_rule",
-            description: """Read one Rule Machine rule, Button Rule or Basic Rule: its health and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; for a Basic Rule, its settings. Any other installed app returns its health alone.[[FLAT_TRIM]] Nothing is written and the rule's page is not opened: broken comes from the rule's own check. health carries broken, brokenRows (each row whose device is gone, by kind and native id), paused, stopped, privateBoolean, disabledActions, disabledTriggers, structuralIssues, the red-X disabled flag and the live eventSubscriptionCount and scheduledJobCount; the raw subscription and job lists come from hub_get_app_config(includeStatus: true).[[/FLAT_TRIM]] health.ok=false with unreadable=false means issues names a problem or checkErrors names a failed read; unreadable=true means nothing could be read, which is not evidence of breakage. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the full health reference.""",
+            description: """Read one Rule Machine rule, Button Rule or Basic Rule: its health and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; for a Basic Rule, its settings. Any other installed app returns its health alone.[[FLAT_TRIM]] Nothing is written and the rule's page is not opened: broken comes from the rule's own check, and is also true when a row's device is gone. health carries broken, brokenRows (each row whose device is gone, by kind and native id), paused, stopped, privateBoolean, disabledActions, disabledTriggers, structuralIssues, the red-X disabled flag and the live eventSubscriptionCount and scheduledJobCount; the raw subscription and job lists come from hub_get_app_config(includeStatus: true).[[/FLAT_TRIM]] health.ok=false with unreadable=false means issues names a problem or checkErrors names a failed read; unreadable=true means nothing could be read, which is not evidence of breakage. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the full health reference.""",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -22475,7 +22515,7 @@ private void registerRmRule(Map combined, def r) {
         }
         label = entry.value?.toString()
         name = label
-    } else if (r != null && !(r instanceof Map)) {
+    } else if (!(r instanceof Map)) {
         id = r
     }
     if (id == null) return
@@ -22584,12 +22624,20 @@ def toolRunRmRule(args) {
     if (visual && action in ["stop", "start"]) {
         throw new IllegalArgumentException("Visual Rules have no stop or start; rule(s) ${visual.join(', ')} are Visual Rules. Use action:'pause' or 'resume' for them. Nothing was dispatched.")
     }
+    List<Integer> unconfirmed = []
     List<Integer> classic = action != "actions" ? [] : visual.findAll { Integer id ->
         String type = guard.types.get(id)?.toString()
-        type ==~ /.*\s1(\.\d+)*/ || (!(type ==~ /.*\s\d+(\.\d+)*/) && _ruleCompiledState(id)?.ruleFormat == "vrb-classic")
+        if (type ==~ /.*\s1(\.\d+)*/) return true
+        if (type ==~ /.*\s\d+(\.\d+)*/) return false
+        def format = _ruleCompiledState(id)?.ruleFormat
+        if (format == null) unconfirmed << id
+        format != "vrb-graph"
     }
     if (classic) {
-        throw new IllegalArgumentException("Visual Rule Builder 1.0 rules have no run button, so their actions cannot be run; rule(s) ${classic.join(', ')} are 1.0 rules. Pause and resume work on them. Nothing was dispatched.")
+        List<Integer> oneZero = classic - unconfirmed
+        String found = (oneZero ? "; rule(s) ${oneZero.join(', ')} are 1.0 rules" : "") +
+            (unconfirmed ? "; the builder format of rule(s) ${unconfirmed.join(', ')} could not be read, so they are not run until it reads as 2.0 (retry, or check them with hub_get_rule)" : "")
+        throw new IllegalArgumentException("Visual Rule Builder 1.0 rules have no run button, so their actions cannot be run${found}. Pause and resume work on them. Nothing was dispatched.")
     }
     boolean runActions = (action == "actions")
     def perRule = { Integer id ->
@@ -22606,7 +22654,7 @@ def toolRunRmRule(args) {
     def results = []
     List remaining = []
     boolean budgetPaused = false
-    for (int i = 0; i < ruleIds.size(); i++) {
+    for (int i in 0..<ruleIds.size()) {
         if (i > 0 && _timeBudgetExceeded(args?.__reqT0 as Long)) {
             budgetPaused = true
             remaining = ruleIds.subList(i, ruleIds.size()).collect { it }
@@ -22774,7 +22822,8 @@ private Map _vrbTogglePaused(Integer ruleId, String action) {
     } catch (Exception e) {
         sent = [success: false, error: "pause endpoint failed: ${e.message}"]
     }
-    if (sent.success == true && sent.confirmed != true) {
+    boolean unconfirmed = sent.success == true && sent.confirmed != true
+    if (unconfirmed) {
         def after = _ruleCompiledState(ruleId)
         if (after?.paused != target) {
             sent = [success: false, error: (after?.paused == null ? "the pause endpoint gave no success verdict and the rule's paused state could not be read, so the change could not be confirmed" : "the pause endpoint gave no success verdict and the rule then read paused=${after.paused}").toString()]
@@ -23529,7 +23578,8 @@ private Map _rmBuildRuleSnapshot(Integer ruleId, String reason, String activePag
             }
         }
     }
-    if (detectedAppType == "rule_machine" && config != null && (configAppName?.toString() ==~ /Rule-[0-9.]+/)) {
+    boolean ruleMachineExport = detectedAppType == "rule_machine" && config != null && (configAppName?.toString() ==~ /Rule-[0-9.]+/)
+    if (ruleMachineExport) {
         def evalState = (status?.appState instanceof List) ? (status.appState as List).find { it instanceof Map && it.name == "eval" }?.value : null
         if (evalState instanceof Map && (evalState as Map)["0"] instanceof List && !((evalState as Map)["0"] as List).isEmpty()) {
             snapshot.nativeExportSkipped = "the rule has a Required Expression, which Hubitat's App Cloner does not export"
@@ -23884,7 +23934,7 @@ private List _rmRequiredTokens(Integer appId) {
 private Integer _rmReplayConditionSlot(Integer appId, Map srcSettings, int srcIdx, Closure writeST, Map cache) {
     Integer newIdx = null
     def written = [] as Set
-    for (int iter = 0; iter < 30; iter++) {
+    for (int iter in 0..<30) {
         def inputs = (_rmFetchConfigJson(appId, "STPage", cache)?.configPage?.sections ?: []).collectMany { it?.input ?: [] }
         if (newIdx == null) {
             def rc = inputs.find { it?.name?.toString()?.startsWith("rCapab_") }
@@ -24019,7 +24069,8 @@ Map _rmRestoreRequiredExpression(Integer appId, Map snapshot) {
             builtCount = 1
             if (snapTokens.size() > 1) _rmTokEnterEditor(appId, cache)
         }
-        if (liveCommitted || snapTokens.size() > 1) {
+        boolean appendTokens = liveCommitted || snapTokens.size() > 1
+        if (appendTokens) {
             def prefix = liveCommitted ? [] : (firstCond > 0 ? snapTokens[0..<firstCond] : [])
             def rest = liveCommitted ? snapTokens : snapTokens.subList(firstCond + 1, snapTokens.size())
             prefix.eachWithIndex { tok, i -> _rmTokInsert(appId, i, _rmTokenValue(tok), writeST, hrefParams, cache) }
@@ -24256,7 +24307,8 @@ private Map _rmBackupBeforeEditLocked(Integer ruleId, String reason) {
     if (recent != null && getAppByAppId(ruleId as Long) == null) {
         throw new IllegalArgumentException("No rule/app with id ${ruleId} exists on this hub. Nothing was changed. Use hub_list_rules for valid ids. See hub_get_tool_guide(section='builtin_app_tools_crud').")
     }
-    if (recent != null && !_rmReusableBackupFileMatches(recent.value as Map, ruleId)) {
+    boolean staleRecent = recent != null && !_rmReusableBackupFileMatches(recent.value as Map, ruleId)
+    if (staleRecent) {
         def staleFile = recent.value?.fileName?.toString()
         mcpLog("warn", "rm-native", "Recent backup ${recent.key} for rule ${ruleId} is missing or does not match its manifest; discarding the stale handle and taking a fresh baseline")
         try { unlinkItemBackupManifestFile(staleFile, recent.key?.toString()) }
@@ -24505,7 +24557,8 @@ private Map _naCreate(Map args) {
             return [success: false, partial: true, app_type: type, app_id: childId, error: failure.message?.toString(),
                     note: "App ${childId} exists and its page may already be saved. Open it with hub_set_native_app(operation:'form', app_id:${childId}, args:{steps:[{kind:'open'}]}, confirm:true) to see its state, then finish or delete it; do not create it again.${guide}".toString()]
         }
-        if (saved.done && !saved.committed && saved.done != '_action_done|Done|') {
+        boolean refusedDone = saved.done && !saved.committed && saved.done != '_action_done|Done|'
+        if (refusedDone) {
             List asks = []
             try {
                 Map model = saved.answer?.model?.configPage instanceof Map ? saved.answer.model : _nfPage(childId)
@@ -24929,11 +24982,6 @@ Map _nrPage(Long ruleId, String page, Map params = [:]) {
     }
     [verificationNeeded: true, result: result]
 }
-Map _nrButton(Long ruleId, String name) {
-    if (!name) throw new IllegalArgumentException('A native button name is required')
-    def result = _nrHandle(ruleId).appButtonHandler(name)
-    [verificationNeeded: true, result: result]
-}
 private List _nrChoiceKeys(Object options) {
     if (options instanceof Map) return options.keySet().collect { it.toString() }.unique()
     if (!(options instanceof List)) return null
@@ -24979,7 +25027,8 @@ private void _nrValidateInput(Map field, Object value, boolean allowClear = fals
     if ((device || field.type in ['enum', 'mode', 'menu']) && options == null) throw new IllegalArgumentException("Native choices are unavailable for ${field.name}")
     if (options != null && values.any { !(allowClear && it.toString() == '') && !(it.toString() in options) }) throw new IllegalArgumentException("Invalid native choice for ${field.name}")
     _nrValidateScalar(field, value, allowClear)
-    if (field.type in ['number', 'decimal'] && !(allowClear && value.toString() == '')) {
+    boolean clearing = allowClear && value.toString() == ''
+    if (field.type in ['number', 'decimal'] && !clearing) {
         BigDecimal number = value.toString().toBigDecimal()
         List range = field.range?.toString()?.split(/\.\./)?.toList() ?: []
         def minimum = field.min != null ? field.min : (range.size() == 2 ? range.get(0) : null)
@@ -26112,7 +26161,9 @@ private Map _ndApply(Long id, List changes, boolean created) {
         if (created && getAppByAppId(id)?.installed != true) throw new IllegalStateException('Native rule is not installed after Done')
         Map written = [success: true, ruleId: id, created: created, results: outcomes, broken: false, stopped: stopped, paused: paused, eventSubscriptions: subscriptions, scheduledJobs: jobs, verification: 'Native persistence, compilation and activation checks passed; verify intended device behavior independently.']
         if (suppressed) written.subscriptionSettle = 'SUPPRESSED: Required Expression is false'
-        Map document = toolGetRuleDocument([ruleId: id, sections: ['actions', 'conditions', 'triggers', 'expressions', 'variables']])
+        Map document
+        try { document = toolGetRuleDocument([ruleId: id, sections: ['actions', 'conditions', 'triggers', 'expressions', 'variables']]) }
+        catch (Exception readBack) { document = [success: false, error: readBack.message ?: readBack.toString()] }
         if (document.success == false) {
             written.documentReadError = document.error
             written.note = "The changes were written and verified; only reading the rule back failed. Do not send them again: read the rule with hub_set_rule(operation:'read') or hub_get_rule. See hub_get_tool_guide(section='set_rule_reference')."
@@ -26142,13 +26193,15 @@ Map toolUpdateRuleDocument(Map args) {
         try { _ndPreflight(id, changes) }
         catch (Exception failure) { return [success: false, partial: false, ruleId: id, error: failure.message?.toString()] }
         Map beforeHealth = _rmCheckRuleHealth(id as Integer)
-        if (beforeHealth.broken == true) {
+        boolean alreadyBroken = beforeHealth.broken == true || beforeHealth.brokenRows
+        if (alreadyBroken) {
             String rows = beforeHealth.brokenRows ? ': ' + beforeHealth.brokenRows.collect { "${it.kind} ${it.id}" + (it.text ? " ('${it.text}')" : '') }.unique().join('; ') : ''
             return [success: false, partial: false, ruleId: id, broken: true, brokenRows: beforeHealth.brokenRows, checkErrors: beforeHealth.checkErrors,
                 error: "Rule ${id} is already broken${rows}; no change was written.".toString(),
                 note: "Repair the broken rows first: open the rule with hub_set_rule(operation:'form') or in the Hubitat UI and replace or remove what refers to the missing device or variable, then retry. hub_get_rule lists the broken rows; see hub_get_tool_guide(section='set_rule_reference').".toString()]
         }
-        if (beforeHealth.broken == null || beforeHealth.disabledActions == null) {
+        boolean unread = beforeHealth.broken == null || beforeHealth.disabledActions == null
+        if (unread) {
             return [success: false, partial: false, ruleId: id, broken: beforeHealth.broken, checkErrors: beforeHealth.checkErrors,
                 error: (beforeHealth.broken == null ? "Rule ${id}'s broken flag could not be read before the write, so whether it is already broken is unknown; no change was written." :
                     "Rule ${id}'s compiled state could not be read before the write, so it is not known to be intact; no change was written.").toString(),
@@ -26245,7 +26298,9 @@ private void _ndValidateSchema(Object value, Map schema, String path, boolean co
         value.each { item -> _ndValidateSchema(item, schema.items, path, complete) }
     } else if (schema.type == 'string') {
         if ((schema.minLength != null && value.trim().size() < schema.minLength) || (schema.maxLength != null && value.size() > schema.maxLength)) throw new IllegalArgumentException("Invalid ${path} length")
-    } else if (schema.minimum != null && value < schema.minimum) throw new IllegalArgumentException("Invalid ${path}")
+    } else if (schema.minimum != null) {
+        if (value < schema.minimum) throw new IllegalArgumentException("Invalid ${path}")
+    }
 }
 Map toolSetRule(Map request) {
     if (request.containsKey('confirm') && !(request.confirm instanceof Boolean)) throw new IllegalArgumentException('confirm must be boolean')
@@ -26301,7 +26356,7 @@ String _ndGuide() {
 
 Call hub_set_rule without operation for help, or choose a write operation without confirm to inspect its schema without changing the rule. Top-level ruleId identifies the target; args cannot override it or confirm. When mandatory guide acknowledgment is enabled, pass its key as top-level bestPracticeKey alongside operation, ruleId, args and confirm.
 
-Read hub_set_rule(operation:"read",ruleId,args:{sections:[...]}) before editing an existing native rule; hub_get_rule returns the same document from the read-only tools, with the local variables as a localVariables list in place of the variables section. A read does not open the rule's page: it returns health, the same report hub_get_rule returns (broken from the rule's own check, brokenRows, paused, stopped, privateBoolean, structuralIssues; see builtin_app_tools_rules). The sections come from native state and typed settings. Sections: actions, conditions, triggers, expressions, variables, settings. Action IDs and order are native IDs, preserved for in-place edits; omitted parts and unknown settings remain native-owned.
+Read hub_set_rule(operation:"read",ruleId,args:{sections:[...]}) before editing an existing native rule; hub_get_rule returns the same document from the read-only tools, with the local variables as a localVariables list in place of the variables section. A read does not open the rule's page: it returns health, the same report hub_get_rule returns (broken from the rule's own check or a row whose device is gone, brokenRows, paused, stopped, privateBoolean, structuralIssues; see builtin_app_tools_rules). The sections come from native state and typed settings. Sections: actions, conditions, triggers, expressions, variables, settings. Action IDs and order are native IDs, preserved for in-place edits; omitted parts and unknown settings remain native-owned.
 
 For large rules, read one section with args:{sections:["settings"],cursor:"",limit:50}. Paging requires exactly one section; limit is 1..100 (default 50). The section keeps its usual map or list shape. Pass the returned top-level nextCursor into args.cursor until nextCursor is null. page returns offset, limit, total and revision, a hash of the complete section; restart if revision changes. Pages may contain fewer than limit rows to fit the response size cap; an individual oversized row is refused explicitly without truncation. Actions retain native order, settings sort by name, and map sections sort by string key. Omit cursor and limit for an unpaged read.
 
@@ -26481,6 +26536,7 @@ private Map _nfWire(Map field, String encoded) {
 private void _nfWalk(Object node, Map fields, Map controls, List messages, List unsupported, Map model, int position = 0) {
     if (node instanceof List) { node.eachWithIndex { item, index -> _nfWalk(item, fields, controls, messages, unsupported, model, index) }; return }
     if (!(node instanceof Map)) return
+    boolean childApp = node.element == 'app' && node.namespace == 'hubitat' && node.appName instanceof String && node.appName && node.name && node.appId?.toString() == model.app?.id?.toString()
     if (node.element == 'input' && node.name && node.type) {
         String name = node.name.toString()
         String type = node.type.toString()
@@ -26522,7 +26578,7 @@ private void _nfWalk(Object node, Map fields, Map controls, List messages, List 
             if (fields.containsKey(name) && fields[name] != field) throw new IllegalStateException('Native form contains ambiguous fields')
             fields.put(name, field)
         }
-    } else if (node.element == 'app' && node.namespace == 'hubitat' && node.appName instanceof String && node.appName && node.name && node.appId?.toString() == model.app?.id?.toString()) {
+    } else if (childApp) {
         _nfControl(controls, [name: node.name.toString(), value: node.appName, kind: 'create_child', title: _nfText(node.title)])
     } else if (node.element in ['label', 'mode']) {
         _nfAppField(fields, model, node.element == 'mode', node)
@@ -30090,7 +30146,9 @@ private Map _mrtrCommitSlice(String stateId, Map rec, Map claim, Map executionAr
                 }
                 if (result instanceof Map && result.remainingRuleIds instanceof List
                         && !(result.remainingRuleIds as List).isEmpty()) {
-                    capped.remainingRuleIds = result.remainingRuleIds
+                    Set reached = banked.collect { it instanceof Map ? it.ruleId?.toString() : null } as Set
+                    def unreached = (result.remainingRuleIds as List).findAll { !(it?.toString() in reached) }
+                    if (unreached) capped.remainingRuleIds = unreached
                 }
                 capped.partial = banked.any { it instanceof Map && it.success == true }
                 def reissue = (((capped.failedRuleIds ?: []) as List) +
@@ -30808,8 +30866,10 @@ def _responseTooLargeSuggestion(String toolName) {
             return "For scope='instances': set includeHidden=false (the default), narrow via filter (builtin / user / disabled / parents / children), or pass cursor to page through the apps list."
         case "hub_get_app_config":
             return "Omit includeSettings -- Room Lighting / RM 5.1 apps can have 500-1000 settings keys. For multi-page apps, read one page at a time with pageName, chosen from the page.hrefs a page returns. If you only need identity, pass summary=true."
+        case "hub_read_file":
+            return "This chunk is too large once JSON-escaped: quotes, backslashes, newlines and non-ASCII characters take several bytes each. Call again at the same offset with a smaller length, e.g. 10000."
         case "hub_list_files":
-            return "Pagination here is OPT-IN: with no cursor the tool returns the WHOLE listing, so a large File Manager has no natural page break. Re-issue with cursor='0' to page through it, or narrow with filter='<substring of the name>'."
+            return "Pagination here is OPT-IN: with no cursor the tool returns the WHOLE listing, so a large File Manager has no natural page break. Re-issue with cursor='' to page through it, or narrow with filter='<substring of the name>'."
         case "hub_get_device_health":
             return "Set includeHealthy=false (the default), narrow staleHours, or pass cursor to page through staleDevices."
         case "hub_get_memory_history":
@@ -31128,10 +31188,10 @@ def getGatewayConfig() {
             description: "Manage hub File Manager: list, read, write, and delete files stored on the hub.",
             tools: ["hub_list_files", "hub_read_file", "hub_write_file", "hub_delete_file"],
             summaries: [
-                hub_list_files: "List files and subfolders in File Manager (names, sizes, URLs, free space). Args: filter, folder, cursor",
+                hub_list_files: "List files and subfolders in File Manager (names, sizes, download base, free space). Args: filter, folder, cursor",
                 hub_read_file: "Read file content. Args: fileName, offset, length",
                 hub_write_file: "Write file to File Manager. Args: fileName, content, confirm=true",
-                hub_delete_file: "Delete file from File Manager (auto-backs up first to <name>_backup_<ts>, unless it's already a backup). Args: fileName, confirm=true"
+                hub_delete_file: "Delete file from File Manager (takes a backup copy to <name>_backup_<ts> first when possible; none for a file that is itself a backup). Args: fileName, confirm=true"
             ],
             searchHints: [
                 hub_list_files: "show uploaded stored csv json text data filter search name substring backup",
@@ -31252,7 +31312,7 @@ def getGatewayConfig() {
             description: "Read-only hub File Manager access: list files and read file content. All operations are read-only; write/delete live in hub_manage_files.",
             tools: ["hub_list_files", "hub_read_file"],
             summaries: [
-                hub_list_files: "List files and subfolders in File Manager (names, sizes, URLs, free space). Args: filter, folder, cursor",
+                hub_list_files: "List files and subfolders in File Manager (names, sizes, download base, free space). Args: filter, folder, cursor",
                 hub_read_file: "Read file content. Args: fileName, offset, length"
             ],
             searchHints: [
@@ -33425,8 +33485,8 @@ private Map _rebuildItemBackupIndex() {
     mcpLog("info", "hub-admin", "Rebuilt the backup index from File Manager: ${rebuilt.size()} backup file(s) indexed")
     return rebuilt
 }
-List _fileManagerRootFiles() {
-    String text = hubInternalGet("/hub/fileManager/json")?.toString()
+Map _fileManagerListing(String folder = null) {
+    String text = hubInternalGet("/hub/fileManager/json", folder ? [folder: folder] : null)?.toString()
     if (!text) throw new IllegalStateException("/hub/fileManager/json returned no data")
     def parsed = new groovy.json.JsonSlurper().parseText(text)
     def files = null
@@ -33436,10 +33496,33 @@ List _fileManagerRootFiles() {
         files = parsed.containsKey("files") ? parsed.files : parsed.values()?.flatten()
     }
     if (!(files instanceof List)) throw new IllegalStateException("/hub/fileManager/json returned an unrecognised shape")
-    Closure asLong = { v -> v != null && v.toString().isLong() ? v.toString().toLong() : null }
-    return (files as List).findAll { !(it instanceof Map) || it.type != "dir" }.collect { f ->
-        f instanceof Map ? [name: f.name?.toString(), size: asLong(f.size), date: asLong(f.date)] : [name: f.toString(), size: null, date: null]
+    List entries = (files as List).collect { f ->
+        f instanceof Map
+            ? [name: f.name?.toString(), type: f.type?.toString(), size: _fileManagerLong(f.size), date: _fileManagerLong(f.date),
+               backupIncluded: f.backupIncluded instanceof Boolean ? f.backupIncluded : null]
+            : [name: f?.toString(), type: null, size: null, date: null, backupIncluded: null]
     }.findAll { it.name }
+    if (entries.isEmpty() && parsed && !(parsed instanceof Map && parsed.containsKey("files"))) {
+        String shapeHint = (parsed instanceof Map) ? "Map with keys=${parsed.keySet()?.take(10)?.toList()}" :
+                           (parsed instanceof List) ? "List of ${parsed.size()} unnamed entries" : _typeName(parsed)
+        mcpLog("warn", "file-manager", "File Manager listing yielded zero files (${shapeHint}) -- shape may not be recognized", null, [details: [shape: shapeHint]])
+    }
+    Map selection = (parsed instanceof Map && parsed.backupSelection instanceof Map) ? parsed.backupSelection : null
+    return [files: entries,
+            freeSpace: parsed instanceof Map ? _fileManagerLong(parsed.freeSpace) : null,
+            excludedFiles: selection?.excludedFiles]
+}
+private Long _fileManagerLong(v) {
+    return v != null && v.toString().isLong() ? v.toString().toLong() : null
+}
+List _fileManagerRootEntries() {
+    def files = getHubFiles()
+    if (!(files instanceof Collection)) throw new IllegalStateException("getHubFiles() returned no file list")
+    return files.collect { f -> [name: f?.name?.toString(), type: f?.type?.toString(), size: _fileManagerLong(f?.size), date: _fileManagerLong(f?.date)] }
+        .findAll { it.name }
+}
+List _fileManagerRootFiles() {
+    return _fileManagerRootEntries().findAll { it.type != "dir" }.collect { [name: it.name, size: it.size, date: it.date] }
 }
 private void _commitItemBackupManifest(Map manifest) {
     String owner = _stateOwnerKey()
@@ -34501,7 +34584,7 @@ Map _rmCheckRuleHealth(Integer appId) {
     String label = status?.installedApp?.label ?: installed?.label?.toString()
     Boolean labelPaused = null
     Boolean labelStopped = null
-    if (label?.contains("*BROKEN*")) issues << "label contains *BROKEN* marker — rule has at least one malformed trigger or action".toString()
+    boolean labelBroken = label?.contains("*BROKEN*") == true
     while (label != null) {
         def decoration = label =~ /<[^>]+>\s*\((Paused|Stopped)\)\s*(?:<\/[^>]+>\s*)*$/
         if (!decoration.find()) break
@@ -34512,7 +34595,8 @@ Map _rmCheckRuleHealth(Integer appId) {
     result.label = label?.replaceAll(/<[^>]+>/, "")?.trim()
     Map compiled = null
     if (ruleType) result.ruleFormat = "rm"
-    if (typeName != null && !visual && !ruleType) {
+    boolean otherApp = typeName != null && !visual && !ruleType
+    if (otherApp) {
         result.ruleFormat = _classicAppFormat(typeName)
     } else {
         def cs = _ruleCompiledState(appId)
@@ -34534,7 +34618,8 @@ Map _rmCheckRuleHealth(Integer appId) {
         }
     }
     boolean brokenNoted = false
-    if (_rmIsEditableRuleType(namespace, typeName)) {
+    boolean editable = _rmIsEditableRuleType(namespace, typeName)
+    if (editable) {
         result.broken = null
         try {
             def flag = _nrHandle(appId as Long).broken()
@@ -34545,9 +34630,17 @@ Map _rmCheckRuleHealth(Integer appId) {
             checkErrors << "the rule's broken() check failed (${brokenErr.message ?: brokenErr.toString()})".toString()
         }
     }
+    boolean nativeBroken = result.broken == true
+    boolean scanRows = compiled != null && status != null && (nativeBroken || editable)
+    if (scanRows) result.brokenRows = _rmBrokenRows(compiled, status.appSettings)
+    if (result.brokenRows) result.broken = true
     if (result.ruleFormat == "rm" && result.broken == null && !brokenNoted) checkErrors << "the rule's broken flag could not be read, so whether it is broken is unknown".toString()
-    if (result.ruleFormat == "rm" && result.broken == true) {
-        issues << "Rule Machine marks this rule broken: a trigger, condition or action refers to something that is gone; brokenRows lists the rows whose device is gone.".toString()
+    if (labelBroken && result.broken == null) issues << "label contains *BROKEN* marker, a hint that the rule has a malformed trigger or action; no broken verdict could be read to confirm it".toString()
+    boolean rmBroken = result.ruleFormat == "rm" && result.broken == true
+    if (rmBroken) {
+        int deadRows = result.brokenRows.collect { [it.kind, it.id] }.unique().size()
+        issues << (nativeBroken ? "Rule Machine marks this rule broken: a trigger, condition or action refers to something that is gone; brokenRows lists the rows whose device is gone." :
+            "the rule refers to ${deadRows} row(s) whose device was deleted, which Rule Machine's own check does not flag; brokenRows lists them.").toString()
         if (compiled == null) checkErrors << "the rule's compiled state went unread, so brokenRows was not listed".toString()
         else if (status?.appSettingsMalformed) checkErrors << "the status page's appSettings is not a list, so brokenRows was not listed".toString()
     }
@@ -34555,11 +34648,11 @@ Map _rmCheckRuleHealth(Integer appId) {
         result.disabledActions = _rmDisabledRowIds(compiled, "disabledActions", checkErrors)
         result.disabledTriggers = _rmDisabledRowIds(compiled, "disabledTriggers", checkErrors)
         boolean useST = status?.appSettings?.any { it.name == "useST" && it.value?.toString() == "true" } == true
+        if (status == null || status.appSettingsMalformed) checkErrors << "the rule's settings went unread, so whether its Required Expression is on is unknown and expression 0 was not checked".toString()
         result.structuralIssues = _ndStructuralIssues(compiled, useST)
         if (result.structuralIssues) {
             issues << ("structural imbalance in the rule's actions or expressions: ${result.structuralIssues.join('; ')} — if you are still building this rule (adding an IF/ELSE or Repeat block across separate calls), this is EXPECTED until you add the closer with a hub_set_rule(operation='update') terminator change (subtype endIf or endRep). Otherwise compare against hub_get_rule(sections:['actions']) before considering a restore.").toString()
         }
-        if (result.broken == true && status != null) result.brokenRows = _rmBrokenRows(compiled, status.appSettings)
     }
     if (status != null) {
         result.eventSubscriptionCount = status.eventSubscriptions.size()
@@ -34802,7 +34895,7 @@ private Map _rmForceDeleteApp(Integer appId) {
     return resp
 }
 def currentVersion() {
-    return "5.2.0"
+    return "5.2.1"
 }
 def hubBpsGuideKey(String section, Long atMs = null) {
     long bucket = ((atMs != null ? atMs : now()) as long).intdiv(3600000L)
@@ -35690,30 +35783,31 @@ Reads the saved source from one backup -- use it to inspect or diff a prior vers
 - `fullRestore={restoreZigbee, restoreZwave, restoreFiles, deleteExistingFiles, allowZwaveFirmwareMismatch}` (booleans, all default false) picks what a full restore brings back besides the database, for a full `hub_local` backup or a `hub_uploaded` archive; `scope=hub_cloud` restores the database only and refuses it. `deleteExistingFiles` needs `restoreFiles`. A restore request the hub never answers returns `outcome: "unknown"`: the hub may be rebooting into the restore, so check it before retrying. A Z-Wave firmware or Z-Wave stack mismatch between hub and backup is refused with the reason; `allowZwaveFirmwareMismatch=true` restores over a hub whose Z-Wave firmware is newer. Full archives over 16 MB are refused in-app before they are downloaded (the web UI takes up to 150 MB).''',
         file_manager: '''## File Manager
 
-Files stored at http://<HUB_IP>/local/<filename>
+Files download from http://<hub IP>/local/<filename> (`downloadUrlBase` in hub_list_files, `directDownload` in hub_read_file and hub_write_file results, `backupDownload` for the backup copy hub_write_file or hub_delete_file takes).
 
 **File name rules:**
-- Must match ^[A-Za-z0-9][A-Za-z0-9._-]*$
-- No spaces, no leading period
-- Valid: my-config.json, backup_2024.txt
-- Invalid: .hidden, my file.txt
+- Must match ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ (the characters the hub's own upload accepts)
+- Letters, numbers, hyphens, underscores and periods only; no spaces or other characters, no leading period
+- Valid: my-config.json, backup_2024.txt, _notes.txt, -draft.txt
+- Invalid: .hidden, my file.txt, notes(1).txt, webcore/x.js
+- hub_read_file, hub_write_file and hub_delete_file act on root files only: a name with `/` is refused, and a folder name is refused as a folder ("is a folder, not a file").
 
 **Chunked reading:**
-- Use offset and length for files >60KB
-- Each chunk must be <60KB
-- Follow `nextOffset` while `hasMore` is true to read the next chunk
+- `offset` (character offset, 0 or more) and `length` (1-60000, default 30000); follow `nextOffset` while `hasMore` is true. Whole numbers sent as decimals (3.0) are accepted. Each chunk downloads the whole file on the hub, so a larger `length` means fewer downloads, but quotes, backslashes, newlines and non-ASCII characters cost several bytes each on the wire once JSON-escaped. On `response_too_large`, call again at the same `offset` with a smaller `length`.
 
-**Backup copies:** hub_write_file (when it overwrites different content) and hub_delete_file first copy the file to `<name>_backup_<yyyyMMdd-HHmmss-SSS><ext>` (older copies use `<yyyyMMdd-HHmmss>`). If that copy cannot be written, hub_write_file writes nothing and returns `success: false`; hub_delete_file deletes anyway with a `warning`. After the write or delete succeeds, the newest 5 copies of each file name are kept; older copies of that same name are deleted and listed in `removedOldBackups`. A failed listing or delete leaves them and adds `pruneWarning`.
+**Errors and retries:** every failure is an error result (`isError: true`, `success: false`). A successful result that is too large to send is not a failure: it comes back as a `response_too_large` envelope with a `suggestion` and no `isError` (an oversized error result keeps `isError: true`); for hub_read_file, follow Chunked reading above (same `offset`, smaller `length`). Reading or deleting a root file that does not exist says "does not exist in File Manager" and changes nothing. Writing a file's current content again writes nothing (`unchanged: true`), so a retried write is safe. A delete retried after a dropped response reports "does not exist" when the first call already deleted it, so check its backup copy with hub_list_files(filter: '<base>_backup_'). A write whose current content cannot be read is refused rather than overwritten, since its backup copy could not be taken. Retry once the read recovers, write under a new name, or save the current content from `directDownload`, then upload the new content over the file in Settings > File Manager (downloading the file does not make a retried write succeed). A delete of a listed file whose content cannot be read (unless the load limiter refused the download, which refuses the delete) still goes ahead with no backup copy and a `warning`: refusing would leave no way to remove a corrupt file, while a write has a new name as its workaround. If the listing also fails while a delete checks a file it could not download, the delete goes ahead with a `warning` that existence could not be checked and the file may not have existed (the hub's delete does not fail on a missing name). If the listing fails and the backup index is not loaded yet, the delete is refused before anything changes; retry once File Manager answers. Send writes and deletes of the same file one at a time.
+
+**Backup copies:** hub_write_file (when it overwrites different content) and hub_delete_file first copy the file to `<name>_backup_<yyyyMMdd-HHmmss-SSS><ext>` (older copies use `<yyyyMMdd-HHmmss>`). hub_delete_file takes none for a file that is itself a backup (a name containing `_backup_` or starting `mcp-backup-`, `mcp-rm-backup-` or `mcp-prerestore-`). If that copy cannot be written, hub_write_file writes nothing and returns `success: false`; hub_delete_file deletes anyway with a `warning`. After the write or delete succeeds, the newest 5 copies of each file name are kept; older copies of that same name are deleted and listed in `removedOldBackups`. A failed listing or delete leaves them and adds `pruneWarning`. To recover a text file, read its copy with hub_read_file (every chunk, following `nextOffset`) and write it back with hub_write_file; for a binary file, download `backupDownload` and upload it in Settings > File Manager.
 
 ### hub_list_files
 
-Use to discover available files before reading one with hub_read_file, or to confirm a write/backup landed. **`filter`:** case-insensitive substring match on the file name -- pass `filter: "backup"` to find backups instead of paging the whole listing and matching client-side. **Cursor pagination:** page size 100 -- omit the cursor for an unbounded list; pass "" for the first page and iterate `nextCursor`.
+Use to discover available files before reading one with hub_read_file, or to confirm a write/backup landed. Each file carries `size` (bytes) and `lastModified` (epoch ms) when the hub reports them. **`filter`:** case-insensitive substring match on the file name -- pass `filter: "backup"` to find backups instead of paging the whole listing and matching client-side. **Cursor pagination:** page size 100 -- omit the cursor for an unbounded list; pass "" for the first page and iterate `nextCursor`.
 
-**Folders (firmware 2.5.2+):** the root listing includes subfolders as entries with `type: "dir"` (no size or download URL); list one with `folder: "<name>"` (nested as `a/b`). Files carry `type: "file"`, and `backupIncluded: false` marks a file a full local backup leaves out (past its 100 MiB File Manager limit). The response adds `freeSpaceBytes` and `filesExcludedFromFullBackup`. A folder that is empty or does not exist lists no files. hub_read_file, hub_write_file and hub_delete_file act on root files only (the hub rejects a `/` in their names); a file in a subfolder is read through its `directDownload` URL.
+**Folders:** the root listing includes subfolders as entries with `type: "dir"` (no size); list one with `folder: "<name>"` (nested as `a/b`; letters, digits, underscore and hyphen; no spaces or dots -- the hub can neither create nor list a folder with either). Files carry `type: "file"`, and `backupIncluded: false` marks a file a full local backup leaves out (past its 100 MiB File Manager limit). The response adds `freeSpaceBytes` and `filesExcludedFromFullBackup` (a count) when the hub reports them. A folder that is empty or does not exist lists no files. A file in a subfolder downloads from that listing's `downloadUrlBase` + its name.
 
 ### hub_read_file
 
-Use after hub_list_files to fetch a named file (config, backup, exported rule/app, CSV). For files >60KB use the chunked-reading loop above.''',
+Use after hub_list_files to fetch a named file (config, backup, exported rule/app, CSV). For a file longer than one chunk (default 30000 characters) use the chunked-reading loop above.''',
         performance: '''## Performance Tips
 
 **hub_call_device_command with `commands` -- the biggest single win on a multi-device intent:**
@@ -35989,7 +36083,7 @@ Every action on a Rule Machine rule drives the rule's own page buttons (`runActi
 `health` has the same shape here, in hub_set_rule's read and in the update pre-check:
 
 - `ruleFormat` says what was inspected: `rm` (any Rule Machine rule or Button Rule) / `vrb-graph` / `vrb-classic` / `basic-rule` / `button-controller` / `classic-app`.
-- **Rule Machine**: `broken` comes from the rule's own broken() check (a Rule Machine 5.1 rule or Button Rule; an older rule type reports its stored flag), so a rule whose trigger device was deleted reads broken without anyone opening it. `brokenRows` (`[{kind: trigger|action|condition, id, setting, text?}]`) lists each row whose device setting no longer names a device: `id` is the row's native id, the one hub_set_rule changes and operation:'form' use (trigger 2 is `tDev2`), `setting` the setting that lost its device, and `text` the trigger's or condition's stored description. A row that is broken for another reason (a deleted variable) is not listed, so `broken:true` with no rows means the broken row has no device setting, unless checkErrors says brokenRows was not listed (the rule's compiled state or settings went unread). `disabledActions` and `disabledTriggers` (native ids of rows switched off; `[]` when none), `structuralIssues` (the IF/Repeat block and expression check hub_set_rule runs) and `privateBoolean`.
+- **Rule Machine**: `broken` comes from the rule's own broken() check (a Rule Machine 5.1 rule or Button Rule; an older rule type reports its stored flag), so a rule whose trigger device was deleted reads broken without anyone opening it. That check misses a condition whose device was deleted, so a Rule Machine 5.1 rule or Button Rule with any `brokenRows` entry also reads `broken:true` and `ok:false`, and an issue says Rule Machine's own check does not flag it. `brokenRows` (`[{kind: trigger|action|condition, id, setting, text?}]`) lists each row whose device setting no longer names a device: `id` is the row's native id, the one hub_set_rule changes and operation:'form' use (trigger 2 is `tDev2`), `setting` the setting that lost its device, and `text` the trigger's or condition's stored description. A row that is broken for another reason (a deleted variable) is not listed, so `broken:true` with no rows means the broken row has no device setting, unless checkErrors says brokenRows was not listed (the rule's compiled state or settings went unread). `disabledActions` and `disabledTriggers` (native ids of rows switched off; `[]` when none), `structuralIssues` (the IF/Repeat block and expression check hub_set_rule runs) and `privateBoolean`.
 - **Visual Rules Builder**: the engine's own verdict, a graph rule's `validationErrors` (broken when non-empty), and its pause state from its builder, with the rule's own name as `label`.
 - **Other apps** (Basic Rule, Button Controller, Room Lighting, user and community apps): label, red-X flag and the state flags below; `broken` is null.
 - `paused`, `stopped` and `privateBoolean` come from the app's state on its App Status page. A Rule Machine rule with no `paused` or `stopped` entry reads `false`, and so does a Basic Rule with no `paused` entry; for an app whose state has no flag, or when the status page cannot be read, the name's "(Paused)" or "(Stopped)" decoration is used. `privateBoolean` has no such fallback. An entry stored as neither true nor false reads null with a `checkErrors` entry. `label` has the decoration removed. `disabled` is the red-X flag.
