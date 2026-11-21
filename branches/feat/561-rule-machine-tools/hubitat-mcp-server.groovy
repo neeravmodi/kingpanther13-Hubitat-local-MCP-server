@@ -22560,7 +22560,7 @@ private List<Integer> _rmRuleIdListArg(Object raw) {
     rawList.each { id ->
         def n = _rmCoerceRuleId(id)
         if (n == null) {
-            throw new IllegalArgumentException("ruleId '${id}' is not an integer-valued rule id. Use hub_list_rules to find valid ids.")
+            throw new IllegalArgumentException("ruleId '${id}' is not a valid rule id (a positive whole number). Use hub_list_rules to find valid ids.")
         }
         if (!ids.contains(n)) ids << n
     }
@@ -25780,7 +25780,7 @@ Map toolGetRuleDocument(Map args) {
     } catch (Exception failure) {
         mcpLogError('rm-native', "${toolName} read failed for rule ${id}: ${failure.message}".toString(), failure)
         [success: false, ruleId: id, error: "Rule ${id} could not be read: ${failure.message ?: failure.toString()}".toString(),
-         note: "Retry once; the read writes nothing beyond rendering the rule's page, as opening it does. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
+         note: "The read rendered the rule's page, as opening it does, and wrote nothing else; a Rule Machine rule's page only shows its settings, so retrying once is safe. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
     }
 }
 private List _ndChanges(Object changes, boolean allowEmpty = false) {
@@ -33863,7 +33863,7 @@ def _exceptionStack(Throwable e) {
 }
 private Integer normalizeRuleId(def ruleId) {
     Integer exact = _exactIntId(ruleId)
-    if (exact == null) throw new IllegalArgumentException("The app id must be a whole number within the hub's id range, got: ${ruleId}. Find app ids with hub_list_apps or hub_list_rules.")
+    if (exact == null) throw new IllegalArgumentException("The app id must be a positive whole number within the hub's id range, got: ${ruleId}. Find app ids with hub_list_apps or hub_list_rules.")
     return exact
 }
 Integer _exactIntId(Object id) {
@@ -33871,7 +33871,9 @@ Integer _exactIntId(Object id) {
         def s = id?.toString()?.trim()
         if (!s) return null
         def bd = new BigDecimal(s)
-        return (bd.stripTrailingZeros().scale() <= 0) ? bd.intValueExact() : null
+        if (bd.stripTrailingZeros().scale() > 0) return null
+        int value = bd.intValueExact()
+        return value > 0 ? value : null
     } catch (Exception ignored) { return null }
 }
 private Map _appTypeRegistry() {
@@ -35916,7 +35918,7 @@ Every action on a Rule Machine rule drives the rule's own page buttons (`runActi
 
 - `localVariables`: `[{name, type, value}]`, the rule's own list, including a value the running rule just set. `type` is Rule Machine's token (integer, bigdecimal, string, boolean, datetime), the value a hub_set_rule variable change takes. A credential-named variable's value is hidden (`redacted:true`) while credential hiding is on. Hub globals are read with hub_list_variables.
 - If the local variables alone cannot be read, `localVariables` is null and `localVariablesError` says why; the health and the requested sections still return.
-- A read that fails returns `success:false` with `error` and `note`. The read renders the app's page as opening it in the hub UI does and writes nothing else, so it can be retried.
+- A read that fails returns `success:false` with `error` and `note`. The read renders the app's page as opening it in the hub UI does. Retrying is safe for a Rule Machine rule, whose page only shows its settings; another app's page runs that app's own code (rendering a Swap Device instance swaps its devices again), so check such an app with hub_get_app_config before reading it again.
 
 `health` has the same shape here, in hub_set_rule's read and in its write responses' documents:
 
