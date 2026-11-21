@@ -22624,20 +22624,9 @@ def toolRunRmRule(args) {
     if (visual && action in ["stop", "start"]) {
         throw new IllegalArgumentException("Visual Rules have no stop or start; rule(s) ${visual.join(', ')} are Visual Rules. Use action:'pause' or 'resume' for them. Nothing was dispatched.")
     }
-    List<Integer> unconfirmed = []
-    List<Integer> classic = action != "actions" ? [] : visual.findAll { Integer id ->
-        String type = guard.types.get(id)?.toString()
-        if (type ==~ /.*\s1(\.\d+)*/) return true
-        if (type ==~ /.*\s\d+(\.\d+)*/) return false
-        def format = _ruleCompiledState(id)?.ruleFormat
-        if (format == null) unconfirmed << id
-        format != "vrb-graph"
-    }
+    List<Integer> classic = action != "actions" ? [] : visual.findAll { Integer id -> guard.types.get(id)?.toString() ==~ /.*\s1(\.\d+)*/ }
     if (classic) {
-        List<Integer> oneZero = classic - unconfirmed
-        String found = (oneZero ? "; rule(s) ${oneZero.join(', ')} are 1.0 rules" : "") +
-            (unconfirmed ? "; the builder format of rule(s) ${unconfirmed.join(', ')} could not be read, so they are not run until it reads as 2.0 (retry, or check them with hub_get_rule)" : "")
-        throw new IllegalArgumentException("Visual Rule Builder 1.0 rules have no run button, so their actions cannot be run${found}. Pause and resume work on them. Nothing was dispatched.")
+        throw new IllegalArgumentException("Visual Rule Builder 1.0 rules have no run button, so their actions cannot be run; rule(s) ${classic.join(', ')} are 1.0 rules. Pause and resume work on them. Nothing was dispatched.")
     }
     boolean runActions = (action == "actions")
     def perRule = { Integer id ->
@@ -22666,7 +22655,7 @@ def toolRunRmRule(args) {
     results.eachWithIndex { r, i -> if (r?.success != true) failed << ruleIds[i] }
     def out = [
         success: failed.isEmpty() && !budgetPaused,
-        partial: budgetPaused || (!failed.isEmpty() && failed.size() < results.size()),
+        partial: failed.size() < results.size() && (budgetPaused || !failed.isEmpty()),
         ruleIds: ruleIds,
         rmAction: "${action} x${results.size()}".toString(),
         results: results
@@ -22675,7 +22664,7 @@ def toolRunRmRule(args) {
         out.failedRuleIds = failed
         def actionedCount = results.size() - failed.size()
         out.error = (actionedCount == 0)
-            ? "${action} failed for EVERY rule in the batch (${failed.join(', ')}); per-rule detail in results[].".toString()
+            ? "${action} failed for EVERY rule ${budgetPaused ? 'reached' : 'in the batch'} (${failed.join(', ')}); per-rule detail in results[].".toString()
             : "${action} failed for rule(s) ${failed.join(', ')} -- the other ${actionedCount} rule(s) in the batch WERE actioned; per-rule detail in results[].".toString()
         out.note = runActions
             ? _rmRunFailedNote(failed)
@@ -22699,12 +22688,12 @@ private String _rmRunFailedNote(List failed) {
 }
 private Map _rmRunGuardFailure(List<Integer> ruleIds, Map guard) {
     Map failure = guard.failure as Map
-    if (ruleIds.size() == 1) return [ruleId: ruleIds[0]] + failure + [ruleIds: ruleIds]
+    if (ruleIds.size() == 1) return [ruleId: ruleIds[0], dispatched: false] + failure + [ruleIds: ruleIds]
     Map unreadable = guard.unreadable as Map
     def rows = ruleIds.collect { id ->
         unreadable.containsKey(id)
-            ? [success: false, ruleId: id, error: "The rule could not be looked up (${unreadable.get(id)}), so it was not run.".toString()]
-            : [success: false, ruleId: id, error: "Not run: another rule in the same call could not be looked up, so none of them was dispatched."]
+            ? [success: false, ruleId: id, dispatched: false, error: "The rule could not be looked up (${unreadable.get(id)}), so it was not run.".toString()]
+            : [success: false, ruleId: id, dispatched: false, error: "Not run: another rule in the same call could not be looked up, so none of them was dispatched."]
     }
     [success: false, partial: false, ruleIds: ruleIds, results: rows, failedRuleIds: ruleIds, error: failure.error,
      note: "No rule in this lookup was run; each one's results[] row says why. Retry them once; if the lookup fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
@@ -22822,11 +22811,11 @@ private Map _vrbTogglePaused(Integer ruleId, String action) {
     } catch (Exception e) {
         sent = [success: false, error: "pause endpoint failed: ${e.message}"]
     }
-    boolean unconfirmed = sent.success == true && sent.confirmed != true
-    if (unconfirmed) {
+    if (sent.success == true) {
         def after = _ruleCompiledState(ruleId)
+        String answered = sent.confirmed == true ? "reported success" : "gave no success verdict"
         if (after?.paused != target) {
-            sent = [success: false, error: (after?.paused == null ? "the pause endpoint gave no success verdict and the rule's paused state could not be read, so the change could not be confirmed" : "the pause endpoint gave no success verdict and the rule then read paused=${after.paused}").toString()]
+            sent = [success: false, error: (after?.paused == null ? "the pause endpoint ${answered} and the rule's paused state could not be read, so the change could not be confirmed" : "the pause endpoint ${answered} and the rule then read paused=${after.paused}").toString()]
         }
     }
     if (sent.success != true) return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: ${sent.error}".toString(),
@@ -23024,7 +23013,7 @@ Map _rmDeleteAction(Integer appId, Integer actionIdx, boolean skipStructuralChec
             _rmStructuralSequenceFromSettings(settingsByName, ([actionIdx] as Set), orderedIndices))
         def newIssues = projectedIssues - currentIssues
         if (newIssues) {
-            throw new IllegalArgumentException("removeAction(${actionIdx}) blocked: action ${actionIdx} is a structural ${humanKind}; removing it would introduce a new structural-balance issue (${newIssues.first()}). Remove the matching opener/closer first. RM is not touched.")
+            throw new IllegalArgumentException("removeAction(${actionIdx}) blocked: action ${actionIdx} is a structural ${humanKind}; removing it would introduce a new structural-balance issue (${newIssues.first()}). Removing either half of a balanced pair alone is refused, so remove both together: one hub_set_rule(operation:'update') batch that deletes both rows (its balance is checked once, after the batch), or the Hubitat UI. RM is not touched.")
         }
     }
     _rmClickAppButton(appId, actionIdx.toString(), "delAct", "selectActions")
@@ -24380,6 +24369,7 @@ private void _naValidateCreate(Map args) {
         List stray = buttonKeys.findAll { args.containsKey(it) }
         if (stray) throw new IllegalArgumentException("${stray.join(', ')} apply only to app_type button_rule".toString())
         if (args.containsKey('fields') && !args.get('fields')) throw new IllegalArgumentException('fields must name at least one input; omit it to create the app with its page defaults')
+        if (args.app_type == 'button_controller' && !(args.get('fields') instanceof Map && args.get('fields').buttonDev)) throw new IllegalArgumentException("button_controller requires fields.buttonDev, the button device id list its first page saves with. Nothing was created.")
     }
 }
 private void _naValidateUpdate(Map args) {
@@ -24805,7 +24795,7 @@ hub_set_native_app works on classic Hubitat apps (dynamicPage apps), user and co
 
 ### create
 
-operation:"create" with args:{app_type,name?,fields?} does what Apps does: it opens the type's parent app (installing it first when the hub lacks it), presses that page's Create control, fills the new app's first page with fields and presses its Done, which installs the app. name goes to the label input the first page renders (origLabel, name, or the hub's own label field); a type whose first page renders none of them (Button Controller, Basic Rule, Thermostat Scheduler and Controller) refuses name. fields are checked against that page before anything is saved: an input it does not render, a button, a disabled input, a bad value or device ID, or a required input left empty for the Done is refused with success:false, and the new app is removed. Inputs that a choice reveals belong to update or form. The result reports app_id, label, fields_applied, and fields_not_landed (with success:false) for any field the hub did not store as written. installed:false means the first page has no Done (Basic Rule: finish it with form). A Done the hub answers by rendering the first page again returns success:false with what that page asks for, and the new app is removed. app_type rule_machine makes only an empty rule.
+operation:"create" with args:{app_type,name?,fields?} does what Apps does: it opens the type's parent app (installing it first when the hub lacks it), presses that page's Create control, fills the new app's first page with fields and presses its Done, which installs the app. name goes to the label input the first page renders (origLabel, name, or the hub's own label field); a type whose first page renders none of them (Button Controller, Basic Rule, Thermostat Scheduler and Controller) refuses name. app_type button_controller requires fields.buttonDev and is refused without it before anything is installed. fields are checked against that page before anything is saved: an input it does not render, a button, a disabled input, a bad value or device ID, or a required input left empty for the Done is refused with success:false, and the new app is removed. Inputs that a choice reveals belong to update or form. The result reports app_id, label, fields_applied, and fields_not_landed (with success:false) for any field the hub did not store as written. installed:false means the first page has no Done (Basic Rule: finish it with form). A Done the hub answers by rendering the first page again returns success:false with what that page asks for, and the new app is removed. app_type rule_machine makes only an empty rule.
 
 A button_rule takes args:{app_type:"button_rule",controller_id,button_number,event} and no name or fields. It runs the Button Controller's own Add Button, the button number, then that event's Create Button Rule control. The controller needs its button device assigned first. A button number the controller does not offer returns success:false after its page's Cancel, with the controller as before and the recovery point taken before the call rendered anything. The controller seeds the trigger; add the actions with hub_set_rule(operation:"update",ruleId:<returned app_id>).
 
@@ -26167,6 +26157,9 @@ private Map _ndApply(Long id, List changes, boolean created) {
         if (document.success == false) {
             written.documentReadError = document.error
             written.note = "The changes were written and verified; only reading the rule back failed. Do not send them again: read the rule with hub_set_rule(operation:'read') or hub_get_rule. See hub_get_tool_guide(section='set_rule_reference')."
+        } else if (groovy.json.JsonOutput.toJson(groovy.json.JsonOutput.toJson(written + [document: document])).getBytes("UTF-8").length > _responseSizeLimitBytes() - 1024) {
+            written.documentOmitted = true
+            written.note = "The changes were written and verified; the rule's document is too large to return with them. Do not send them again: read it one section at a time with hub_set_rule(operation:'read', args:{sections:['actions'], cursor:'', limit:50}) and follow nextCursor. See hub_get_tool_guide(section='set_rule_reference')."
         } else written.document = document
         written
     } catch (Exception failure) {
@@ -26193,19 +26186,20 @@ Map toolUpdateRuleDocument(Map args) {
         try { _ndPreflight(id, changes) }
         catch (Exception failure) { return [success: false, partial: false, ruleId: id, error: failure.message?.toString()] }
         Map beforeHealth = _rmCheckRuleHealth(id as Integer)
-        boolean alreadyBroken = beforeHealth.broken == true || beforeHealth.brokenRows
-        if (alreadyBroken) {
+        if (beforeHealth.broken == true) {
             String rows = beforeHealth.brokenRows ? ': ' + beforeHealth.brokenRows.collect { "${it.kind} ${it.id}" + (it.text ? " ('${it.text}')" : '') }.unique().join('; ') : ''
             return [success: false, partial: false, ruleId: id, broken: true, brokenRows: beforeHealth.brokenRows, checkErrors: beforeHealth.checkErrors,
                 error: "Rule ${id} is already broken${rows}; no change was written.".toString(),
                 note: "Repair the broken rows first: open the rule with hub_set_rule(operation:'form') or in the Hubitat UI and replace or remove what refers to the missing device or variable, then retry. hub_get_rule lists the broken rows; see hub_get_tool_guide(section='set_rule_reference').".toString()]
         }
-        boolean unread = beforeHealth.broken == null || beforeHealth.disabledActions == null
+        boolean unread = beforeHealth.broken == null || beforeHealth.disabledActions == null || beforeHealth.brokenRows == null
         if (unread) {
+            String why = beforeHealth.broken == null ? "broken flag could not be read before the write, so whether it is already broken is unknown" :
+                beforeHealth.disabledActions == null ? "compiled state could not be read before the write, so it is not known to be intact" :
+                "device settings could not be read before the write, so a row whose device was deleted would go unnoticed"
             return [success: false, partial: false, ruleId: id, broken: beforeHealth.broken, checkErrors: beforeHealth.checkErrors,
-                error: (beforeHealth.broken == null ? "Rule ${id}'s broken flag could not be read before the write, so whether it is already broken is unknown; no change was written." :
-                    "Rule ${id}'s compiled state could not be read before the write, so it is not known to be intact; no change was written.").toString(),
-                note: "checkErrors says why. Check that the hub answers with hub_get_info, then read the rule with hub_get_rule: send the update once its health reads broken:false and lists disabledActions. If it stays unreadable, check the rule in the Hubitat UI or with hub_set_rule(operation:'form') before editing it. See hub_get_tool_guide(section='set_rule_reference')."]
+                error: "Rule ${id}'s ${why}; no change was written.".toString(),
+                note: "checkErrors says why. Check that the hub answers with hub_get_info, then read the rule with hub_get_rule: send the update once its health reads broken:false and lists disabledActions and brokenRows. If it stays unreadable, check the rule in the Hubitat UI or with hub_set_rule(operation:'form') before editing it. See hub_get_tool_guide(section='set_rule_reference')."]
         }
         Map backup
         try { backup = _ndEditBackup(id, 'pre-document-update') }
@@ -26375,7 +26369,7 @@ Each change is {part,value}. Supported parts:
 
 Typed fields use exact native names containing # for the allocated ID, for example logmsg.#. Expressions use existing native condition IDs and (, ), NOT, AND, OR, XOR. Omit an id to append; provide an existing native id to edit. Field names and capability/action variants require verified native contracts; not every capability-specific variant is supported. Discover native options through operation:"form" when a document contract is unavailable. Unknown fields cannot be assumed to compile correctly merely because a setting persists. A successful result establishes native model checks, typed readback, native editor diagnostics, expression-reference checks and nonbroken health with activation status; independently verify device behavior and native UI editing for the intended automation.
 
-Example changes: [{part:"action",value:{type:"messageActs",subtype:"getLogMsg",fields:[{name:"logmsg.#",type:"textarea",value:"Document action"}]}}]. Writes render the native trigger/action/main pages, check health, submit native Done, and read subscriptions plus a fresh document. These pages can mutate native state; a document read renders none of them.
+Example changes: [{part:"action",value:{type:"messageActs",subtype:"getLogMsg",fields:[{name:"logmsg.#",type:"textarea",value:"Document action"}]}}]. Writes render the native trigger/action/main pages, check health, submit native Done, and read subscriptions plus a fresh document; a document too large to send with the result is left out (documentOmitted:true), so read it by section. These pages can mutate native state; a document read renders none of them.
 
 ## Native Rule Forms
 
@@ -30618,7 +30612,7 @@ private List _mrtrCollapseRuleResults(List entries) {
         def rid = (entry instanceof Map) ? entry.ruleId : null
         if (rid == null) {
             unkeyed << entry
-        } else {
+        } else if (entry.dispatched != false || !lastByRule.containsKey(rid.toString())) {
             lastByRule.put(rid.toString(), entry)
         }
     }
@@ -34526,6 +34520,21 @@ boolean _rmIsEditableRuleType(namespace, name) {
 private List _rmBrokenRows(Map compiled, List appSettings) {
     def kinds = ['trigger', 'condition', 'action']
     def stores = [trigger: compiled.capabstrue, condition: compiled.capabsfalse, action: compiled.actions]
+    def order = compiled.actionList instanceof List ? compiled.actionList.collect { it.toString() } : []
+    def evals = compiled.eval instanceof Map ? compiled.eval : [:]
+    def expressionIds = appSettings.any { it.name == 'useST' && it.value?.toString() == 'true' } ? ['0'] : []
+    def used = []
+    order.each { actionId ->
+        def action = compiled.actions instanceof Map ? _nmEntry(compiled.actions, actionId) : null
+        if (!(action instanceof Map)) return
+        if (action.cond != null) used << action.cond.toString()
+        if (action.rule != null) expressionIds << action.rule.toString()
+    }
+    expressionIds.each { expressionId ->
+        def tokens = _nmEntry(evals, expressionId)
+        if (tokens instanceof List) used.addAll(tokens.collect { it.toString() })
+    }
+    def inUse = [trigger: null, condition: used, action: order]
     def rows = []
     appSettings.each { setting ->
         if (!setting.type?.startsWith('capability') || setting.deviceIds) return
@@ -34539,6 +34548,8 @@ private List _rmBrokenRows(Map compiled, List appSettings) {
         if (kind == null) return
         def stored = stores.get(kind)
         if (!(stored instanceof Map) || !stored.containsKey(id)) return
+        def listed = inUse.get(kind)
+        if (listed != null && !(id in listed)) return
         Map row = [kind: kind, id: id, setting: setting.name]
         if (stored.get(id) instanceof String) row.text = stored.get(id)
         rows << row
@@ -34633,16 +34644,19 @@ Map _rmCheckRuleHealth(Integer appId) {
     boolean nativeBroken = result.broken == true
     boolean scanRows = compiled != null && status != null && (nativeBroken || editable)
     if (scanRows) result.brokenRows = _rmBrokenRows(compiled, status.appSettings)
+    boolean rowsUnread = (editable || nativeBroken) && result.ruleFormat == "rm" && (!scanRows || status.appSettingsMalformed)
+    if (rowsUnread) {
+        result.brokenRows = null
+        checkErrors << (compiled == null ? "the rule's compiled state went unread, so brokenRows was not listed" : "the rule's settings went unread, so brokenRows was not listed").toString()
+    }
     if (result.brokenRows) result.broken = true
     if (result.ruleFormat == "rm" && result.broken == null && !brokenNoted) checkErrors << "the rule's broken flag could not be read, so whether it is broken is unknown".toString()
     if (labelBroken && result.broken == null) issues << "label contains *BROKEN* marker, a hint that the rule has a malformed trigger or action; no broken verdict could be read to confirm it".toString()
     boolean rmBroken = result.ruleFormat == "rm" && result.broken == true
     if (rmBroken) {
-        int deadRows = result.brokenRows.collect { [it.kind, it.id] }.unique().size()
+        int deadRows = (result.brokenRows ?: []).collect { [it.kind, it.id] }.unique().size()
         issues << (nativeBroken ? "Rule Machine marks this rule broken: a trigger, condition or action refers to something that is gone; brokenRows lists the rows whose device is gone." :
             "the rule refers to ${deadRows} row(s) whose device was deleted, which Rule Machine's own check does not flag; brokenRows lists them.").toString()
-        if (compiled == null) checkErrors << "the rule's compiled state went unread, so brokenRows was not listed".toString()
-        else if (status?.appSettingsMalformed) checkErrors << "the status page's appSettings is not a list, so brokenRows was not listed".toString()
     }
     if (compiled != null) {
         result.disabledActions = _rmDisabledRowIds(compiled, "disabledActions", checkErrors)
@@ -34660,9 +34674,10 @@ Map _rmCheckRuleHealth(Integer appId) {
         if (!visual) {
             boolean pausable = ruleType || result.ruleFormat == "basic-rule"
             Map paused = _appStatusFlag(status, "paused")
-            if (paused.value != null) result.paused = paused.value
-            else if (result.paused == null && pausable && !paused.present && !paused.missing) result.paused = false
+            if (paused.present) { result.paused = paused.value; labelPaused = null }
+            else if (result.paused == null && pausable && !paused.missing) result.paused = false
             Map stopped = _appStatusFlag(status, "stopped")
+            if (stopped.present) labelStopped = null
             result.stopped = stopped.value != null ? stopped.value : (ruleType && !stopped.present && !stopped.missing ? false : null)
             Map flags = [paused: paused, stopped: stopped]
             if (ruleType) { flags.put("private", _appStatusFlag(status, "private")); result.privateBoolean = flags.get("private").value }
@@ -36018,7 +36033,7 @@ Rule runtime control surface (hub_list_rules = Read master; hub_call_rule and th
 - **hub_list_rules** — lists Rule Machine 5.x rules, each with a live **status** ("active" | "paused" | "stopped" | "disabled" | "unknown"), the **disabled** and **paused** booleans (omitted when unknown) and, only when detected, **requiredExpressionFalse: true**.
   - **disabled** is the app's red-X flag from /hub2/appsList.
   - **paused** and **stopped** come from Rule Machine's name decoration. The appsList name and the RMUtils label are compared with markup stripped and entities decoded; the text the appsList name adds — "(Paused)", "(Stopped)", "(Required Expression false)" — sets the flag. A rule literally NAMED "... (Paused)" or "... (Stopped)" carries the suffix in both strings and is not flagged. A stopped rule's label and name come back without the decoration, in the encoding they already use.
-  - The name shows one decoration at a time ("(Stopped)" hides "(Paused)"), so a decorated row also reads that rule's own paused/stopped state; undecorated rows make no extra read. If that read fails, the name decides and the row carries **statusSource: "name"**, with **statusSourceNote** listing those ids. Rule Machine refreshes the decoration when the rule's page renders: hub_call_rule(action="stop"/"start"/"pause"/"resume") renders it, so the list is current after an MCP stop, start, pause or resume, while a stop made elsewhere shows once the rule's page is next opened.
+  - The name shows one decoration at a time ("(Stopped)" hides "(Paused)"), so a decorated row also reads that rule's own paused/stopped state; undecorated rows make no extra read. If that read fails, the name decides and the row carries **statusSource: "name"**, with **statusSourceNote** listing those ids. Rule Machine refreshes the decoration when the rule's page renders: hub_call_rule(action="stop"/"start"/"pause"/"resume") renders it, so the list is current after an MCP stop, start, pause or resume (unless that render failed, which the call's note reports; hub_get_rule then reads the flag), while a stop made elsewhere shows once the rule's page is next opened.
   - **status** precedence is disabled > stopped > paused > active; the booleans stay independent (a paused rule disabled later reads disabled:true, paused:true, status:"disabled").
   - **unknown**: when /hub2/appsList cannot be read, every rule is unknown, the list is unfiltered (deleted rules may linger) and the result carries **statusNote**; when one rule's entry lacks data, only that rule is unknown.
   - For one rule's state call hub_get_rule. Button Rules, Basic Rules and other classic apps (Room Lighting, Notifier, Button Controllers) are listed, with their disabled flag, by hub_list_apps (scope='instances'; nameFilter matches the app type too, so 'Button Rule' finds Button Rules), and Visual Rules by hub_get_visual_rule.
@@ -36048,9 +36063,11 @@ For BACKUP enumeration and restore, use the unified **hub_list_backups** (in hub
 4. Deletes are soft by default; force=true also removes children.
 
 ### CRUD workflow example
-  hub_set_rule(operation="create", args={parentId:<Rule Machine parent>, name:"BAT-RM-demo", changes:[<native changes>]}, confirm=true) → ruleId
+  hub_create_backup(confirm=true, bestPracticeKey=<backup key>) → a hub backup, which the writes below require within 24 hours
+  hub_set_rule(operation="create", args={parentId:<Rule Machine parent>, name:"BAT-RM-demo", changes:[<native changes>]}, confirm=true, bestPracticeKey=<set_rule_reference key>) → ruleId
   hub_get_rule(ruleId=<ruleId>) → health.ok=true, health.issues:[]
-  hub_delete_native_app(appId=<ruleId>, force=true, confirm=true) → {backup: {backupKey: "rm-rule_<ruleId>_..."}}
+  hub_delete_native_app(appId=<ruleId>, force=true, confirm=true, bestPracticeKey=<builtin_app_tools_crud key>) → {backup: {backupKey: "rm-rule_<ruleId>_..."}}
+  (bestPracticeKey is needed while mandatory guide acknowledgment is on, the default; reads take none.)
 
 ### hub_list_drivers (list device driver TYPES on the hub)
 
@@ -36068,9 +36085,9 @@ For BACKUP enumeration and restore, use the unified **hub_list_backups** (in hub
 - **`actions`**: run the rule's actions directly, skipping condition evaluation. A Rule Machine rule's Run Actions button (`runAction`) is clicked; a Visual Rule Builder 2.0 rule runs through its builder's run endpoint, whose conditions still pick the branch, and a run the hub declines comes back as success:false with the hub's own message. A Visual Rule Builder 1.0 rule has no run button, so `actions` naming one refuses the whole call before anything runs; pause and resume work on it.
 - **`stop`**: halt the rule's in-progress actions (Rule Machine only).
 - **`start`**: restart a stopped rule (clears stopped and re-initializes it; the private boolean is unchanged; Rule Machine only).
-- **`pause`** / **`resume`**: pause or resume the rule; a paused rule does not fire on its triggers. A Rule Machine rule's Pause button (`pausRule`) is clicked; a Visual Rule is paused through its builder's pause endpoint.
+- **`pause`** / **`resume`**: pause or resume the rule; a paused rule does not fire on its triggers. A Rule Machine rule's Pause button (`pausRule`) is clicked; a Visual Rule is paused through its builder's pause endpoint, and its paused state is read again afterwards, so an endpoint success that left it unchanged returns success:false.
 
-Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume click the rule's page is rendered once, so hub_list_rules shows the new status at once, and the flag is read again: the hub accepts a click that changes nothing, so a flag still not in the target state returns success:false, and hub_get_rule shows where the rule ended up. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: a toggle reads the rule's state and then clicks, so two overlapping calls on one rule can both click and undo each other (the read after the click reports it as success:false); to act on several rules, name them all in one call's `ruleId` array. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean, which acts only on Rule Machine rules and Button Rules.
+Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume click the rule's page is rendered once, so hub_list_rules shows the new status at once (when that render fails, the result's note says so and hub_list_rules may show the old status until the rule's page is next opened; repeating the call does not refresh it, since the rule is already in the target state, so check the flag with hub_get_rule), and the flag is read again: the hub accepts a click that changes nothing, so a flag still not in the target state returns success:false, and hub_get_rule shows where the rule ended up. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: a toggle reads the rule's state and then clicks, so two overlapping calls on one rule can both click and undo each other (the read after the click reports it as success:false); to act on several rules, name them all in one call's `ruleId` array. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean, which acts only on Rule Machine rules and Button Rules.
 
 ### hub_get_rule
 
@@ -36083,14 +36100,14 @@ Every action on a Rule Machine rule drives the rule's own page buttons (`runActi
 `health` has the same shape here, in hub_set_rule's read and in the update pre-check:
 
 - `ruleFormat` says what was inspected: `rm` (any Rule Machine rule or Button Rule) / `vrb-graph` / `vrb-classic` / `basic-rule` / `button-controller` / `classic-app`.
-- **Rule Machine**: `broken` comes from the rule's own broken() check (a Rule Machine 5.1 rule or Button Rule; an older rule type reports its stored flag), so a rule whose trigger device was deleted reads broken without anyone opening it. That check misses a condition whose device was deleted, so a Rule Machine 5.1 rule or Button Rule with any `brokenRows` entry also reads `broken:true` and `ok:false`, and an issue says Rule Machine's own check does not flag it. `brokenRows` (`[{kind: trigger|action|condition, id, setting, text?}]`) lists each row whose device setting no longer names a device: `id` is the row's native id, the one hub_set_rule changes and operation:'form' use (trigger 2 is `tDev2`), `setting` the setting that lost its device, and `text` the trigger's or condition's stored description. A row that is broken for another reason (a deleted variable) is not listed, so `broken:true` with no rows means the broken row has no device setting, unless checkErrors says brokenRows was not listed (the rule's compiled state or settings went unread). `disabledActions` and `disabledTriggers` (native ids of rows switched off; `[]` when none), `structuralIssues` (the IF/Repeat block and expression check hub_set_rule runs) and `privateBoolean`.
+- **Rule Machine**: `broken` comes from the rule's own broken() check (a Rule Machine 5.1 rule or Button Rule; an older rule type reports its stored flag), so a rule whose trigger device was deleted reads broken without anyone opening it. That check misses a condition whose device was deleted, so a Rule Machine 5.1 rule or Button Rule with any `brokenRows` entry also reads `broken:true` and `ok:false`, and an issue says Rule Machine's own check does not flag it. `brokenRows` (`[{kind: trigger|action|condition, id, setting, text?}]`) lists each row in use (a trigger, an action in the action list, or a condition an action or the Required Expression uses) whose device setting no longer names a device: `id` is the row's native id, the one hub_set_rule changes and operation:'form' use (trigger 2 is `tDev2`), `setting` the setting that lost its device, and `text` the trigger's or condition's stored description. A row that is broken for another reason (a deleted variable) is not listed, so `broken:true` with no rows means the broken row has no device setting. `brokenRows` is null when it was not listed because the rule's compiled state or settings went unread; checkErrors says which. `disabledActions` and `disabledTriggers` (native ids of rows switched off; `[]` when none), `structuralIssues` (the IF/Repeat block and expression check hub_set_rule runs) and `privateBoolean`.
 - **Visual Rules Builder**: the engine's own verdict, a graph rule's `validationErrors` (broken when non-empty), and its pause state from its builder, with the rule's own name as `label`.
 - **Other apps** (Basic Rule, Button Controller, Room Lighting, user and community apps): label, red-X flag and the state flags below; `broken` is null.
-- `paused`, `stopped` and `privateBoolean` come from the app's state on its App Status page. A Rule Machine rule with no `paused` or `stopped` entry reads `false`, and so does a Basic Rule with no `paused` entry; for an app whose state has no flag, or when the status page cannot be read, the name's "(Paused)" or "(Stopped)" decoration is used. `privateBoolean` has no such fallback. An entry stored as neither true nor false reads null with a `checkErrors` entry. `label` has the decoration removed. `disabled` is the red-X flag.
+- `paused`, `stopped` and `privateBoolean` come from the app's state on its App Status page. A Rule Machine rule with no `paused` or `stopped` entry reads `false`, and so does a Basic Rule with no `paused` entry; for an app whose state has no flag, or when the status page cannot be read, the name's "(Paused)" or "(Stopped)" decoration is used. `privateBoolean` has no such fallback. An entry stored as neither true nor false reads null with a `checkErrors` entry; neither the compiled state nor the name's decoration replaces it. `label` has the decoration removed. `disabled` is the red-X flag.
 - `eventSubscriptionCount` and `scheduledJobCount` count the app's live subscriptions and scheduled jobs from the same read; the lists themselves come from hub_get_app_config(includeStatus=true).
 - A value the hub does not return reads null.
 
-`ok:true` means everything was read and nothing is wrong. `ok:false` with `unreadable:false` means `issues` names a problem or `checkErrors` names a read that failed, leaving part of the rule unchecked; `unreadable:true` means nothing could be read, which is not evidence of breakage. A `checkErrors` entry is not evidence about the rule either. A Rule Machine rule whose `broken` could not be read always has a `checkErrors` entry, so `broken:null` never reads `ok:true`; hub_set_rule(operation='update') refuses a rule with `broken:null`, or whose compiled state went unread (`disabledActions:null`), before any backup or write. A structural issue is expected while a block is built across several calls; finish it with a hub_set_rule(operation='update') terminator change, and compare with hub_get_rule(sections=['actions']) before considering a restore. hub_set_rule(operation='update') refuses a rule that is already broken before any backup or write, naming each broken row by kind and native id.
+`ok:true` means everything was read and nothing is wrong. `ok:false` with `unreadable:false` means `issues` names a problem or `checkErrors` names a read that failed, leaving part of the rule unchecked; `unreadable:true` means nothing could be read, which is not evidence of breakage. A `checkErrors` entry is not evidence about the rule either. A Rule Machine rule whose `broken` could not be read always has a `checkErrors` entry, so `broken:null` never reads `ok:true`; hub_set_rule(operation='update') refuses a rule with `broken:null`, whose compiled state went unread (`disabledActions:null`), or whose settings went unread (`brokenRows:null`, since Rule Machine's own check misses a deleted condition device), before any backup or write. A structural issue is expected while a block is built across several calls; finish it with a hub_set_rule(operation='update') terminator change, and compare with hub_get_rule(sections=['actions']) before considering a restore. hub_set_rule(operation='update') refuses a rule that is already broken before any backup or write, naming each broken row by kind and native id.
 
 ### hub_delete_native_app
 
