@@ -2376,7 +2376,7 @@ private Map _vrbSetPaused(Integer appId, boolean paused) {
         if (parsed instanceof Map && parsed.success == false) {
             return [success: false, error: parsed.message ? "pause endpoint reported: ${parsed.message}" : "pause endpoint returned success=false"]
         }
-        return [success: true]
+        return [success: true, confirmed: parsed instanceof Map && parsed.success == true]
     } catch (Exception e) {
         return [success: false, error: "pause endpoint returned a non-JSON response: ${text?.take(200)}"]
     }
@@ -2398,9 +2398,13 @@ private Map _vrbRunNow(Integer appId) {
         return [success: false, ruleId: appId, error: "hub_call_rule action=actions: /app/ruleBuilderRun returned a non-JSON response: ${text?.take(200)}".toString(),
                 note: _vrbRunUncertainNote()]
     }
-    if (parsed.success != true) {
+    if (parsed.success == false) {
         return [success: false, ruleId: appId, error: "The hub did not run Visual Rule ${appId}: ${parsed.message ?: 'its run endpoint answered success:false'}".toString(),
                 note: "Nothing else was tried. Read the rule with hub_get_visual_rule; a rule whose definition has validation errors does not run."]
+    }
+    if (parsed.success != true) {
+        return [success: false, ruleId: appId, error: "hub_call_rule action=actions: /app/ruleBuilderRun answered without a success verdict: ${text?.take(200)}".toString(),
+                note: _vrbRunUncertainNote()]
     }
     def out = [success: true, ruleId: appId, rmAction: "ruleBuilderRun"]
     if (parsed.message) out.message = parsed.message.toString()
@@ -17030,7 +17034,13 @@ private void _appConfigFitStatus(Map result) {
             cut << "${key} lists the first ${keep} of ${full.size()}".toString()
         }
     }
-    result.statusTruncatedNote = ("The status lists were too large for one response, so appState lists names only, its values omitted" +
+    String stateText = "appState lists names only, its values omitted"
+    if (_appConfigResultBytes(result) > budget) {
+        result.appStateTotal = result.appState.size()
+        result.remove('appState')
+        stateText = "appState is omitted (${result.appStateTotal} entries)".toString()
+    }
+    result.statusTruncatedNote = ("The status lists were too large for one response, so ${stateText}" +
         (cut ? "; ${cut.join('; ')}" : "") + ". The app's App Status page in the Hubitat UI shows the values. " +
         "See hub_get_tool_guide(section='builtin_app_tools_apps').").toString()
 }
@@ -22226,7 +22236,7 @@ def _getAllToolDefinitions_partNativeRM() {
     return [
         [
             name: "hub_list_rules",
-            description: "List all Rule Machine rules (deduplicated by id) with each rule's id, label, and live `status` (`active`/`paused`/`stopped`/`disabled`).[[FLAT_TRIM]] Requires the Read master.[[/FLAT_TRIM]][[FLAT_TRIM]] `status` is `unknown` when the hub's app list is momentarily unreadable. Status reflects Rule Machine's name decoration (refreshed after an MCP stop, start, pause or resume); a decorated rule's paused/stopped come from its own state, and a row marked statusSource:'name' fell back to the decoration because that state could not be read. A stop made outside MCP may show only after the rule's page is next opened. For ONE rule's state, call hub_get_rule(ruleId) instead of listing every rule — its health returns that rule's paused/disabled/stopped/broken directly. For the enabled/disabled state of NON-RM classic apps (Room Lighting, Notifier, Basic Rules, Button Controllers) use `hub_list_apps` (scope='instances'). Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the status-detection semantics and platform limitations on RM rule internals.[[/FLAT_TRIM]]",
+            description: "List all Rule Machine 5.x rules (deduplicated by id) with each rule's id, label, and live `status` (`active`/`paused`/`stopped`/`disabled`).[[FLAT_TRIM]] Requires the Read master.[[/FLAT_TRIM]][[FLAT_TRIM]] `status` is `unknown` when the hub's app list is momentarily unreadable. Status reflects Rule Machine's name decoration (refreshed after an MCP stop, start, pause or resume); a decorated rule's paused/stopped come from its own state, and a row marked statusSource:'name' fell back to the decoration because that state could not be read. A stop made outside MCP may show only after the rule's page is next opened. For ONE rule's state, call hub_get_rule(ruleId) instead of listing every rule — its health returns that rule's paused/disabled/stopped/broken directly. For the enabled/disabled state of NON-RM classic apps (Room Lighting, Notifier, Basic Rules, Button Controllers) use `hub_list_apps` (scope='instances'). Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the status-detection semantics and platform limitations on RM rule internals.[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -22517,6 +22527,7 @@ private boolean _rmSettleRuleStatusFromState(Map entry, Map flags) {
         Map status = _appStatusRead(flags.appId as Integer)
         Map statePaused = _appStatusFlag(status, "paused")
         Map stateStopped = _appStatusFlag(status, "stopped")
+        if (statePaused.missing) throw new IllegalStateException("its status page carried no appState")
         [statePaused, stateStopped].each { if (it.present && it.value == null) fromState = false }
         if (statePaused.value != null || !statePaused.present) paused = statePaused.value == true
         if (stateStopped.value != null || !stateStopped.present) stopped = stateStopped.value == true
@@ -22564,7 +22575,7 @@ def toolRunRmRule(args) {
     }
     ruleIds.each { _requireUnprotectedAppMutation(it, "change rule runtime") }
     Map guard = _rmRequireRuleTargets(ruleIds, "hub_call_rule", true)
-    if (guard.failure) return guard.failure + [ruleIds: ruleIds]
+    if (guard.failure) return _rmRunGuardFailure(ruleIds, guard)
     List<Integer> visual = ruleIds.findAll { _rmIsVisualRuleType(guard.types.get(it) as String) }
     if (visual && action in ["stop", "start"]) {
         throw new IllegalArgumentException("Visual Rules have no stop or start; rule(s) ${visual.join(', ')} are Visual Rules. Use action:'pause' or 'resume' for them. Nothing was dispatched.")
@@ -22608,16 +22619,36 @@ def toolRunRmRule(args) {
             ? "${action} failed for EVERY rule in the batch (${failed.join(', ')}); per-rule detail in results[].".toString()
             : "${action} failed for rule(s) ${failed.join(', ')} -- the other ${actionedCount} rule(s) in the batch WERE actioned; per-rule detail in results[].".toString()
         out.note = runActions
-            ? "Re-issue for the failed ids only: a repeat of a succeeded id runs that rule's actions again."
+            ? _rmRunFailedNote(failed)
             : "Re-issue for the failed ids only. A repeat of a succeeded id is safe: the toggle no-ops rules already in the target state."
     }
     if (budgetPaused) {
         out.remainingRuleIds = remaining
         if (!out.error) out.error = "Response-budget checkpoint: rule(s) ${remaining.join(', ')} were not yet actioned."
-        def reissueIds = (failed + remaining).unique()
-        out.note = "Budget checkpoint -- re-issue with ruleId=[${reissueIds.join(', ')}] to finish${failed ? " (includes the ${failed.size()} failed id(s), not just the un-reached ones)" : ""}; ${runActions ? 'leave out the rules already run, or their actions run again' : 'already-actioned rules no-op safely'}.".toString()
+        if (runActions) {
+            out.note = ("Budget checkpoint -- re-issue with ruleId=[${remaining.join(', ')}] to run the rules not yet reached; leave out the rules already run, or their actions run again." +
+                (failed ? " ${_rmRunFailedNote(failed)}" : "")).toString()
+        } else {
+            def reissueIds = (remaining + failed).unique()
+            out.note = "Budget checkpoint -- re-issue with ruleId=[${reissueIds.join(', ')}] to finish${failed ? " (includes the ${failed.size()} failed id(s), not just the un-reached ones)" : ""}; already-actioned rules no-op safely.".toString()
+        }
     }
     return out
+}
+private String _rmRunFailedNote(List failed) {
+    "Rule(s) ${failed.join(', ')} failed: read each one's results[] note before running it again, because a run whose answer was lost may already have run the actions. A repeat of a succeeded id runs that rule's actions again.".toString()
+}
+private Map _rmRunGuardFailure(List<Integer> ruleIds, Map guard) {
+    Map failure = guard.failure as Map
+    if (ruleIds.size() == 1) return [ruleId: ruleIds[0]] + failure + [ruleIds: ruleIds]
+    Map unreadable = guard.unreadable as Map
+    def rows = ruleIds.collect { id ->
+        unreadable.containsKey(id)
+            ? [success: false, ruleId: id, error: "The rule could not be looked up (${unreadable.get(id)}), so it was not run.".toString()]
+            : [success: false, ruleId: id, error: "Not run: another rule in the same call could not be looked up, so none of them was dispatched."]
+    }
+    [success: false, partial: false, ruleIds: ruleIds, results: rows, failedRuleIds: ruleIds, error: failure.error,
+     note: "No rule in this lookup was run; each one's results[] row says why. Retry them once; if the lookup fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
 }
 private Map _rmRequireRuleTargets(List<Integer> ruleIds, String toolName, boolean visualRules = false) {
     Map<Integer, String> types = [:]
@@ -22645,7 +22676,7 @@ private Map _rmRequireRuleTargets(List<Integer> ruleIds, String toolName, boolea
     }
     if (unreadable) {
         unreadable.each { id, why -> mcpLog("warn", "rm-interop", "${toolName}: app ${id} could not be identified (${why}); nothing dispatched") }
-        return [failure: _rmLookupFailure(unreadable)]
+        return [failure: _rmLookupFailure(unreadable), unreadable: unreadable]
     }
     return [types: types]
 }
@@ -22660,6 +22691,7 @@ private Map _rmRunActionsButton(Integer ruleId) {
 }
 private boolean _rmRuntimeFlag(Integer ruleId, String name) {
     Map flag = _appStatusFlag(_appStatusRead(ruleId), name)
+    if (flag.missing) throw new IllegalStateException("its status page carried no appState")
     if (flag.present && flag.value == null) throw new IllegalStateException("its ${name} state is neither true nor false")
     return flag.value == true
 }
@@ -22714,8 +22746,14 @@ private Map _vrbTogglePaused(Integer ruleId, String action) {
     } catch (Exception e) {
         sent = [success: false, error: "pause endpoint failed: ${e.message}"]
     }
+    if (sent.success == true && sent.confirmed != true) {
+        def after = _ruleCompiledState(ruleId)
+        if (after?.paused != target) {
+            sent = [success: false, error: (after?.paused == null ? "the pause endpoint gave no success verdict and the rule's paused state could not be read, so the change could not be confirmed" : "the pause endpoint gave no success verdict and the rule then read paused=${after.paused}").toString()]
+        }
+    }
     if (sent.success != true) return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: ${sent.error}".toString(),
-        note: "Re-issuing is safe: the Visual Rule's state is read first and a rule already ${target ? 'paused' : 'not paused'} is left alone. Confirm with hub_get_rule or hub_list_rules. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
+        note: "Re-issuing is safe: the Visual Rule's state is read first and a rule already ${target ? 'paused' : 'not paused'} is left alone. Confirm with hub_get_rule (Visual Rules are not in hub_list_rules). See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
     return [success: true, ruleId: ruleId, rmAction: "ruleBuilderPause -> ${target}".toString()]
 }
 private Object _rmGetStateEditAct(Integer appId) {
@@ -22812,15 +22850,7 @@ private Map _collectLiveApps() {
     return complete ? apps : null
 }
 private Integer _rmCoerceRuleId(Object id) {
-    try {
-        if (id instanceof Number) {
-            return (id.doubleValue() == id.longValue()) ? id.intValue() : null
-        }
-        def s = id?.toString()?.trim()
-        if (!s) return null
-        def bd = new BigDecimal(s)
-        return (bd.stripTrailingZeros().scale() <= 0) ? bd.intValue() : null
-    } catch (Exception ignored) { return null }
+    return _exactIntId(id)
 }
 private List _rmCollectTriggerIndices(Integer appId) {
     def status = _rmFetchStatusJson(appId)
@@ -22912,7 +22942,7 @@ Map _rmDeleteAction(Integer appId, Integer actionIdx, boolean skipStructuralChec
         ][sType] ?: sType
         def orderedIndices = _rmOrderedActionIndices(appId)
         if (orderedIndices == null) {
-            throw new IllegalStateException("removeAction(${actionIdx}) blocked: action ${actionIdx} is a structural ${humanKind} row and the rule's compiled action order (ruleBuilderJson actionList) is unavailable, so the deletion's effect on block balance cannot be verified -- the settings scan can be masked by leftover rows. Retry once ruleBuilderJson answers (hub_get_rule lists the read failure under health.checkErrors), or use replaceActions to rebuild the action list atomically. RM is not touched.")
+            throw new IllegalStateException("removeAction(${actionIdx}) blocked: action ${actionIdx} is a structural ${humanKind} row and the rule's compiled action order (ruleBuilderJson actionList) is unavailable, so the deletion's effect on block balance cannot be verified -- the settings scan can be masked by leftover rows. Retry once ruleBuilderJson answers (hub_get_rule lists the read failure under health.checkErrors). RM is not touched.")
         }
         def currentIssues = _rmStructuralIssuesFromSequence(
             _rmStructuralSequenceFromSettings(settingsByName, ([] as Set), orderedIndices))
@@ -22920,7 +22950,7 @@ Map _rmDeleteAction(Integer appId, Integer actionIdx, boolean skipStructuralChec
             _rmStructuralSequenceFromSettings(settingsByName, ([actionIdx] as Set), orderedIndices))
         def newIssues = projectedIssues - currentIssues
         if (newIssues) {
-            throw new IllegalArgumentException("removeAction(${actionIdx}) blocked: action ${actionIdx} is a structural ${humanKind}; removing it would introduce a new structural-balance issue (${newIssues.first()}). Remove the matching opener/closer first, or use replaceActions to rebuild the action list atomically. RM is not touched.")
+            throw new IllegalArgumentException("removeAction(${actionIdx}) blocked: action ${actionIdx} is a structural ${humanKind}; removing it would introduce a new structural-balance issue (${newIssues.first()}). Remove the matching opener/closer first. RM is not touched.")
         }
     }
     _rmClickAppButton(appId, actionIdx.toString(), "delAct", "selectActions")
@@ -25702,8 +25732,15 @@ Map toolGetRuleDocument(Map args) {
     _nrHandle(id)
     try {
         def document = [ruleId: id, health: _rmCheckRuleHealth(id as Integer)]
-        Map nativeState = _nrState(id)
-        if (withLocals) document.localVariables = _ndLocalVariables(id)
+        Map nativeState = sections.any { it in ['actions', 'conditions', 'triggers', 'expressions'] } ? _nrState(id) : null
+        if (withLocals) {
+            try { document.localVariables = _ndLocalVariables(id) }
+            catch (Exception localsFailure) {
+                mcpLog('warn', 'rm-native', "hub_get_rule: rule ${id}'s local variables could not be read (${localsFailure.message})")
+                document.localVariables = null
+                document.localVariablesError = (localsFailure.message ?: localsFailure.toString()).toString()
+            }
+        }
         if ('actions' in sections) document.actions = (nativeState.actionList instanceof List ? nativeState.actionList : []).collect { actionId ->
             [id: actionId.toString(), value: nativeState.actions instanceof Map ? _nmEntry(nativeState.actions, actionId.toString()) : null]
         }
@@ -25743,7 +25780,7 @@ Map toolGetRuleDocument(Map args) {
     } catch (Exception failure) {
         mcpLogError('rm-native', "${toolName} read failed for rule ${id}: ${failure.message}".toString(), failure)
         [success: false, ruleId: id, error: "Rule ${id} could not be read: ${failure.message ?: failure.toString()}".toString(),
-         note: "Nothing was changed. Retry once; if it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
+         note: "Retry once; the read writes nothing beyond rendering the rule's page, as opening it does. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
     }
 }
 private List _ndChanges(Object changes, boolean allowEmpty = false) {
@@ -26057,7 +26094,13 @@ Map toolUpdateRuleDocument(Map args) {
         if (getAppByAppId(id)?.disabled == true) throw new IllegalArgumentException('Enable the native rule before editing its document')
         try { _ndPreflight(id, changes) }
         catch (Exception failure) { return [success: false, partial: false, ruleId: id, error: failure.message?.toString()] }
-        Map beforeHealth = _rmCheckRuleHealth(id as Integer)
+        Map rendered = [:]
+        Map beforeHealth = _rmCheckRuleHealth(id as Integer, rendered)
+        if (rendered.page != true) {
+            return [success: false, partial: false, ruleId: id, checkErrors: beforeHealth.checkErrors,
+                error: "Rule ${id}'s page could not be rendered before the write, so whether it is already broken is unknown; no change was written.".toString(),
+                note: "Retry once; if it fails again, check that the hub answers with hub_get_info and open the rule with hub_get_rule. See hub_get_tool_guide(section='set_rule_reference')."]
+        }
         if (beforeHealth.broken == true) {
             String rows = beforeHealth.brokenRows ? ': ' + beforeHealth.brokenRows.collect { it.text ? "${it.kind} '${it.text}'" : "${it.kind} on line ${it.position} of its section" }.join('; ') : ''
             return [success: false, partial: false, ruleId: id, broken: true, brokenRows: beforeHealth.brokenRows,
@@ -29894,8 +29937,8 @@ private Map _mrtrContinuation(String leafTool, Map executionArgs, result, Map re
     if (leafTool == "hub_call_rule" && result.remainingRuleIds instanceof List
             && !result.remainingRuleIds.isEmpty()) {
         def retryIds = []
-        if (result.failedRuleIds instanceof List) retryIds.addAll(result.failedRuleIds)
         retryIds.addAll(result.remainingRuleIds)
+        if (result.failedRuleIds instanceof List) retryIds.addAll(result.failedRuleIds)
         nextLeaf.ruleId = retryIds.unique()
         kind = "call_rule"
     } else if (leafTool == "hub_create_driver" && result.status == "in_progress" &&
@@ -30060,6 +30103,7 @@ private def _mrtrAggregateTerminal(Map rec, result) {
                 out.remove("ruleId")
                 out.remove("rmAction")
                 out.remove("error")
+                if (!(result.results instanceof List)) out.remove("note")
             }
             def failed = out.results.findAll { it instanceof Map && it.success != true }
             out.success = out.success == true && failed.isEmpty()
@@ -33818,12 +33862,17 @@ def _exceptionStack(Throwable e) {
     return ("${e.class.name}: ${e.message}\n" + (e.getStackTrace()?.take(5)?.collect { it.toString() }?.join("\n") ?: "")).toString()
 }
 private Integer normalizeRuleId(def ruleId) {
-    if (ruleId instanceof Number) return ruleId.toInteger()
+    Integer exact = _exactIntId(ruleId)
+    if (exact == null) throw new IllegalArgumentException("The app id must be a whole number within the hub's id range, got: ${ruleId}. Find app ids with hub_list_apps or hub_list_rules.")
+    return exact
+}
+Integer _exactIntId(Object id) {
     try {
-        return ruleId.toString().trim() as Integer
-    } catch (NumberFormatException e) {
-        throw new IllegalArgumentException("ruleId must be an integer, got: ${ruleId}")
-    }
+        def s = id?.toString()?.trim()
+        if (!s) return null
+        def bd = new BigDecimal(s)
+        return (bd.stripTrailingZeros().scale() <= 0) ? bd.intValueExact() : null
+    } catch (Exception ignored) { return null }
 }
 private Map _appTypeRegistry() {
     return [
@@ -34131,7 +34180,7 @@ Map _appStatusRead(Integer appId) {
         if (value != null && !(value instanceof List)) throw new IllegalStateException("App ${appId}'s status page returned ${key} in an unexpected shape")
     }
     boolean maskTokens = _redactsAccessTokens()
-    [appState: appState.findAll { it instanceof Map }.collect { row ->
+    [appStateMissing: rawState == null, appState: appState.findAll { it instanceof Map }.collect { row ->
         String key = row.name?.toString()
         def value = _appStateMasked(key, row.value)
         if (maskTokens) value = _redactAccessTokens([(key): value]).get(key)
@@ -34142,10 +34191,11 @@ Map _appStatusRead(Integer appId) {
 private Object _appStateMasked(String name, Object value) {
     if (_appConfigMasksSetting(name, null, value)) return _appConfigRedactedMarker()
     if (value instanceof Map) return value.collectEntries { k, v -> [(k): _appStateMasked(k?.toString(), v)] }
-    if (value instanceof List) return value.collect { item -> item instanceof Map ? _appStateMasked(name, item) : item }
+    if (value instanceof List) return value.collect { item -> _appStateMasked(name, item) }
     value
 }
 private Map _appStatusFlag(Map status, String name) {
+    if (status?.appStateMissing == true) return [present: false, value: null, missing: true]
     def entry = (status?.appState ?: []).find { it?.name?.toString() == name }
     [present: entry != null, value: entry == null ? null : _appStateFlag(entry.value)]
 }
@@ -34361,7 +34411,7 @@ private List _rmDisabledRowIds(Map compiled, String key, List checkErrors) {
     checkErrors << "the rule's ${key} is not a list (${value}), so its disabled rows were not read".toString()
     return null
 }
-Map _rmCheckRuleHealth(Integer appId) {
+Map _rmCheckRuleHealth(Integer appId, Map probe = null) {
     def issues = []
     def checkErrors = []
     def result = [ok: false, unreadable: true, broken: null, ruleFormat: null, label: null, disabled: null,
@@ -34390,6 +34440,7 @@ Map _rmCheckRuleHealth(Integer appId) {
         try {
             cfg = _rmFetchConfigJson(appId)
             read = true
+            if (probe != null) probe.page = true
             if (typeName == null) typeName = cfg.app?.appType?.name?.toString()
             def label = cfg.app?.label?.toString()
             if (cfg.app?.disabled != null) result.disabled = (cfg.app.disabled == true)
@@ -34449,10 +34500,11 @@ Map _rmCheckRuleHealth(Integer appId) {
         if (!visual) {
             Map paused = _appStatusFlag(status, "paused")
             if (paused.value != null) result.paused = paused.value
-            else if (result.paused == null && ruleType && !paused.present) result.paused = false
+            else if (result.paused == null && ruleType && !paused.present && !paused.missing) result.paused = false
             Map stopped = _appStatusFlag(status, "stopped")
-            result.stopped = stopped.value != null ? stopped.value : (ruleType && !stopped.present ? false : null)
+            result.stopped = stopped.value != null ? stopped.value : (ruleType && !stopped.present && !stopped.missing ? false : null)
             if (ruleType) result.privateBoolean = _appStatusFlag(status, "private").value
+            if (paused.missing) checkErrors << "the app's status page carried no appState, so paused, stopped and the private boolean were not read".toString()
         }
     } catch (Exception statusErr) {
         checkErrors << "statusJson: ${statusErr.message ?: statusErr.toString()}".toString()
@@ -35768,7 +35820,7 @@ A single tool can also be switched off under **Advanced: Per-tool Overrides**. A
   - Each input is the field hub_set_native_app(operation='form') returns; a device picker adds `selected`, its devices with labels. `unsupported` lists page parts a form cannot drive, such as a community app's create button. When the page cannot be modelled, `formError` says why: inputs carry no values and there are no controls.
   - `appType.namespace` and `appType.name` name the type; `appType.system` and `appType.menu` are the fields hub_list_apps(scope='types') gives for every type at once.
   - `includeSettings=true` adds the raw settings map: 500-1000 app-encoded keys on large apps (Room Lighting stores per-device scene levels as `dm~<deviceId>~<scene>`). Secrets read `***redacted (password)***`: every setting the hub types as a password, on any page, and free-text settings with credential-shaped names (password, pass, secret, token, API key, credential, PIN, lock or alarm code, ...). OAuth accessToken settings follow the Hide access tokens setting. Page inputs read as in the form tools: a password input carries no value and `redacted: true`; a credential-named input reads the marker. With Hide passwords and credentials turned off in the MCP app's settings they read as stored. When the setting types cannot be read the map is withheld and `settingsNote` says why.
-  - `includeStatus=true` adds the app's App Status lists, for any app and also with `summary=true`: `appState` (the app's stored state as `[{name, value}]`; a community app's working data, a webCoRE piston's definition, logs and trace), `eventSubscriptions` and `scheduledJobs`. With Hide passwords and credentials on, a value whose name looks like a credential reads `***redacted (password)***`, also inside nested maps (a rule's local variables); `statusRedactionNote` says so. Access tokens (an `accessToken` entry, each per-client token in `clientTokens`) read `***redacted (access token)***` whenever Hide access tokens is on, and always for a per-client token; `statusRedactionNote` also says whether an app's stored token is shown. When the lists would push the response past the size cap (a webCoRE piston's state can), `appState` lists names only with its values omitted, `statusTruncated` is true and `statusTruncatedNote` says what was cut; if that is still too large, `eventSubscriptions` and `scheduledJobs` are cut too, with `eventSubscriptionsTotal` / `scheduledJobsTotal` giving their full counts. When the status page cannot be read the three lists are omitted and `statusNote` says why. hub_get_rule counts a rule's subscriptions and jobs from the same read.
+  - `includeStatus=true` adds the app's App Status lists, for any app and also with `summary=true`: `appState` (the app's stored state as `[{name, value}]`; a community app's working data, a webCoRE piston's definition, logs and trace), `eventSubscriptions` and `scheduledJobs`. With Hide passwords and credentials on, a value whose name looks like a credential reads `***redacted (password)***`, also inside nested maps (a rule's local variables); `statusRedactionNote` says so. Access tokens (an `accessToken` entry, each per-client token in `clientTokens`) read `***redacted (access token)***` whenever Hide access tokens is on, and always for a per-client token; `statusRedactionNote` also says whether an app's stored token is shown. When the lists would push the response past the size cap (a webCoRE piston's state can), `appState` lists names only with its values omitted, `statusTruncated` is true and `statusTruncatedNote` says what was cut; if that is still too large, `eventSubscriptions` and `scheduledJobs` are cut too, with `eventSubscriptionsTotal` / `scheduledJobsTotal` giving their full counts, and as a last resort `appState` is left out with `appStateTotal` giving its count. When the status page cannot be read the three lists are omitted and `statusNote` says why. hub_get_rule counts a rule's subscriptions and jobs from the same read.
   - A type='mode' input's `value` is its stored setting. Day Lights uses ten of them for per-mode levels, gated by `useModeOverrides`; most apps use one as an "only during these modes" restriction.
   - **Mode gating in the built-in apps.** The hub has no "modes in use by" list, so read each app; resolve mode IDs with hub_list_modes.
     - **Notifier** — `modes` (mode ids) on `moreOptions`; restricts.
@@ -35801,7 +35853,7 @@ A single tool can also be switched off under **Advanced: Per-tool Overrides**. A
 Rule runtime control surface (hub_list_rules = Read master; hub_call_rule and the private boolean = Write master):
 (hub_list_rules, hub_call_rule, hub_set_rule_private_boolean and hub_get_rule are also in hub_manage_rule_machine, with hub_set_rule. The reads hub_list_rules and hub_get_rule are also in hub_read_rules.)
 
-- **hub_list_rules** — every Rule Machine rule (deduplicated by id) with a live **status** ("active" | "paused" | "stopped" | "disabled" | "unknown"), the **disabled** and **paused** booleans (omitted when unknown) and, only when detected, **requiredExpressionFalse: true**.
+- **hub_list_rules** — every Rule Machine 5.x rule (deduplicated by id; older rule types are not supported on current firmware and are not listed) with a live **status** ("active" | "paused" | "stopped" | "disabled" | "unknown"), the **disabled** and **paused** booleans (omitted when unknown) and, only when detected, **requiredExpressionFalse: true**.
   - **disabled** is the app's red-X flag from /hub2/appsList.
   - **paused** and **stopped** come from Rule Machine's name decoration. The appsList name and the RMUtils label are compared with markup stripped and entities decoded; the text the appsList name adds — "(Paused)", "(Stopped)", "(Required Expression false)" — sets the flag. A rule literally NAMED "... (Paused)" or "... (Stopped)" carries the suffix in both strings and is not flagged. A stopped rule's label and name come back without the decoration, in the encoding they already use.
   - The name shows one decoration at a time ("(Stopped)" hides "(Paused)"), so a decorated row also reads that rule's own paused/stopped state; undecorated rows make no extra read. If that read fails, the name decides and the row carries **statusSource: "name"**, with **statusSourceNote** listing those ids. Rule Machine refreshes the decoration when the rule's page renders: hub_call_rule(action="stop"/"start"/"pause"/"resume") renders it, so the list is current after an MCP stop, start, pause or resume, while a stop made elsewhere shows once the rule's page is next opened.
@@ -35856,14 +35908,15 @@ For BACKUP enumeration and restore, use the unified **hub_list_backups** (in hub
 - **`start`**: restart a stopped rule (clears stopped and re-initializes it; the private boolean is unchanged; Rule Machine only).
 - **`pause`** / **`resume`**: pause or resume the rule; a paused rule does not fire on its triggers. A Rule Machine rule's Pause button (`pausRule`) is clicked; a Visual Rule is paused through its builder's pause endpoint.
 
-Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume the rule's page is rendered once, so hub_list_rules shows the new status at once. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean.
+Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume the rule's page is rendered once, so hub_list_rules shows the new status at once. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: a toggle reads the rule's state and then clicks, so two overlapping calls on one rule can both click and undo each other; to act on several rules, name them all in one call's `ruleId` array. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean.
 
 ### hub_get_rule
 
 `hub_get_rule(ruleId, sections?, cursor?, limit?)` reads one rule. It returns `ruleId`, `health`, `localVariables` and, for a Rule Machine 5.1 rule or Button Rule, the document hub_set_rule(operation='read') returns: `actions`, `conditions`, `triggers`, `expressions` and `settings`, all by default, or the ones named in `sections`; `sections: []` returns the health and local variables alone. A long rule's whole document can exceed the response size cap, so read its health with `sections: []` and its rows one section at a time. Page one section with `cursor` ("" first, then each `nextCursor`) and `limit` (1-100, default 50), exactly as the hub_set_rule read does (see set_rule_reference). A Visual Rule or a classic app returns `health`, `localVariables: null` and a `note` naming the tool that reads it.
 
 - `localVariables`: `[{name, type, value}]`, the rule's own list, including a value the running rule just set. `type` is Rule Machine's token (integer, bigdecimal, string, boolean, datetime), the value a hub_set_rule variable change takes. A credential-named variable's value is hidden (`redacted:true`) while credential hiding is on. Hub globals are read with hub_list_variables.
-- A read that fails returns `success:false` with `error` and `note`; nothing is changed, so retry it.
+- If the local variables alone cannot be read, `localVariables` is null and `localVariablesError` says why; the health and the requested sections still return.
+- A read that fails returns `success:false` with `error` and `note`. The read renders the app's page as opening it in the hub UI does and writes nothing else, so it can be retried.
 
 `health` has the same shape here, in hub_set_rule's read and in its write responses' documents:
 
