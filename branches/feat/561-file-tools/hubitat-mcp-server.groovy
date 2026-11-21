@@ -4092,7 +4092,7 @@ def toolDeleteFile(args) {
         mcpLogError("file-manager", "Failed to delete file '${fileName}'", e)
         if (!backupFileName) {
             Map unavailable = _itemBackupIndexUnavailableResult(e)
-            if (unavailable != null) return unavailable + [fileName: fileName]
+            if (unavailable != null) return unavailable + [fileName: fileName, note: "${unavailable.note} ${FILES_GUIDE_POINTER}".toString()]
         }
         return [
             success: false,
@@ -4146,7 +4146,7 @@ def _getAllToolDefinitions_partFiles() {
         ],
         [
             name: "hub_delete_file",
-            description: "⚠️ Permanently delete a file from the hub's File Manager. A backup copy is taken first when possible (backupFile/undoHint in the result); a file that is itself a backup gets none, and if no copy can be taken (unreadable content or a failed upload) the delete still runs with a warning, except that a download the load limiter refused deletes nothing (retry). Requires confirm=true and a hub backup from the last 24 hours — get user approval first.",
+            description: "⚠️ Permanently delete a file from the hub's File Manager. A backup copy is taken first when possible (backupFile/undoHint in the result); a file that is itself a backup gets none, and if no copy can be taken (unreadable content or a failed upload) the delete still runs with a warning[[FLAT_TRIM]], except that a download the load limiter refused deletes nothing (retry)[[/FLAT_TRIM]]. Requires confirm=true and a hub backup from the last 24 hours — get user approval first.",
             inputSchema: [
                 type: "object",
                 properties: [
