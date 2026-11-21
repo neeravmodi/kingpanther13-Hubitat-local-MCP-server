@@ -15999,9 +15999,9 @@ private String findRuleAppRedirect(ruleId, String verb) {
         } else if (verb == "test") {
             if (isRmRule) {
                 return "Rule ${idStr} is a Hubitat built-in ${appTypeName} app. " +
-                    "Use `hub_read_apps_code -> hub_get_app_config(appId=${idStr})` for read-only inspection. " +
-                    "`hub_test_custom_rule` only handles MCP's own rule engine, not Hubitat built-in apps. " +
-                    "Use `hub_manage_native_rules_and_apps -> hub_call_rule(ruleId=${idStr})` to trigger it " +
+                    "Use `hub_read_rules -> hub_get_rule(ruleId=${idStr})` for read-only inspection. " +
+                    "`hub_test_custom_rule` only handles MCP's own rule engine, not Hubitat built-in apps, and Rule Machine has no dry run: " +
+                    "`hub_call_rule(ruleId=${idStr})` runs every one of the rule's actions at once, skipping its conditions " +
                     "(requires the Write master)."
             } else {
                 return "Rule ${idStr} is a Hubitat built-in ${appTypeName} app. " +
@@ -16531,10 +16531,10 @@ def _projectAppType(Map t, boolean builtIn, Map enrich) {
     }
     return out
 }
-private List _nameFiltered(List rows, filter) {
+private List _nameFiltered(List rows, filter, boolean matchType = false) {
     String f = filter?.toString()?.trim()?.toLowerCase()
     if (!f) return rows
-    return rows.findAll { it instanceof Map && (stripAppConfigHtml(it.name) ?: "").toLowerCase().contains(f) }
+    return rows.findAll { row -> row instanceof Map && (matchType ? [row.name, row.type] : [row.name]).any { (stripAppConfigHtml(it) ?: "").toLowerCase().contains(f) } }
 }
 def toolListHubDrivers(args) {
     def cursor = args?.cursor
@@ -16863,10 +16863,11 @@ def toolGetAppConfig(args) {
         parentAppId: parsed.app.parentAppId,
         installed: parsed.app.installed == true
     ]
-    boolean isRmRule = _rmIsRuleAppType((appTypeRaw instanceof Map ? appTypeRaw.name : null)?.toString()) ||
-        _rmIsRuleAppType(parsed.app.name?.toString())
+    def appTypeNamespace = appTypeRaw instanceof Map ? appTypeRaw.namespace : null
+    List typeNames = [appTypeRaw instanceof Map ? appTypeRaw.name : null, parsed.app.name]
+    boolean isRmRule = typeNames.any { _rmIsRuleAppType(appTypeNamespace, it) }
     boolean rmHasDisabled = isRmRule
-    if (isRmRule && [appTypeRaw instanceof Map ? appTypeRaw.name : null, parsed.app.name].any { _rmIsEditableRuleType(it) }) {
+    if (isRmRule && typeNames.any { _rmIsEditableRuleType(appTypeNamespace, it) }) {
         try {
             Map rmState = _nrState(appIdStr as Long)
             rmHasDisabled = [rmState.disabledActions, rmState.disabledTriggers].any { it instanceof Collection && !it.isEmpty() }
@@ -17005,9 +17006,11 @@ private void _appConfigAttachStatus(Map result, Integer appId) {
         result.appState = status.appState
         result.eventSubscriptions = status.eventSubscriptions
         result.scheduledJobs = status.scheduledJobs
+        if (status.appStateMissing) result.appStateMissing = true
         List redaction = []
-        if (_redactsCredentials()) redaction << "appState values whose names look like credentials, at any depth, read ${_appConfigRedactedMarker()}, as settings do; turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
-        if (status.appState.any { it.name?.toString() in ['accessToken', 'clientTokens'] })
+        if (callerClient != null) redaction << "This client's token always reads credential-named appState values and access tokens as redacted, whatever the MCP app's settings say."
+        else if (_redactsCredentials()) redaction << "appState values whose names look like credentials, at any depth, read ${_appConfigRedactedMarker()}, as settings do; turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
+        if (callerClient == null && status.appState.any { it.name?.toString() in ['accessToken', 'clientTokens'] })
             redaction << (_redactsAccessTokens() ? "The app's access tokens read as redacted (Hide access tokens is on)." : "The app's access tokens are shown, because Hide access tokens is off in the MCP app's settings.")
         if (redaction) result.statusRedactionNote = redaction.join(' ')
         _appConfigFitStatus(result)
@@ -18472,7 +18475,7 @@ def toolListInstalledApps(args) {
                     throw new IllegalStateException("filter branch missing for '${filter}' -- validFilters and switch have drifted")
             }
         }
-        if (args?.nameFilter) filtered = _nameFiltered(filtered, args.nameFilter)
+        if (args?.nameFilter) filtered = _nameFiltered(filtered, args.nameFilter, true)
         def paged = _paginateList(filtered, cursor, 50, "hub_list_apps")
         def result = [
             apps: paged.page,
@@ -18597,7 +18600,7 @@ def _getAllToolDefinitions_partCodeManagement() {
                 properties: [
                     scope: [type: "string", enum: ["instances", "types"], description: "What to list. 'instances' (default) = running app instances with parent/child tree; 'types' = installed app-type catalog (community + built-in), each with system/isBuiltIn and menu (Apps/Automations/Integrations tab, null if undeclared).", default: "instances"],
                     filter: [type: "string", enum: ["all", "builtin", "user", "disabled", "parents", "children"], description: "scope='instances' only: category filter."],
-                    nameFilter: [type: "string", description: "Name contains (case-insensitive)."],
+                    nameFilter: [type: "string", description: "Name contains (case-insensitive); for scope='instances' the app type too, so 'Button Rule' finds Button Rules, which are named after their button."],
                     includeHidden: [type: "boolean", description: "scope='instances' only: include hidden apps (typically Hubitat internal). Default: false", default: false],
                     cursor: [type: "string", description: "Opt-in pagination cursor. Omit for unbounded (subject to 120KB guard); pass \"\" for the first page, iterate nextCursor (page size 50)."]
                 ]
@@ -21290,7 +21293,7 @@ private Map _rmLegacyNativeRecovery(Map snapshot) {
     def status = snapshot.statusJson
     def app = config instanceof Map ? config.app : null
     if (!(app instanceof Map) || !(app.appType instanceof Map) ||
-        !_rmIsEditableRuleType(app.appType.name)) return null
+        !_rmIsEditableRuleType(app.appType.namespace, app.appType.name)) return null
     if (!(status instanceof Map) || !status.containsKey('appState') || !status.containsKey('appSettings') ||
         !(status.containsKey('eventSubscriptions') || status.containsKey('appSubscriptions'))) return null
     Long id = _ndId(snapshot.ruleId)
@@ -22236,7 +22239,7 @@ def _getAllToolDefinitions_partNativeRM() {
     return [
         [
             name: "hub_list_rules",
-            description: "List all Rule Machine 5.x rules (deduplicated by id) with each rule's id, label, and live `status` (`active`/`paused`/`stopped`/`disabled`).[[FLAT_TRIM]] Requires the Read master.[[/FLAT_TRIM]][[FLAT_TRIM]] `status` is `unknown` when the hub's app list is momentarily unreadable. Status reflects Rule Machine's name decoration (refreshed after an MCP stop, start, pause or resume); a decorated rule's paused/stopped come from its own state, and a row marked statusSource:'name' fell back to the decoration because that state could not be read. A stop made outside MCP may show only after the rule's page is next opened. For ONE rule's state, call hub_get_rule(ruleId) instead of listing every rule — its health returns that rule's paused/disabled/stopped/broken directly. For the enabled/disabled state of NON-RM classic apps (Room Lighting, Notifier, Basic Rules, Button Controllers) use `hub_list_apps` (scope='instances'). Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the status-detection semantics and platform limitations on RM rule internals.[[/FLAT_TRIM]]",
+            description: "List the Rule Machine 5.x rules, with each rule's id, label, and live `status` (`active`/`paused`/`stopped`/`disabled`).[[FLAT_TRIM]] Requires the Read master.[[/FLAT_TRIM]][[FLAT_TRIM]] `status` is `unknown` when the hub's app list is momentarily unreadable. Status reflects Rule Machine's name decoration (refreshed after an MCP stop, start, pause or resume); a decorated rule's paused/stopped come from its own state, and a row marked statusSource:'name' fell back to the decoration because that state could not be read. A stop made outside MCP may show only after the rule's page is next opened. For ONE rule's state, call hub_get_rule(ruleId) instead of listing every rule — its health returns that rule's paused/disabled/stopped/broken directly. Button Rules, Basic Rules and other classic apps (Room Lighting, Notifier, Button Controllers) are not listed here: `hub_list_apps` (scope='instances') lists them with their enabled/disabled state (nameFilter:'Button Rule' finds Button Rules), and hub_get_visual_rule lists Visual Rules. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the status-detection semantics and platform limitations on RM rule internals.[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -22247,11 +22250,11 @@ def _getAllToolDefinitions_partNativeRM() {
         ],
         [
             name: "hub_call_rule",
-            description: "Run the actions of one or more rules, or stop, start, pause or resume them: Rule Machine rules and Button Rules, and Visual Rules (actions, pause, resume).[[FLAT_TRIM]] Requires the Write master. Each rule is acted on through its own page button (a Visual Rule through its builder's endpoint), one at a time, with per-rule results on a batch. stop/start/pause/resume leave a rule already in that state alone; a repeated actions runs the actions again.[[/FLAT_TRIM]] Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for action semantics.",
+            description: "Run the actions of one or more rules, or stop, start, pause or resume them: Rule Machine rules and Button Rules, and Visual Rules (pause, resume, and actions on a Visual Rule Builder 2.0 rule).[[FLAT_TRIM]] Requires the Write master. Each rule is acted on through its own page button (a Visual Rule through its builder's endpoint), one at a time, with per-rule results on a batch. stop/start/pause/resume leave a rule already in that state alone; a repeated actions runs the actions again.[[/FLAT_TRIM]] Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for action semantics.",
             inputSchema: [
                 type: "object",
                 properties: [
-                    ruleId: [type: ["integer", "array"], items: [type: "integer"], description: "Rule ID from hub_list_rules (a Visual Rule's from hub_get_visual_rule), or an array of rule IDs to act on in one call"],
+                    ruleId: [type: ["integer", "array"], items: [type: "integer"], description: "Rule ID from hub_list_rules (a Button Rule's from hub_list_apps(nameFilter:'Button Rule'), a Visual Rule's from hub_get_visual_rule), or an array of rule IDs to act on in one call"],
                     action: [type: "string", enum: ["actions", "stop", "start", "pause", "resume"], description: "actions (the default) runs the rule's actions; stop/start stop or restart a Rule Machine rule; pause/resume pause or resume the rule."],
                 ],
                 required: ["ruleId"]
@@ -22263,7 +22266,7 @@ def _getAllToolDefinitions_partNativeRM() {
             inputSchema: [
                 type: "object",
                 properties: [
-                    ruleId: [type: ["integer", "array"], items: [type: "integer"], description: "Rule ID from hub_list_rules, or an array of rule IDs to set together"],
+                    ruleId: [type: ["integer", "array"], items: [type: "integer"], description: "Rule ID from hub_list_rules (a Button Rule's from hub_list_apps(nameFilter:'Button Rule')), or an array of rule IDs to set together"],
                     value: [type: "boolean", description: "Target value for the rule's Private Boolean."]
                 ],
                 required: ["ruleId", "value"]
@@ -22276,11 +22279,11 @@ def _getAllToolDefinitions_partNativeRM() {
         ],
         [
             name: "hub_get_rule",
-            description: """Read one rule: its health and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables. Also reads the health of a Visual Rule or a built-in classic app (Basic Rule, Button Controller).[[FLAT_TRIM]] The rule's page is rendered once first (Rule Machine updates its broken flag only then). health carries broken, brokenRows (the rows the page marks broken), paused, stopped, privateBoolean, disabledActions, disabledTriggers, structuralIssues, the red-X disabled flag and the live eventSubscriptionCount and scheduledJobCount; the raw subscription and job lists come from hub_get_app_config(includeStatus: true).[[/FLAT_TRIM]] health.ok=false with unreadable=false means issues names a problem or checkErrors names a failed read; unreadable=true means nothing could be read, which is not evidence of breakage. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the full health reference.""",
+            description: """Read one Rule Machine rule, Button Rule or Basic Rule: its health and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; for a Basic Rule, its settings. Any other installed app returns its health alone.[[FLAT_TRIM]] Nothing is written and the rule's page is not opened: broken comes from the rule's own check. health carries broken, brokenRows (each row whose device is gone, by kind and native id), paused, stopped, privateBoolean, disabledActions, disabledTriggers, structuralIssues, the red-X disabled flag and the live eventSubscriptionCount and scheduledJobCount; the raw subscription and job lists come from hub_get_app_config(includeStatus: true).[[/FLAT_TRIM]] health.ok=false with unreadable=false means issues names a problem or checkErrors names a failed read; unreadable=true means nothing could be read, which is not evidence of breakage. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the full health reference.""",
             inputSchema: [
                 type: "object",
                 properties: [
-                    ruleId: [type: "integer", minimum: 1, description: "The rule's installed-app id, from hub_list_rules (a Visual Rule's from hub_get_visual_rule)."],
+                    ruleId: [type: "integer", minimum: 1, description: "The rule's installed-app id, from hub_list_rules (a Button Rule's or Basic Rule's from hub_list_apps(scope:'instances'), a Visual Rule's from hub_get_visual_rule)."],
                     sections: [type: "array", items: [type: "string", enum: ["actions", "conditions", "triggers", "expressions", "settings"]], description: "Document sections to return; default all. localVariables and health are always returned, so [] returns them alone; a long rule's whole document can exceed the response cap."],
                     cursor: [type: "string", description: "Page one section: pass \"\" for the first page, then each nextCursor. Requires exactly one section."],
                     limit: [type: "integer", minimum: 1, maximum: 100, description: "Rows per page when paging (default 50)."]
@@ -22543,6 +22546,7 @@ private boolean _rmSettleRuleStatusFromState(Map entry, Map flags) {
 private void _rmApplyRuleStatus(Map entry, boolean disabled, boolean paused, boolean stopped) {
     entry.disabled = disabled
     entry.paused = paused
+    entry.stopped = stopped
     entry.status = disabled ? "disabled" : (stopped ? "stopped" : (paused ? "paused" : "active"))
 }
 private String _rmStripTrailingDecoration(Object raw, String suffix) {
@@ -22558,7 +22562,7 @@ private List<Integer> _rmRuleIdListArg(Object raw) {
     if (rawList.isEmpty()) throw new IllegalArgumentException("ruleId array must not be empty")
     List<Integer> ids = []
     rawList.each { id ->
-        def n = _rmCoerceRuleId(id)
+        def n = _exactIntId(id)
         if (n == null) {
             throw new IllegalArgumentException("ruleId '${id}' is not a valid rule id (a positive whole number). Use hub_list_rules to find valid ids.")
         }
@@ -22576,9 +22580,16 @@ def toolRunRmRule(args) {
     ruleIds.each { _requireUnprotectedAppMutation(it, "change rule runtime") }
     Map guard = _rmRequireRuleTargets(ruleIds, "hub_call_rule", true)
     if (guard.failure) return _rmRunGuardFailure(ruleIds, guard)
-    List<Integer> visual = ruleIds.findAll { _rmIsVisualRuleType(guard.types.get(it) as String) }
+    List<Integer> visual = ruleIds.findAll { _rmIsVisualRuleType('hubitat', guard.types.get(it)) }
     if (visual && action in ["stop", "start"]) {
         throw new IllegalArgumentException("Visual Rules have no stop or start; rule(s) ${visual.join(', ')} are Visual Rules. Use action:'pause' or 'resume' for them. Nothing was dispatched.")
+    }
+    List<Integer> classic = action != "actions" ? [] : visual.findAll { Integer id ->
+        String type = guard.types.get(id)?.toString()
+        type ==~ /.*\s1(\.\d+)*/ || (!(type ==~ /.*\s\d+(\.\d+)*/) && _ruleCompiledState(id)?.ruleFormat == "vrb-classic")
+    }
+    if (classic) {
+        throw new IllegalArgumentException("Visual Rule Builder 1.0 rules have no run button, so their actions cannot be run; rule(s) ${classic.join(', ')} are 1.0 rules. Pause and resume work on them. Nothing was dispatched.")
     }
     boolean runActions = (action == "actions")
     def perRule = { Integer id ->
@@ -22654,31 +22665,39 @@ private Map _rmRequireRuleTargets(List<Integer> ruleIds, String toolName, boolea
     Map<Integer, String> types = [:]
     List<Integer> missing = []
     Map<Integer, String> unreadable = [:]
+    Map<Integer, String> notRules = [:]
     ruleIds.each { id ->
         try {
             def app = getAppByAppId(id as Long)
             if (app == null) missing << id
             else {
                 def typeName = app.appType?.name?.toString()
-                if (typeName) types.put(id, typeName)
-                else unreadable.put(id, "its app type could not be read")
+                def namespace = app.appType?.namespace
+                if (!typeName) unreadable.put(id, "its app type could not be read")
+                else if (_rmIsRuleAppType(namespace, typeName) || (visualRules && _rmIsVisualRuleType(namespace, typeName))) types.put(id, typeName)
+                else notRules.put(id, typeName)
             }
         } catch (Exception e) {
             unreadable.put(id, (e.message ?: e.toString()).toString())
         }
     }
+    String accepts = visualRules ? "Rule Machine rules, Button Rules and Visual Rules" : "Rule Machine rules and Button Rules"
     if (missing) {
-        throw new IllegalArgumentException("${_rmNoAppText(missing)}; ${toolName} only acts on rules. Find rule ids with hub_list_rules. Nothing was dispatched.")
+        throw new IllegalArgumentException("${_rmNoAppText(missing)}; ${toolName} acts only on ${accepts}. Find rule ids with hub_list_rules (Rule Machine), hub_list_apps (Button Rules and Basic Rules) or hub_get_visual_rule (Visual Rules). Nothing was dispatched.")
     }
-    def notRules = types.findAll { id, typeName -> !_rmIsRuleAppType(typeName) && !(visualRules && _rmIsVisualRuleType(typeName)) }
     if (notRules) {
-        throw new IllegalArgumentException("${_rmNotRuleText(notRules)}; ${toolName} only acts on rules. Find rule ids with hub_list_rules. Nothing was dispatched.")
+        throw new IllegalArgumentException("${_rmNotRuleText(notRules)}; ${toolName} acts only on ${accepts}. Find rule ids with hub_list_rules (Rule Machine), hub_list_apps (Button Rules and Basic Rules) or hub_get_visual_rule (Visual Rules). Nothing was dispatched.")
     }
     if (unreadable) {
         unreadable.each { id, why -> mcpLog("warn", "rm-interop", "${toolName}: app ${id} could not be identified (${why}); nothing dispatched") }
         return [failure: _rmLookupFailure(unreadable), unreadable: unreadable]
     }
     return [types: types]
+}
+private Map _rmLookupFailure(Map reasonsById) {
+    def detail = reasonsById.collect { id, why -> "app ${id}: ${why}" }.join('; ')
+    return [success: false, error: "The target app could not be looked up (${detail}), so nothing was run.".toString(),
+            note: "Nothing was changed. Retry once; if it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
 }
 private Map _rmRunActionsButton(Integer ruleId) {
     try {
@@ -22722,11 +22741,20 @@ private Map _rmToggleButton(Integer ruleId, String action, String flag, String b
                 note: "Re-issuing is safe: the rule's state is read first and a rule already ${target ? flag : 'not ' + flag} is left alone. Confirm with hub_get_rule or hub_list_rules. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
     }
     def out = [success: true, ruleId: ruleId, rmAction: clicked]
+    String renderError = null
     try {
         _rmFetchConfigJson(ruleId)
     } catch (Exception e) {
-        out.note = "The rule's ${flag} state changed, but re-rendering its page failed (${e.message}), so hub_list_rules may show the old status until the rule's page is next opened. hub_get_rule reads the rule's own state.".toString()
+        renderError = e.message ?: e.toString()
     }
+    def seen
+    try { seen = _rmRuntimeFlag(ruleId, flag) }
+    catch (Exception e) { seen = e.message ?: e.toString() }
+    if (seen != target) {
+        return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: the ${button} click was accepted, but the rule's ${flag} state then read ${seen}, not ${target}".toString(),
+                note: "Another change to the rule may have run at the same time. Read it with hub_get_rule, then send the action again if it is still needed: a rule already in the target state is left alone. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
+    }
+    if (renderError != null) out.note = "The rule's ${flag} state changed, but re-rendering its page failed (${renderError}), so hub_list_rules may show the old status until the rule's page is next opened. hub_get_rule reads the rule's own state.".toString()
     return out
 }
 private Map _vrbTogglePaused(Integer ruleId, String action) {
@@ -22848,9 +22876,6 @@ private Map _collectLiveApps() {
     parsed.apps.each { walk(it) }
     if (!complete) mcpLog("warn", "rm-interop", "_collectLiveApps: /hub2/appsList contains malformed app nodes; absence cannot be established")
     return complete ? apps : null
-}
-private Integer _rmCoerceRuleId(Object id) {
-    return _exactIntId(id)
 }
 private List _rmCollectTriggerIndices(Integer appId) {
     def status = _rmFetchStatusJson(appId)
@@ -23344,7 +23369,7 @@ private Map _rmDecodeRuleExport(Integer ruleId, Object raw) {
     def payload = new groovy.json.JsonSlurper().parseText(raw)
     def identity = payload instanceof Map && payload.appReplacements instanceof Map ? payload.appReplacements.find { key, value -> key.toString() == ruleId.toString() }?.value : null
     def data = payload instanceof Map && payload.appData instanceof Map ? payload.appData.find { key, value -> key.toString() == ruleId.toString() }?.value : null
-    if (!(identity instanceof Map) || !_rmIsEditableRuleType(identity.appTypeName, identity.appTypeNamespace) ||
+    if (!(identity instanceof Map) || !_rmIsEditableRuleType(identity.appTypeNamespace, identity.appTypeName) ||
         !identity.parentAppInstalledAppId?.toString()?.isLong() || identity.parentAppInstalledAppId.toString().toLong() <= 0L ||
         !(payload.deviceReplacements instanceof Map) || !(data instanceof Map) || !(data.state instanceof Map) ||
         ['actions', 'capabstrue', 'capabsfalse', 'eval'].any { data.state.get(it) != null && !(data.state.get(it) instanceof Map) } ||
@@ -24148,24 +24173,35 @@ def toolDeleteNativeApp(args) {
 def toolGetNativeRule(args) {
     def raw = args?.ruleId
     if (raw == null) throw new IllegalArgumentException("ruleId is required")
-    if (!(raw instanceof Number) || !raw.toString().isLong() || raw.toString().toLong() <= 0L) throw new IllegalArgumentException("ruleId must be a positive integer")
-    Long id = raw.toString().toLong()
+    Long id = normalizeRuleId(raw) as Long
     Map docArgs = [ruleId: id, localVariables: true]
     ['sections', 'cursor', 'limit'].each { key -> if (args.containsKey(key)) docArgs.put(key, args.get(key)) }
-    _ndDocumentArgs(docArgs, ['actions', 'conditions', 'triggers', 'expressions', 'settings'], 'hub_get_rule')
+    Map read = _ndDocumentArgs(docArgs, ['actions', 'conditions', 'triggers', 'expressions', 'settings'], 'hub_get_rule')
     def target
     try { target = getAppByAppId(id) }
     catch (Exception lookup) {
         mcpLogError("rm-native", "hub_get_rule lookup failed for app ${id}", lookup)
-        return [ruleId: id] + _rmLookupFailure([(id): (lookup.message ?: lookup.toString()).toString()])
+        return [success: false, ruleId: id, error: "Rule ${id} could not be read: ${lookup.message ?: lookup.toString()}".toString(),
+                note: "The read writes nothing and does not open the rule's page, so retrying once is safe. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
     }
     if (target == null) throw new IllegalArgumentException(_rmMissingAppText(id))
     String typeName = target.appType?.name?.toString()
-    if (_rmIsEditableRuleType(typeName, target.appType?.namespace)) return toolGetRuleDocument(docArgs)
-    String note = _rmIsVisualRuleType(typeName) ? "A Visual Rule's definition is read with hub_get_visual_rule." :
-        (_rmIsRuleAppType(typeName) ? "Only a Rule Machine 5.1 rule or Button Rule has a document; this rule returns its health alone." :
-            "This app is not a Rule Machine rule; read its configuration with hub_get_app_config.")
-    [ruleId: id, health: _rmCheckRuleHealth(id as Integer), localVariables: null, note: note]
+    def namespace = target.appType?.namespace
+    if (_rmIsEditableRuleType(namespace, typeName)) return toolGetRuleDocument(docArgs)
+    boolean basicRule = namespace == 'hubitat' && _classicAppFormat(typeName) == 'basic-rule'
+    if (basicRule && read.paged) throw new IllegalArgumentException("A Basic Rule's settings are returned whole; omit cursor and limit.")
+    Map result = [ruleId: id, health: _rmCheckRuleHealth(id as Integer), localVariables: null]
+    if (basicRule) {
+        if ('settings' in read.sections) {
+            try { result.settings = _ndSettings(id) }
+            catch (Exception settingsFailure) { result.settings = null; result.settingsError = (settingsFailure.message ?: settingsFailure.toString()).toString() }
+        }
+        return result
+    }
+    result.note = _rmIsVisualRuleType(namespace, typeName) ? "A Visual Rule's definition is read with hub_get_visual_rule." :
+        (_rmIsRuleAppType(namespace, typeName) ? "Only a Rule Machine 5.1 rule or Button Rule has a document; this rule returns its health alone. Read its configuration with hub_get_app_config(includeStatus: true)." :
+            "hub_get_rule reads Rule Machine rules, Button Rules and Basic Rules; for this app it returns its health alone. Read its configuration and App Status with hub_get_app_config(includeStatus: true).")
+    result
 }
 Map _rmPublicLocalVariable(String name, Map row) {
     Map result = [name: name, type: row?.type, value: row?.value]
@@ -24700,7 +24736,7 @@ def _idempotentWriteToolNames_partNativeRM() {
 }
 def _toolDisplayMeta_partNativeRM() {
     return [
-        hub_list_rules: [title: "List Rule Machine Rules", summary: "List all Rule Machine rules."],
+        hub_list_rules: [title: "List Rule Machine Rules", summary: "List the Rule Machine 5.x rules with their status."],
         hub_call_rule: [title: "Run or Control Rule", summary: "Run the actions of one or more rules, or stop, start, pause or resume them."],
         hub_set_rule_private_boolean: [title: "Set Rule Private Boolean", summary: "Set the private boolean of one or more Rule Machine rules."],
         hub_get_rule: [title: "Get Rule", summary: "Read a rule's health, actions, conditions, triggers, settings and local variables."],
@@ -24739,7 +24775,13 @@ private Long _nrCreatedAppId(Object response) {
 private void _nrRequireEditableRule(target, Long ruleId) {
     if (target == null || target.id?.toString() != ruleId.toString()) throw new IllegalArgumentException(_rmMissingAppText(ruleId))
     String typeName = target.appType?.name?.toString()
-    if (!_rmIsEditableRuleType(typeName, target.appType?.namespace)) throw new IllegalArgumentException(_rmNotEditableText(ruleId, typeName))
+    def namespace = target.appType?.namespace
+    if (!_rmIsEditableRuleType(namespace, typeName)) throw new IllegalArgumentException(_rmNotEditableText(ruleId, namespace, typeName))
+}
+private String _rmNotEditableText(id, namespace, String typeName) {
+    if (_rmIsVisualRuleType(namespace, typeName)) return "App ${id} is a ${typeName} rule: Visual Rules are read with hub_get_visual_rule, but only Rule Machine 5.1 rules and Button Rules can be edited here.".toString()
+    if (_rmIsRuleAppType(namespace, typeName)) return "App ${id} is a ${typeName} rule: rules of that type are read with hub_get_rule, but only Rule Machine 5.1 rules and Button Rules can be edited here.".toString()
+    return "${_rmNotRuleText([(id): typeName ?: 'unknown type'])}; only Rule Machine 5.1 rules and Button Rules can be edited here.".toString()
 }
 def _nrHandle(Long ruleId) {
     if (ruleId == null || ruleId <= 0L) throw new IllegalArgumentException('A positive rule ID is required')
@@ -25618,8 +25660,9 @@ private void _nmWriteActionOrder(Long ruleId, List actionList) {
     action: ['id', 'type', 'subtype', 'fields', 'expression', 'events', 'condition'], expression: ['id', 'tokens'],
     variable: ['operation', 'name', 'type', 'value'], required: ['tokens'], delete: ['part', 'id'], order: ['ids'], terminator: ['subtype']]
 private Long _ndId(Object id) {
-    if (id == null || !id.toString().isLong() || id.toString().toLong() <= 0L) throw new IllegalArgumentException('A positive native application ID is required')
-    id.toString().toLong()
+    Integer exact = _exactIntId(id)
+    if (exact == null) throw new IllegalArgumentException("A positive native application ID is required, got: ${id}.".toString())
+    exact as Long
 }
 private Object _ndJson(Object value) {
     value instanceof Map || value instanceof List ? value : new groovy.json.JsonSlurper().parseText(value?.toString() ?: '{}')
@@ -25635,7 +25678,7 @@ private List _ndSettings(Long id) {
     response.settings.collect { row ->
         if (!(row instanceof Map) || !(row.name instanceof String)) throw new IllegalStateException('Unexpected native setting row')
         boolean secret = _redactsCredentials() && (row.type == 'password' || _appConfigIsSecretSetting(row.name, row.type, row.value))
-        def setting = [name: row.name, type: row.type, multiple: row.multiple, value: secret ? null : row.value, device_ids: row.deviceList instanceof Map ? row.deviceList.keySet().collect { it.toString() }.sort() : null]
+        def setting = [name: row.name, type: row.type, multiple: row.multiple, value: secret ? null : row.value, deviceIds: row.deviceList instanceof Map ? row.deviceList.keySet().collect { it.toString() }.sort() : null]
         if (secret) setting.redacted = true
         setting
     }
@@ -25733,11 +25776,14 @@ Map toolGetRuleDocument(Map args) {
     try {
         def document = [ruleId: id, health: _rmCheckRuleHealth(id as Integer)]
         Map nativeState = sections.any { it in ['actions', 'conditions', 'triggers', 'expressions'] } ? _nrState(id) : null
-        if (withLocals) {
-            try { document.localVariables = _ndLocalVariables(id) }
-            catch (Exception localsFailure) {
-                mcpLog('warn', 'rm-native', "hub_get_rule: rule ${id}'s local variables could not be read (${localsFailure.message})")
-                document.localVariables = null
+        if (withLocals || 'variables' in sections) {
+            String key = withLocals ? 'localVariables' : 'variables'
+            try {
+                List locals = _ndLocalVariables(id)
+                document.put(key, withLocals ? locals : locals.collectEntries { row -> [(row.name): row.findAll { k, v -> k != 'name' }] })
+            } catch (Exception localsFailure) {
+                mcpLog('warn', 'rm-native', "${toolName}: rule ${id}'s local variables could not be read (${localsFailure.message})")
+                document.put(key, null)
                 document.localVariablesError = (localsFailure.message ?: localsFailure.toString()).toString()
             }
         }
@@ -25747,13 +25793,8 @@ Map toolGetRuleDocument(Map args) {
         if ('conditions' in sections) document.conditions = nativeState.capabsfalse instanceof Map ? nativeState.capabsfalse : [:]
         if ('triggers' in sections) document.triggers = nativeState.capabstrue instanceof Map ? nativeState.capabstrue : [:]
         if ('expressions' in sections) document.expressions = nativeState.eval instanceof Map ? nativeState.eval : [:]
-        if ('variables' in sections) document.variables = _nrHandle(id).getAllLocalVars().collectEntries { name, row ->
-            Map shown = _rmPublicLocalVariable(name.toString(), row instanceof Map ? row : [value: row])
-            shown.remove('name')
-            [(name): row instanceof Map ? row + shown : shown]
-        }
         if ('settings' in sections) document.settings = _ndSettings(id)
-        if (read.paged) {
+        if (read.paged && document.get(sections[0]) != null) {
             String section = sections[0]
             def complete = document.get(section)
             List rows = complete instanceof Map ? complete.entrySet().toList().sort { a, b -> a.key.toString() <=> b.key.toString() } :
@@ -25770,7 +25811,7 @@ Map toolGetRuleDocument(Map args) {
                 document.nextCursor = end < total ? end.toString() : null
                 def envelope = jsonRpcResult(0, [content: [[type: 'text', text: groovy.json.JsonOutput.toJson(document)]]])
                 if (groovy.json.JsonOutput.toJson(envelope).getBytes('UTF-8').length <= budget) break
-                if (end - start <= 1) throw new IllegalArgumentException('A native document row or its validation metadata exceeds the response size limit; it cannot be returned without truncation')
+                if (end - start <= 1) throw new IllegalArgumentException('A native document row or its health exceeds the response size limit; it cannot be returned without truncation')
                 end = start + (end - start).intdiv(2)
             }
         }
@@ -25780,7 +25821,7 @@ Map toolGetRuleDocument(Map args) {
     } catch (Exception failure) {
         mcpLogError('rm-native', "${toolName} read failed for rule ${id}: ${failure.message}".toString(), failure)
         [success: false, ruleId: id, error: "Rule ${id} could not be read: ${failure.message ?: failure.toString()}".toString(),
-         note: "The read rendered the rule's page, as opening it does, and wrote nothing else; a Rule Machine rule's page only shows its settings, so retrying once is safe, though a render drops an edit still open and not yet compiled in Rule Machine's own editor. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
+         note: "The read writes nothing and does not open the rule's page, so retrying once is safe. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
     }
 }
 private List _ndChanges(Object changes, boolean allowEmpty = false) {
@@ -26069,8 +26110,14 @@ private Map _ndApply(Long id, List changes, boolean created) {
             persistedState.stPrimed == false
         if (actualTriggers && !stopped && !paused && !suppressed && subscriptions.empty && jobs.empty) throw new IllegalStateException('Native triggers have no active subscriptions or scheduled jobs')
         if (created && getAppByAppId(id)?.installed != true) throw new IllegalStateException('Native rule is not installed after Done')
-        [success: true, ruleId: id, created: created, results: outcomes, broken: false, stopped: stopped, paused: paused, eventSubscriptions: subscriptions, scheduledJobs: jobs, verification: 'Native persistence, compilation and activation checks passed; verify intended device behavior independently.', document: toolGetRuleDocument([ruleId: id, sections: ['actions', 'conditions', 'triggers', 'expressions', 'variables']])] +
-            (suppressed ? [subscriptionSettle: 'SUPPRESSED: Required Expression is false'] : [:])
+        Map written = [success: true, ruleId: id, created: created, results: outcomes, broken: false, stopped: stopped, paused: paused, eventSubscriptions: subscriptions, scheduledJobs: jobs, verification: 'Native persistence, compilation and activation checks passed; verify intended device behavior independently.']
+        if (suppressed) written.subscriptionSettle = 'SUPPRESSED: Required Expression is false'
+        Map document = toolGetRuleDocument([ruleId: id, sections: ['actions', 'conditions', 'triggers', 'expressions', 'variables']])
+        if (document.success == false) {
+            written.documentReadError = document.error
+            written.note = "The changes were written and verified; only reading the rule back failed. Do not send them again: read the rule with hub_set_rule(operation:'read') or hub_get_rule. See hub_get_tool_guide(section='set_rule_reference')."
+        } else written.document = document
+        written
     } catch (Exception failure) {
         mcpLogError('rm-native', "hub_set_rule ${created ? 'create' : 'update'} failed for rule ${id}: ${failure.message}".toString(), failure)
         [success: false, partial: started, ruleId: id, created: created, results: outcomes, remaining: changes.drop(outcomes.size()), error: failure.message?.toString(), note: _ndFailureNote(started, created)]
@@ -26094,28 +26141,18 @@ Map toolUpdateRuleDocument(Map args) {
         if (getAppByAppId(id)?.disabled == true) throw new IllegalArgumentException('Enable the native rule before editing its document')
         try { _ndPreflight(id, changes) }
         catch (Exception failure) { return [success: false, partial: false, ruleId: id, error: failure.message?.toString()] }
-        Map rendered = [:]
-        Map beforeHealth = _rmCheckRuleHealth(id as Integer, rendered)
-        if (rendered.pageError) {
-            return [success: false, partial: false, ruleId: id, issues: beforeHealth.issues,
-                error: "Rule ${id}'s page reports an error (${rendered.pageError}), so whether it is already broken is unknown; no change was written.".toString(),
-                note: "Open the rule with hub_get_rule to see the page's error and repair it with hub_set_rule(operation:'form') or in the Hubitat UI before editing. See hub_get_tool_guide(section='set_rule_reference')."]
-        }
-        if (rendered.page != true) {
-            return [success: false, partial: false, ruleId: id, checkErrors: beforeHealth.checkErrors,
-                error: "Rule ${id}'s page could not be rendered before the write, so whether it is already broken is unknown; no change was written.".toString(),
-                note: "Retry once; if it fails again, check that the hub answers with hub_get_info and open the rule with hub_get_rule. See hub_get_tool_guide(section='set_rule_reference')."]
-        }
-        if (beforeHealth.broken == null) {
-            return [success: false, partial: false, ruleId: id, checkErrors: beforeHealth.checkErrors,
-                error: "Rule ${id}'s broken flag could not be read before the write, so whether it is already broken is unknown; no change was written.".toString(),
-                note: "Retry once; if it fails again, check that the hub answers with hub_get_info and read the rule with hub_get_rule. See hub_get_tool_guide(section='set_rule_reference')."]
-        }
+        Map beforeHealth = _rmCheckRuleHealth(id as Integer)
         if (beforeHealth.broken == true) {
-            String rows = beforeHealth.brokenRows ? ': ' + beforeHealth.brokenRows.collect { it.text ? "${it.kind} '${it.text}'" : "${it.kind} on line ${it.position} of its section" }.join('; ') : ''
-            return [success: false, partial: false, ruleId: id, broken: true, brokenRows: beforeHealth.brokenRows,
+            String rows = beforeHealth.brokenRows ? ': ' + beforeHealth.brokenRows.collect { "${it.kind} ${it.id}" + (it.text ? " ('${it.text}')" : '') }.unique().join('; ') : ''
+            return [success: false, partial: false, ruleId: id, broken: true, brokenRows: beforeHealth.brokenRows, checkErrors: beforeHealth.checkErrors,
                 error: "Rule ${id} is already broken${rows}; no change was written.".toString(),
                 note: "Repair the broken rows first: open the rule with hub_set_rule(operation:'form') or in the Hubitat UI and replace or remove what refers to the missing device or variable, then retry. hub_get_rule lists the broken rows; see hub_get_tool_guide(section='set_rule_reference').".toString()]
+        }
+        if (beforeHealth.broken == null || beforeHealth.disabledActions == null) {
+            return [success: false, partial: false, ruleId: id, broken: beforeHealth.broken, checkErrors: beforeHealth.checkErrors,
+                error: (beforeHealth.broken == null ? "Rule ${id}'s broken flag could not be read before the write, so whether it is already broken is unknown; no change was written." :
+                    "Rule ${id}'s compiled state could not be read before the write, so it is not known to be intact; no change was written.").toString(),
+                note: "checkErrors says why. Check that the hub answers with hub_get_info, then read the rule with hub_get_rule: send the update once its health reads broken:false and lists disabledActions. If it stays unreadable, check the rule in the Hubitat UI or with hub_set_rule(operation:'form') before editing it. See hub_get_tool_guide(section='set_rule_reference')."]
         }
         Map backup
         try { backup = _ndEditBackup(id, 'pre-document-update') }
@@ -26212,7 +26249,7 @@ private void _ndValidateSchema(Object value, Map schema, String path, boolean co
 }
 Map toolSetRule(Map request) {
     if (request.containsKey('confirm') && !(request.confirm instanceof Boolean)) throw new IllegalArgumentException('confirm must be boolean')
-    if (request.containsKey('ruleId')) _ndValidateSchema(request.ruleId, [type: 'integer', minimum: 1], 'ruleId', true)
+    if (request.containsKey('ruleId')) _ndId(request.ruleId)
     if (request.containsKey('args') && !(request.args instanceof Map)) throw new IllegalArgumentException('args must be an object')
     if (!request.containsKey('operation')) {
         if (request.args) throw new IllegalArgumentException('Choose an operation before supplying args')
@@ -26229,7 +26266,7 @@ Map toolSetRule(Map request) {
         Map properties = [operation: [type: 'string', enum: [operation]], args: schema, confirm: [type: 'boolean'], bestPracticeKey: [type: 'string']]
         List required = ['operation', 'args', 'confirm']
         if (operation != 'create') { properties.ruleId = [type: 'integer', minimum: 1]; required << 'ruleId' }
-        return [operation: operation, confirm_required: true, inputSchema: [type: 'object', additionalProperties: false, properties: properties, required: required],
+        return [operation: operation, confirmRequired: true, inputSchema: [type: 'object', additionalProperties: false, properties: properties, required: required],
             usage: 'Supply these arguments with confirm=true and a recent backup to execute. See set_rule_reference.']
     }
     if (operation != 'create' && !request.containsKey('ruleId')) throw new IllegalArgumentException('ruleId is required')
@@ -26240,7 +26277,15 @@ Map toolSetRule(Map request) {
     def target = getAppByAppId(id)
     boolean rmParent = target?.appType?.namespace == 'hubitat' && target?.appType?.name == 'Rule Machine'
     if (target?.id?.toString() != id.toString() || !rmParent) _nrRequireEditableRule(target, id)
-    toolCallAppForm(arguments + [ruleId: request.ruleId, confirm: true], 'hub_set_rule')
+    _ndCamelForm(toolCallAppForm(arguments + [ruleId: request.ruleId, confirm: true], 'hub_set_rule'))
+}
+private Map _ndCamelForm(Map result) {
+    Closure camel = { Map row -> row.collectEntries { k, v -> [(k.toString().replaceAll(/_([a-z])/) { all, c -> c.toUpperCase() }): v] } }
+    Map renamed = camel(result)
+    ['completed', 'fields', 'controls'].each { key ->
+        if (renamed.get(key) instanceof List) renamed.put(key, renamed.get(key).collect { it instanceof Map ? camel(it) : it })
+    }
+    renamed
 }
 def _getAllToolDefinitions_partNativeDocuments() {
     return [[
@@ -26256,11 +26301,11 @@ String _ndGuide() {
 
 Call hub_set_rule without operation for help, or choose a write operation without confirm to inspect its schema without changing the rule. Top-level ruleId identifies the target; args cannot override it or confirm. When mandatory guide acknowledgment is enabled, pass its key as top-level bestPracticeKey alongside operation, ruleId, args and confirm.
 
-Read hub_set_rule(operation:"read",ruleId,args:{sections:[...]}) before editing an existing native rule; hub_get_rule returns the same document from the read-only tools. A read renders the rule's main page once, because Rule Machine updates its broken flag only then, and returns the result as health, the same report hub_get_rule returns (broken, brokenRows, paused, stopped, privateBoolean, structuralIssues; see builtin_app_tools_rules). The sections come from native state and typed settings. Sections: actions, conditions, triggers, expressions, variables, settings. Action IDs and order are native IDs, preserved for in-place edits; omitted parts and unknown settings remain native-owned.
+Read hub_set_rule(operation:"read",ruleId,args:{sections:[...]}) before editing an existing native rule; hub_get_rule returns the same document from the read-only tools, with the local variables as a localVariables list in place of the variables section. A read does not open the rule's page: it returns health, the same report hub_get_rule returns (broken from the rule's own check, brokenRows, paused, stopped, privateBoolean, structuralIssues; see builtin_app_tools_rules). The sections come from native state and typed settings. Sections: actions, conditions, triggers, expressions, variables, settings. Action IDs and order are native IDs, preserved for in-place edits; omitted parts and unknown settings remain native-owned.
 
 For large rules, read one section with args:{sections:["settings"],cursor:"",limit:50}. Paging requires exactly one section; limit is 1..100 (default 50). The section keeps its usual map or list shape. Pass the returned top-level nextCursor into args.cursor until nextCursor is null. page returns offset, limit, total and revision, a hash of the complete section; restart if revision changes. Pages may contain fewer than limit rows to fit the response size cap; an individual oversized row is refused explicitly without truncation. Actions retain native order, settings sort by name, and map sections sort by string key. Omit cursor and limit for an unpaged read.
 
-Writes require confirm=true and a recent hub backup. Automatic pre-edit recovery is enabled by default: an update captures one recovery point for its whole changes batch, and a rule form captures one before its first render and reuses it through that workflow. Recovery metadata is returned as backup, including after partial failure; capture failure stops the requested edit. Rule Machine parent creation/navigation has no existing child configuration to recover; opening the child starts its own protected workflow. hub_set_rule(operation:"update",ruleId,args:{changes:[...]},confirm:true) applies changes in order. hub_set_rule(operation:"create",args:{parentId,name,changes:[...]},confirm:true) creates a Rule-5.1 child under native Rule Machine; parentId is the installed Rule Machine app's id, which hub_list_apps(scope:"instances") lists. A failed creation can leave a native child: inspect returned ruleId and parent before retrying. A partial update can leave preceding changes committed; inspect before resubmitting. An update first renders the rule's page and refuses a rule that is already broken, naming its broken rows, before anything is written: repair those rows with operation:"form" or in the Hubitat UI.
+Writes require confirm=true and a recent hub backup. Automatic pre-edit recovery is enabled by default: an update captures one recovery point for its whole changes batch, and a rule form captures one before its first render and reuses it through that workflow. Recovery metadata is returned as backup, including after partial failure; capture failure stops the requested edit. Rule Machine parent creation/navigation has no existing child configuration to recover; opening the child starts its own protected workflow. hub_set_rule(operation:"update",ruleId,args:{changes:[...]},confirm:true) applies changes in order. hub_set_rule(operation:"create",args:{parentId,name,changes:[...]},confirm:true) creates a Rule-5.1 child under native Rule Machine; parentId is the installed Rule Machine app's id, which hub_list_apps(scope:"instances") lists. A failed creation can leave a native child: inspect returned ruleId and parent before retrying. A partial update can leave preceding changes committed; inspect before resubmitting. An update first reads the same health and, before any backup or write, refuses a rule that is already broken, naming each broken row by kind and native id (trigger 2), or a rule whose broken flag or compiled state cannot be read, with checkErrors saying why: repair broken rows with operation:"form" or in the Hubitat UI.
 
 Each change is {part,value}. Supported parts:
 - condition or trigger: {id?,capability,fields:[{name,type,value}]}.
@@ -26275,17 +26320,17 @@ Each change is {part,value}. Supported parts:
 
 Typed fields use exact native names containing # for the allocated ID, for example logmsg.#. Expressions use existing native condition IDs and (, ), NOT, AND, OR, XOR. Omit an id to append; provide an existing native id to edit. Field names and capability/action variants require verified native contracts; not every capability-specific variant is supported. Discover native options through operation:"form" when a document contract is unavailable. Unknown fields cannot be assumed to compile correctly merely because a setting persists. A successful result establishes native model checks, typed readback, native editor diagnostics, expression-reference checks and nonbroken health with activation status; independently verify device behavior and native UI editing for the intended automation.
 
-Example changes: [{part:"action",value:{type:"messageActs",subtype:"getLogMsg",fields:[{name:"logmsg.#",type:"textarea",value:"Document action"}]}}]. Writes render the native trigger/action/main pages, check health, submit native Done, and read subscriptions plus a fresh document. These pages can mutate native state; a document read renders only the main page.
+Example changes: [{part:"action",value:{type:"messageActs",subtype:"getLogMsg",fields:[{name:"logmsg.#",type:"textarea",value:"Document action"}]}}]. Writes render the native trigger/action/main pages, check health, submit native Done, and read subscriptions plus a fresh document. These pages can mutate native state; a document read renders none of them.
 
 ## Native Rule Forms
 
-hub_set_rule(operation:"form",ruleId,args:{steps:[{kind:"open"}]},confirm:true) operates an enabled Rule-5.1 or Button Rule-5.1 rule, or its Rule Machine parent; hub_set_native_app(operation:"form",app_id,...) runs the same steps on any other classic app, spelling expectPage and optionsFor as expect_page and options_for. Read action variants, input names and option values from the returned forms instead of guessing them. Even open renders execute app code and can change state or cause side effects. An open's optional page names a registered native page, and from names the page that links to it, so a sub-page opened directly offers its Done back to that parent. Follow returned controls for page parameters and breadcrumbs. A create_child control creates the parent's native child type, returns created_app_id and closes the parent context; open the child separately to configure it. Apps are deleted with hub_delete_native_app.
+hub_set_rule(operation:"form",ruleId,args:{steps:[{kind:"open"}]},confirm:true) operates an enabled Rule-5.1 or Button Rule-5.1 rule, or its Rule Machine parent; hub_set_native_app(operation:"form",app_id,...) runs the same steps on any other classic app, spelling expectPage and optionsFor as expect_page and options_for, and its result keys in snake_case (control_id, created_app_id, navigated_app_id, reopen_required). Read action variants, input names and option values from the returned forms instead of guessing them. Even open renders execute app code and can change state or cause side effects. An open's optional page names a registered native page, and from names the page that links to it, so a sub-page opened directly offers its Done back to that parent. Follow returned controls for page parameters and breadcrumbs. A create_child control creates the parent's native child type, returns createdAppId and closes the parent context; open the child separately to configure it. Apps are deleted with hub_delete_native_app.
 
-Submit with {kind:"submit",expectPage:"last returned page",fields:{"native field name":value},activate:"returned control_id"}; without activate it saves the fields and refreshes the page. Control IDs tell apart native buttons that share a name, such as editing and deleting the same variable. With Hide passwords and credentials on (the default), form results mask password-typed fields and fields whose names look like credentials (API keys, tokens, passwords, PINs, lock codes) with the same marker hub_get_app_config uses; with it off they read as stored, except for a per-client token. A page with both a next page and a done page renders its Done as the _action_done control, which the hub answers by saving the page and rendering that same page again. An app without pages also shows the hub's default fields, label (the app's name) and mode[mode] (a list of mode IDs from its options), and a page's own label and mode elements are the same two fields; the hub does not always keep the label posted with mode[mode], so after such a submit the label is checked and posted again on its own when the hub put back an older one (label_restored). Native enum keys, device IDs, booleans and single/multiple cardinality are checked before the request. A file-text input takes the file's text, not a path. Each submit posts the supplied settings and, as the browser does, the shown default of every other input with no stored value; a password's default is never posted, and page code can still change its own settings. args.optionsFor:["device field name"] expands device choices on the final returned page.
+Submit with {kind:"submit",expectPage:"last returned page",fields:{"native field name":value},activate:"returned controlId"}; without activate it saves the fields and refreshes the page. Control IDs tell apart native buttons that share a name, such as editing and deleting the same variable. With Hide passwords and credentials on (the default), form results mask password-typed fields and fields whose names look like credentials (API keys, tokens, passwords, PINs, lock codes) with the same marker hub_get_app_config uses; with it off they read as stored, except for a per-client token. A page with both a next page and a done page renders its Done as the _action_done control, which the hub answers by saving the page and rendering that same page again. An app without pages also shows the hub's default fields, label (the app's name) and mode[mode] (a list of mode IDs from its options), and a page's own label and mode elements are the same two fields; the hub does not always keep the label posted with mode[mode], so after such a submit the label is checked and posted again on its own when the hub put back an older one (labelRestored). Native enum keys, device IDs, booleans and single/multiple cardinality are checked before the request. A file-text input takes the file's text, not a path. Each submit posts the supplied settings and, as the browser does, the shown default of every other input with no stored value; a password's default is never posted, and page code can still change its own settings. args.optionsFor:["device field name"] expands device choices on the final returned page.
 
 A batch holds 1 through 16 steps, each using the form the step before it returned, so dependent fields require another submit after they appear. A button handler runs before its step's fields are saved, as in the browser: submit the fields it needs in an earlier step. A button without submitOnChange reloads and needs a separate field submission.
 
-The context expires after five minutes or an app reload and keeps no field values, messages or option labels; limits are 24 KiB of descriptors per app, 96 KiB in all, and eight caller workflows. Opening another app replaces only that caller's context; reopen the previous app before submitting it again. expectPage guards the caller's latest context, not edits in a browser, so avoid editing concurrently. After an error, completed operations stay and the last can be uncertain: inspect the app and reopen instead of replaying buttons. Terminal navigation closes the context without following redirects; a local link or script navigation to the same app or its direct child returns navigated_app_id and navigated_page with closed:true, to open separately. No script is evaluated: app JavaScript, custom HTML inputs, external links and other unsupported browser controls are listed in unsupported. Success means the native form operation returned, not that the app's intended runtime behavior was independently verified.'''
+The context expires after five minutes or an app reload and keeps no field values, messages or option labels; limits are 24 KiB of descriptors per app, 96 KiB in all, and eight caller workflows. Opening another app replaces only that caller's context; reopen the previous app before submitting it again. expectPage guards the caller's latest context, not edits in a browser, so avoid editing concurrently. After an error, completed operations stay and the last can be uncertain: inspect the app and reopen instead of replaying buttons. Terminal navigation closes the context without following redirects; a local link or script navigation to the same app or its direct child returns navigatedAppId and navigatedPage with closed:true, to open separately. No script is evaluated: app JavaScript, custom HTML inputs, external links and other unsupported browser controls are listed in unsupported. Success means the native form operation returned, not that the app's intended runtime behavior was independently verified.'''
 }
 @groovy.transform.Field static final Map NATIVE_FORM_CONTEXTS = new java.util.concurrent.ConcurrentHashMap()
 @groovy.transform.Field static final Map NATIVE_FORM_BUSY = new java.util.concurrent.ConcurrentHashMap()
@@ -26600,7 +26645,7 @@ private Map _nfPublic(Map context, List optionsFor) {
 private Map _nfBackup(Long id, def nativeApp, String page) {
     boolean builtIn = nativeApp?.appType?.namespace == 'hubitat'
     if (builtIn && nativeApp.appType.name == 'Rule Machine') return [skipped: true, reason: 'Parent creation/navigation has no existing child state to restore; opening a child starts its own protected workflow']
-    if (_rmIsEditableRuleType(nativeApp?.appType?.name, nativeApp?.appType?.namespace)) return _ndEditBackup(id, 'pre-native-form')
+    if (_rmIsEditableRuleType(nativeApp?.appType?.namespace, nativeApp?.appType?.name)) return _ndEditBackup(id, 'pre-native-form')
     if (_effectiveBackupSetting('backupBeforeRuleEdits') == 'false') return [skipped: true, reason: 'Automatic pre-edit backups are disabled']
     _rmBackupBeforeEdit(id.toInteger(), 'pre-native-form', page)
 }
@@ -26623,7 +26668,7 @@ private Map _nfPrepare(Long id, Map context, Map supplied, String activate, Stri
     Map body = [:] + context.envelope
     supplied.each { name, value ->
         Map field = context.get('fields').get(name)
-        if (!field && context.controls.values().any { it.kind == 'button' && it.name == name }) throw new IllegalArgumentException("${name} is a button on the current native page, not a field; activate its control_id instead")
+        if (!field && context.controls.values().any { it.kind == 'button' && it.name == name }) throw new IllegalArgumentException("${name} is a button on the current native page, not a field; activate its ${_nfKeyNames(toolName).control} instead")
         if (!field) throw new IllegalArgumentException("Field is not present on the current native page: ${name}")
         body.putAll(_nfWire(field, _nfValue(field, value)))
     }
@@ -26648,7 +26693,7 @@ private Map _nfPrepare(Long id, Map context, Map supplied, String activate, Stri
     String reloadPath = null
     if (activate) {
         control = context.controls[activate]
-        if (!control) throw new IllegalArgumentException('Choose one exact returned native control_id')
+        if (!control) throw new IllegalArgumentException("Choose one exact returned native ${_nfKeyNames(toolName).control}".toString())
         if (control.disabled) throw new IllegalArgumentException('The native control is disabled')
         if (control.kind == 'local_app' && supplied) throw new IllegalArgumentException('Submit fields separately before opening another native app form')
         if (control.kind == 'create_child' && supplied) throw new IllegalArgumentException('Submit parent fields separately before creating a child')
@@ -26737,14 +26782,14 @@ private void _nfForget(Long id) {
     if (NATIVE_FORM_CONTEXTS[key]?.app_id == id) NATIVE_FORM_CONTEXTS.remove(key)
 }
 private Map _nfKeyNames(String toolName) {
-    toolName == 'hub_set_rule' ? [id: 'ruleId', expect: 'expectPage', options: 'optionsFor'] : [id: 'app_id', expect: 'expect_page', options: 'options_for']
+    toolName == 'hub_set_rule' ? [id: 'ruleId', expect: 'expectPage', options: 'optionsFor', control: 'controlId'] : [id: 'app_id', expect: 'expect_page', options: 'options_for', control: 'control_id']
 }
 Map toolCallAppForm(Map args, String toolName = 'hub_set_native_app') {
     Map names = _nfKeyNames(toolName)
     String idKey = names.id
     String expectKey = names.expect
     def rawId = args.get(idKey)
-    if (args.keySet().any { !(it in [idKey, 'steps', names.options, 'confirm', 'bestPracticeKey']) } || !rawId?.toString()?.isLong() || rawId.toString().toLong() < 1) throw new IllegalArgumentException("A positive ${idKey} is required".toString())
+    if (args.keySet().any { !(it in [idKey, 'steps', names.options, 'confirm', 'bestPracticeKey']) } || _exactIntId(rawId) == null) throw new IllegalArgumentException("A positive ${idKey} is required".toString())
     if (!(args.steps instanceof List) || args.steps.size() < 1 || args.steps.size() > 16) throw new IllegalArgumentException('Provide 1 through 16 open/submit steps')
     List optionsFor = args.get(names.options) ?: []
     if (!(optionsFor instanceof List) || optionsFor.size() > 32 || optionsFor.any { !(it instanceof String) }) throw new IllegalArgumentException("${names.options} must contain at most 32 field names".toString())
@@ -26756,12 +26801,12 @@ Map toolCallAppForm(Map args, String toolName = 'hub_set_native_app') {
         if (step.kind == 'open' && step.page != null && (!(step.page instanceof String) || !(step.page ==~ /[A-Za-z_][A-Za-z0-9_.-]*/))) throw new IllegalArgumentException('A registered native page name is required')
         if (step.kind == 'open' && step.from != null && (step.page == null || !(step.from instanceof String) || !(step.from ==~ /[A-Za-z_][A-Za-z0-9_.-]*/))) throw new IllegalArgumentException('from names the parent page of the opened page and requires page')
         if (step.kind == 'submit' && (!(step.get(expectKey) instanceof String) || (step.get('fields') != null && !(step.get('fields') instanceof Map)))) throw new IllegalArgumentException("Submit requires ${expectKey} and an optional fields object".toString())
-        if (step.activate != null && !(step.activate instanceof String)) throw new IllegalArgumentException('activate requires a returned control_id string')
+        if (step.activate != null && !(step.activate instanceof String)) throw new IllegalArgumentException("activate requires a returned ${names.control} string".toString())
         def marked = step.get('fields') instanceof Map ? step.get('fields').find { k, v -> _isRedactionMarker(v) } : null
         if (marked) throw new IllegalArgumentException("${marked.key} is the redaction marker, not a value; omit the field to keep the stored one")
     }
     requireDestructiveConfirm(args.confirm)
-    Long id = rawId.toString().toLong()
+    Long id = _exactIntId(rawId) as Long
     _requireUnprotectedAppMutation(id, 'edit native form')
     def nativeApp = getAppByAppId(id)
     if (nativeApp?.id?.toString() != id.toString()) throw new IllegalArgumentException("${idKey} must identify an installed app".toString())
@@ -31121,8 +31166,8 @@ def getGatewayConfig() {
             summaries: [
                 hub_get_custom_rule: "List MCP custom rules (omit ruleId) or get one rule's detail; detailed=true (with ruleId) adds diagnostics. Args: ruleId?, detailed?, cursor?",
                 hub_test_custom_rule: "Dry-run an MCP custom rule without executing actions. Args: ruleId",
-                hub_list_rules: "List all native Rule Machine rules with IDs, labels and status",
-                hub_get_rule: "Read one rule: its health (broken, broken rows, paused, stopped, private boolean, disabled rows, block structure, live subscription and job counts) and, for a Rule Machine 5.1 rule, its actions, conditions, triggers, expressions, settings and local variables. Also reads a Visual Rule's or classic app's health. Args: ruleId, sections?, cursor?, limit?",
+                hub_list_rules: "List the Rule Machine 5.x rules with IDs, labels and status. Button Rules are listed by hub_list_apps and Visual Rules by hub_get_visual_rule",
+                hub_get_rule: "Read one Rule Machine rule, Button Rule or Basic Rule without opening its page: its health (broken, broken rows by native id, paused, stopped, private boolean, disabled rows, block structure, live subscription and job counts) and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; a Basic Rule's settings. Any other app returns its health alone. Args: ruleId, sections?, cursor?, limit?",
                 hub_get_visual_rule: "List Visual Rules Builder rules (omit appId) or read one rule's full JSON definition + format. Args: appId?"
             ],
             searchHints: [
@@ -31138,16 +31183,16 @@ def getGatewayConfig() {
             tools: ["hub_set_native_app", "hub_set_rule", "hub_list_rules", "hub_call_rule", "hub_set_rule_private_boolean", "hub_set_app_disabled", "hub_delete_native_app", "hub_clone_native_app", "hub_export_native_app", "hub_import_native_app", "hub_get_rule"],
             summaries: [
                 hub_set_rule: "Read, create, update or use native Rule Machine forms. Args: operation?, ruleId?, args?, confirm?. Omit operation for help; unconfirmed writes return schemas.",
-                hub_list_rules: "List all Rule Machine rules with IDs, labels and status (uses RMUtils — RM only)",
-                hub_call_rule: "Run the actions of one or more rules, or stop, start, pause or resume them, through each rule's own page buttons (a Visual Rule: actions, pause, resume). Args: ruleId (id or array of ids), action (actions/stop/start/pause/resume, default actions)",
-                hub_set_rule_private_boolean: "Set the private boolean of one or more RM rules (RMUtils). Args: ruleId (id or array of ids), value (bool)",
+                hub_list_rules: "List the Rule Machine 5.x rules with IDs, labels and status. Button Rules are listed by hub_list_apps and Visual Rules by hub_get_visual_rule",
+                hub_call_rule: "Run the actions of one or more rules, or stop, start, pause or resume them, through each rule's own page buttons (a Visual Rule: pause, resume, and actions on a 2.0 rule). Args: ruleId (id or array of ids), action (actions/stop/start/pause/resume, default actions)",
+                hub_set_rule_private_boolean: "Set the private boolean of one or more Rule Machine rules or Button Rules. Args: ruleId (id or array of ids), value (bool)",
                 hub_set_native_app: "Create, update or drive the native forms of classic apps (Room Lighting, Button Controller and Button Rule, Basic Rule, Notifier, Groups and Scenes, Thermostat Scheduler and Controller, user and community apps). Args: operation?, app_id?, args?, confirm?. Omit operation for help; unconfirmed writes return schemas. Rule Machine rules use hub_set_rule.",
                 hub_delete_native_app: "Delete any classic native app (soft by default, force=true for hard). Auto-backs-up first. Args: appId, force (opt), confirm",
                 hub_set_app_disabled: "Enable or disable any installed app without deleting it (reversible red-X). Args: appId, disabled (bool). Read-back verified. For RM rules prefer hub_call_rule pause/resume.",
                 hub_clone_native_app: "Clone an existing rule/app via Hubitat's first-party appCloner (deep: child apps and pause state copy too, so a clone of an ACTIVE app lands ACTIVE). Cheaper than rebuilding from scratch via the wizard. Args: appId (alias sourceAppId), newName (opt), stageDisabled (opt: disable clone + every descendant immediately), confirm. Returns newAppId.",
                 hub_export_native_app: "Export a rule/app to its canonical JSON shape via Hubitat's first-party appCloner. Args: appId (alias sourceAppId), saveAs (opt File Manager filename). Returns the JSON content (and writes to File Manager if saveAs given).",
                 hub_import_native_app: "Create a new rule/app from a previously-exported JSON via Hubitat's first-party appCloner (the import lands ACTIVE). Args: jsonContent | fromFile, parentHintAppId (existing rule under the target parent — used to seed the cloner), newName (opt), stageDisabled (opt: disable import + every descendant immediately), confirm. Returns newAppId.",
-                hub_get_rule: "Read one rule: its health (broken, broken rows, paused, stopped, private boolean, disabled rows, block structure, live subscription and job counts) and, for a Rule Machine 5.1 rule, its actions, conditions, triggers, expressions, settings and local variables. Also reads a Visual Rule's or classic app's health. Args: ruleId, sections?, cursor?, limit?"
+                hub_get_rule: "Read one Rule Machine rule, Button Rule or Basic Rule without opening its page: its health (broken, broken rows by native id, paused, stopped, private boolean, disabled rows, block structure, live subscription and job counts) and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; a Basic Rule's settings. Any other app returns its health alone. Args: ruleId, sections?, cursor?, limit?"
             ],
             searchHints: [
                 hub_set_rule: "Read, create, update or use native Rule Machine forms. Args: operation?, ruleId?, args?, confirm?. Omit operation for help; unconfirmed writes return schemas.",
@@ -31262,10 +31307,10 @@ def getGatewayConfig() {
             tools: ["hub_set_rule", "hub_list_rules", "hub_call_rule", "hub_set_rule_private_boolean", "hub_get_rule", "hub_delete_native_app", "hub_get_visual_rule", "hub_set_visual_rule", "hub_delete_visual_rule"],
             summaries: [
                 hub_set_rule: "Read, create, update or use native Rule Machine forms. Args: operation?, ruleId?, args?, confirm?. Omit operation for help; unconfirmed writes return schemas.",
-                hub_list_rules: "List all Rule Machine rules with IDs, labels and status (RMUtils — RM only)",
-                hub_call_rule: "Run the actions of one or more rules, or stop, start, pause or resume them (a Visual Rule: actions, pause, resume). Args: ruleId (id or array of ids), action (actions/stop/start/pause/resume, default actions)",
-                hub_set_rule_private_boolean: "Set the private boolean of one or more RM rules. Args: ruleId (id or array of ids), value (bool)",
-                hub_get_rule: "Read one rule: its health (broken, broken rows, paused, stopped, private boolean, disabled rows, block structure, live subscription and job counts) and, for a Rule Machine 5.1 rule, its actions, conditions, triggers, expressions, settings and local variables. Also reads a Visual Rule's or classic app's health. Args: ruleId, sections?, cursor?, limit?",
+                hub_list_rules: "List the Rule Machine 5.x rules with IDs, labels and status. Button Rules are listed by hub_list_apps and Visual Rules by hub_get_visual_rule",
+                hub_call_rule: "Run the actions of one or more rules, or stop, start, pause or resume them, through each rule's own page buttons (a Visual Rule: pause, resume, and actions on a 2.0 rule). Args: ruleId (id or array of ids), action (actions/stop/start/pause/resume, default actions)",
+                hub_set_rule_private_boolean: "Set the private boolean of one or more Rule Machine rules or Button Rules. Args: ruleId (id or array of ids), value (bool)",
+                hub_get_rule: "Read one Rule Machine rule, Button Rule or Basic Rule without opening its page: its health (broken, broken rows by native id, paused, stopped, private boolean, disabled rows, block structure, live subscription and job counts) and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; a Basic Rule's settings. Any other app returns its health alone. Args: ruleId, sections?, cursor?, limit?",
                 hub_delete_native_app: "Delete any classic native app incl. RM rules (soft by default, force=true for hard). Auto-backs-up first. Args: appId, force (opt), confirm.",
                 hub_get_visual_rule: "List Visual Rules Builder rules (omit appId) or read one rule's full JSON definition + format. Args: appId?",
                 hub_set_visual_rule: "Create or update a Visual Rules Builder rule — VRB is the primary rule engine; one JSON write with if/then/else gating. Use native document tools for supported RM structures. Args: appId (omit=create), name, definition, paused (opt), confirm.",
@@ -31566,6 +31611,7 @@ def handleGateway(gatewayName, toolName, toolArgs, reqT0 = null, boolean bpsChec
     if (required) {
         def missing = required.findAll { !safeArgs.containsKey(it) }
         if (missing && !getHiddenToolNames().contains(toolName)) {
+            _rejectUnknownArgs(toolName, safeArgs)
             def defMap = applyDescriptionTransform(getAllToolDefinitions(), false)
                 .collectEntries { [(it.name): it] }
             def toolDef = defMap[toolName]
@@ -34191,14 +34237,23 @@ Map _appStatusRead(Integer appId) {
     sections.each { key, value ->
         if (value != null && !(value instanceof List)) throw new IllegalStateException("App ${appId}'s status page returned ${key} in an unexpected shape")
     }
+    boolean settingsMalformed = status.appSettings != null && !(status.appSettings instanceof List)
+    sections.appSettings = settingsMalformed ? null : status.appSettings
     boolean maskTokens = _redactsAccessTokens()
-    [appStateMissing: rawState == null, appState: appState.findAll { it instanceof Map }.collect { row ->
+    [appStateMissing: rawState == null, appSettingsMalformed: settingsMalformed, appState: appState.findAll { it instanceof Map }.collect { row ->
         String key = row.name?.toString()
         def value = _appStateMasked(key, row.value)
         if (maskTokens) value = _redactAccessTokens([(key): value]).get(key)
         [name: row.name, value: value]
      },
-     eventSubscriptions: sections.eventSubscriptions ?: [], scheduledJobs: sections.scheduledJobs ?: []]
+     eventSubscriptions: sections.eventSubscriptions ?: [], scheduledJobs: sections.scheduledJobs ?: [],
+     appSettings: (sections.appSettings ?: []).findAll { it instanceof Map }.collect { row ->
+        def ids = row.deviceIdsForDeviceList instanceof List ? row.deviceIdsForDeviceList : []
+        if (!ids && row.deviceList instanceof Map) ids = row.deviceList.keySet().toList()
+        [name: row.name?.toString(), type: row.type?.toString(), value: _appStateMasked(row.name?.toString(), row.value), deviceIds: ids.collect { it.toString() }]
+     },
+     installedApp: [label: status.installedApp?.label?.toString(), disabled: status.installedApp?.disabled,
+                    typeName: status.installedApp?.appType?.name?.toString(), namespace: status.installedApp?.appType?.namespace?.toString()]]
 }
 private Object _appStateMasked(String name, Object value) {
     if (_appConfigMasksSetting(name, null, value)) return _appConfigRedactedMarker()
@@ -34227,9 +34282,9 @@ private Map _ruleCompiledState(Integer appId) {
             }
             boolean rmMaps = parsed.capabstrue instanceof Map && parsed.capabsfalse instanceof Map
             if (parsed.containsKey("broken") || rmMaps) {
-                Boolean nativePaused = parsed.paused instanceof Boolean ? parsed.paused :
-                    (!parsed.containsKey("paused") && parsed.broken instanceof Boolean && rmMaps ? false : null)
-                return [ruleFormat: "rm", broken: parsed.containsKey("broken") ? parsed.broken == true : null, validationErrors: [],
+                Boolean nativePaused = _appStateFlag(parsed.paused)
+                if (nativePaused == null && !parsed.containsKey("paused") && rmMaps) nativePaused = false
+                return [ruleFormat: "rm", broken: _appStateFlag(parsed.broken), validationErrors: [],
                         paused: nativePaused,
                         actionList: (parsed.actionList instanceof List ? parsed.actionList : null),
                         state: parsed, endpoint: "ruleBuilderJson"]
@@ -34366,55 +34421,46 @@ private String _classicAppFormat(String typeName) {
     if (t.contains("button controller")) return "button-controller"
     return "classic-app"
 }
-private boolean _rmIsRuleAppType(String name) {
-    return name != null && name ==~ /(Button )?Rule-\d.*/
+private boolean _rmIsRuleAppType(namespace, name) {
+    return namespace?.toString() == 'hubitat' && name?.toString() ==~ /(Button )?Rule-\d.*/
 }
-private boolean _rmIsVisualRuleType(String name) {
-    return name?.startsWith("Visual Rule Builder") == true
+private boolean _rmIsVisualRuleType(namespace, name) {
+    return namespace?.toString() == 'hubitat' && name?.toString()?.startsWith("Visual Rule Builder") == true
 }
 String _rmNoAppText(Collection ids) {
     return "No app with id ${ids.join(', ')} is installed".toString()
 }
 String _rmNotRuleText(Map typesById) {
-    if (typesById.size() == 1) return typesById.collect { id, typeName -> "App ${id} is a ${typeName} app, not a rule" }[0].toString()
-    return "Apps ${typesById.collect { id, typeName -> "${id} (${typeName})" }.join(', ')} are not rules".toString()
+    if (typesById.size() == 1) return typesById.collect { id, typeName -> "App ${id} is a ${typeName} app" }[0].toString()
+    return "Apps ${typesById.collect { id, typeName -> "${id} (${typeName})" }.join(', ')} are other app types".toString()
 }
 String _rmMissingAppText(id) {
-    return "${_rmNoAppText([id])}; find rule ids with hub_list_rules, or any app's id with hub_list_apps.".toString()
+    return "${_rmNoAppText([id])}. Find rule ids with hub_list_rules (Rule Machine), hub_list_apps (Button Rules and Basic Rules) or hub_get_visual_rule (Visual Rules).".toString()
 }
-boolean _rmIsEditableRuleType(name, namespace = 'hubitat') {
+boolean _rmIsEditableRuleType(namespace, name) {
     return namespace?.toString() == 'hubitat' && name?.toString() in ['Rule-5.1', 'Button Rule-5.1']
 }
-String _rmNotEditableText(id, String typeName) {
-    if (_rmIsVisualRuleType(typeName)) return "App ${id} is a ${typeName} rule: Visual Rules are read with hub_get_visual_rule, but only Rule Machine 5.1 rules and Button Rules can be edited here".toString()
-    if (_rmIsRuleAppType(typeName)) return "App ${id} is a ${typeName} rule: rules of that type are read with hub_get_rule, but only Rule Machine 5.1 rules and Button Rules can be edited here".toString()
-    return _rmNotRuleText([(id): typeName ?: 'unknown type'])
-}
-Map _rmLookupFailure(Map reasonsById) {
-    def detail = reasonsById.collect { id, why -> "app ${id}: ${why}" }.join('; ')
-    return [success: false, error: "The target app could not be looked up (${detail}), so nothing was run.".toString(),
-            note: "Nothing was changed. Retry once; if it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
-}
-private List _rmBrokenRows(Map cfg) {
-    def kinds = ["**Broken Trigger**": "trigger", "**Broken Action**": "action", "**Broken Condition**": "condition"]
+private List _rmBrokenRows(Map compiled, List appSettings) {
+    def kinds = ['trigger', 'condition', 'action']
+    def stores = [trigger: compiled.capabstrue, condition: compiled.capabsfalse, action: compiled.actions]
     def rows = []
-    (cfg?.configPage?.sections ?: []).each { sect ->
-        def texts = (sect?.body ?: []).findAll { it instanceof Map && it.element in ["paragraph", "href"] }.collect { it.description?.toString() ?: "" }
-        texts.each { html ->
-            List lines = html.split(/(?i)<br\s*\/?>|<\/?p[^>]*>|<\/div>|<\/li>|\n/).collect { _rmPlainText(it) }.findAll { it }
-            lines.eachWithIndex { line, idx ->
-                kinds.each { marker, kind ->
-                    if (!line.contains(marker)) return
-                    String text = line.replace(marker, "").trim()
-                    rows << [kind: kind, text: text ?: null, position: idx + 1]
-                }
-            }
+    appSettings.each { setting ->
+        if (!setting.type?.startsWith('capability') || setting.deviceIds) return
+        String kind = null
+        String id = null
+        ['action': /^.+\.(\d+)$/, 'condition': /^(?:rDev|relDevice)_(\d+)$/, 'trigger': /^(?:tDev|reltDevice)(\d+)$/].find { k, pattern ->
+            def match = setting.name =~ pattern
+            if (match.matches()) { kind = k; id = match.group(1) }
+            kind != null
         }
+        if (kind == null) return
+        def stored = stores.get(kind)
+        if (!(stored instanceof Map) || !stored.containsKey(id)) return
+        Map row = [kind: kind, id: id, setting: setting.name]
+        if (stored.get(id) instanceof String) row.text = stored.get(id)
+        rows << row
     }
-    rows.unique()
-}
-private String _rmPlainText(String html) {
-    html?.replaceAll(/<[^>]+>/, "")?.replace("&nbsp;", " ")?.replace("&lt;", "<")?.replace("&gt;", ">")?.replace("&quot;", "\"")?.replace("&#39;", "'")?.replace("&amp;", "&")?.trim()
+    rows.unique().sort { a, b -> kinds.indexOf(a.kind) <=> kinds.indexOf(b.kind) ?: a.id.toInteger() <=> b.id.toInteger() ?: a.setting <=> b.setting }
 }
 private List _rmDisabledRowIds(Map compiled, String key, List checkErrors) {
     if (!compiled.containsKey(key) || compiled.get(key) == null) return []
@@ -34423,7 +34469,7 @@ private List _rmDisabledRowIds(Map compiled, String key, List checkErrors) {
     checkErrors << "the rule's ${key} is not a list (${value}), so its disabled rows were not read".toString()
     return null
 }
-Map _rmCheckRuleHealth(Integer appId, Map probe = null) {
+Map _rmCheckRuleHealth(Integer appId) {
     def issues = []
     def checkErrors = []
     def result = [ok: false, unreadable: true, broken: null, ruleFormat: null, label: null, disabled: null,
@@ -34439,40 +34485,31 @@ Map _rmCheckRuleHealth(Integer appId, Map probe = null) {
     try { installed = getAppByAppId(appId as Long) }
     catch (Exception lookup) {
         identified = false
-        checkErrors << "app ${appId} could not be identified (${lookup.message ?: lookup.toString()}), so its type was taken from its page".toString()
+        checkErrors << "app ${appId} could not be identified (${lookup.message ?: lookup.toString()}), so its type was taken from its status page".toString()
     }
     if (identified && installed == null) throw new IllegalArgumentException(_rmMissingAppText(appId))
-    String typeName = installed?.appType?.name?.toString()
-    boolean visual = _rmIsVisualRuleType(typeName)
-    boolean read = false
-    Map cfg = null
+    Map status = null
+    try { status = _appStatusRead(appId) }
+    catch (Exception statusErr) { checkErrors << "statusJson: ${statusErr.message ?: statusErr.toString()}".toString() }
+    String typeName = installed != null ? installed.appType?.name?.toString() : status?.installedApp?.typeName
+    def namespace = installed != null ? installed.appType?.namespace : status?.installedApp?.namespace
+    boolean visual = _rmIsVisualRuleType(namespace, typeName)
+    boolean ruleType = _rmIsRuleAppType(namespace, typeName)
+    boolean read = !visual && status != null
+    def disabled = status?.installedApp?.disabled != null ? status.installedApp.disabled : installed?.disabled
+    if (disabled != null) result.disabled = (disabled == true)
+    String label = status?.installedApp?.label ?: installed?.label?.toString()
     Boolean labelPaused = null
     Boolean labelStopped = null
-    if (!visual) {
-        try {
-            cfg = _rmFetchConfigJson(appId)
-            read = true
-            if (probe != null) { if (cfg.configPage?.error) probe.pageError = cfg.configPage.error.toString(); else probe.page = true }
-            if (typeName == null) typeName = cfg.app?.appType?.name?.toString()
-            def label = cfg.app?.label?.toString()
-            if (cfg.app?.disabled != null) result.disabled = (cfg.app.disabled == true)
-            if (cfg.configPage?.error) issues << "the app's page reports an error: ${cfg.configPage.error}".toString()
-            if (label?.contains("*BROKEN*")) issues << "label contains *BROKEN* marker — rule has at least one malformed trigger or action".toString()
-            result.brokenRows = _rmBrokenRows(cfg)
-            if (result.brokenRows) issues << "the rule's page marks ${result.brokenRows.size()} row(s) broken; brokenRows lists each one".toString()
-            while (label != null) {
-                def decoration = label =~ /<[^>]+>\s*\((Paused|Stopped)\)\s*(?:<\/[^>]+>\s*)*$/
-                if (!decoration.find()) break
-                if (decoration.group(1) == "Stopped") labelStopped = true
-                else labelPaused = true
-                label = label.substring(0, decoration.start()).trim()
-            }
-            result.label = label?.replaceAll(/<[^>]+>/, "")?.trim()
-        } catch (Exception e) {
-            checkErrors << "configPage read failed: ${e.message}".toString()
-        }
+    if (label?.contains("*BROKEN*")) issues << "label contains *BROKEN* marker — rule has at least one malformed trigger or action".toString()
+    while (label != null) {
+        def decoration = label =~ /<[^>]+>\s*\((Paused|Stopped)\)\s*(?:<\/[^>]+>\s*)*$/
+        if (!decoration.find()) break
+        if (decoration.group(1) == "Stopped") labelStopped = true
+        else labelPaused = true
+        label = label.substring(0, decoration.start()).trim()
     }
-    boolean ruleType = _rmIsRuleAppType(typeName)
+    result.label = label?.replaceAll(/<[^>]+>/, "")?.trim()
     Map compiled = null
     if (ruleType) result.ruleFormat = "rm"
     if (typeName != null && !visual && !ruleType) {
@@ -34492,38 +34529,57 @@ Map _rmCheckRuleHealth(Integer appId, Map probe = null) {
             if (cs.ruleFormat == "rm") compiled = cs.state
         } else if (cs?.readError) {
             checkErrors << "compiled-state read failed: ${cs.readError}".toString()
-        } else if (_rmIsEditableRuleType(typeName)) {
-            checkErrors << "the rule's compiled state was read but is not Rule Machine state, so its broken flag and disabled rows were not checked".toString()
+        } else if (_rmIsEditableRuleType(namespace, typeName)) {
+            checkErrors << "the rule's compiled state was read but is not Rule Machine state, so its disabled rows were not checked".toString()
         }
     }
+    boolean brokenNoted = false
+    if (_rmIsEditableRuleType(namespace, typeName)) {
+        result.broken = null
+        try {
+            def flag = _nrHandle(appId as Long).broken()
+            if (flag instanceof Boolean) result.broken = flag
+            else { brokenNoted = true; checkErrors << "the rule's broken() check returned ${flag}, not true or false".toString() }
+        } catch (Exception brokenErr) {
+            brokenNoted = true
+            checkErrors << "the rule's broken() check failed (${brokenErr.message ?: brokenErr.toString()})".toString()
+        }
+    }
+    if (result.ruleFormat == "rm" && result.broken == null && !brokenNoted) checkErrors << "the rule's broken flag could not be read, so whether it is broken is unknown".toString()
+    if (result.ruleFormat == "rm" && result.broken == true) {
+        issues << "Rule Machine marks this rule broken: a trigger, condition or action refers to something that is gone; brokenRows lists the rows whose device is gone.".toString()
+        if (compiled == null) checkErrors << "the rule's compiled state went unread, so brokenRows was not listed".toString()
+        else if (status?.appSettingsMalformed) checkErrors << "the status page's appSettings is not a list, so brokenRows was not listed".toString()
+    }
     if (compiled != null) {
-        if (result.broken == true) issues << "Rule Machine marks this rule broken (compiled broken:true): a trigger, condition or action refers to something that is gone; brokenRows lists the rows its page marks.".toString()
         result.disabledActions = _rmDisabledRowIds(compiled, "disabledActions", checkErrors)
         result.disabledTriggers = _rmDisabledRowIds(compiled, "disabledTriggers", checkErrors)
-        result.structuralIssues = _ndStructuralIssues(compiled, cfg?.settings?.useST?.toString() == "true")
+        boolean useST = status?.appSettings?.any { it.name == "useST" && it.value?.toString() == "true" } == true
+        result.structuralIssues = _ndStructuralIssues(compiled, useST)
         if (result.structuralIssues) {
             issues << ("structural imbalance in the rule's actions or expressions: ${result.structuralIssues.join('; ')} — if you are still building this rule (adding an IF/ELSE or Repeat block across separate calls), this is EXPECTED until you add the closer with a hub_set_rule(operation='update') terminator change (subtype endIf or endRep). Otherwise compare against hub_get_rule(sections:['actions']) before considering a restore.").toString()
         }
+        if (result.broken == true && status != null) result.brokenRows = _rmBrokenRows(compiled, status.appSettings)
     }
-    try {
-        Map status = _appStatusRead(appId)
+    if (status != null) {
         result.eventSubscriptionCount = status.eventSubscriptions.size()
         result.scheduledJobCount = status.scheduledJobs.size()
         if (!visual) {
+            boolean pausable = ruleType || result.ruleFormat == "basic-rule"
             Map paused = _appStatusFlag(status, "paused")
             if (paused.value != null) result.paused = paused.value
-            else if (result.paused == null && ruleType && !paused.present && !paused.missing) result.paused = false
+            else if (result.paused == null && pausable && !paused.present && !paused.missing) result.paused = false
             Map stopped = _appStatusFlag(status, "stopped")
             result.stopped = stopped.value != null ? stopped.value : (ruleType && !stopped.present && !stopped.missing ? false : null)
-            if (ruleType) result.privateBoolean = _appStatusFlag(status, "private").value
+            Map flags = [paused: paused, stopped: stopped]
+            if (ruleType) { flags.put("private", _appStatusFlag(status, "private")); result.privateBoolean = flags.get("private").value }
+            flags.each { name, flag -> if (flag.present && flag.value == null) checkErrors << "the app's ${name} state is stored as neither true nor false, so it was not read".toString() }
             if (paused.missing) checkErrors << "the app's status page carried no appState, so paused, stopped and the private boolean were not read".toString()
         }
-    } catch (Exception statusErr) {
-        checkErrors << "statusJson: ${statusErr.message ?: statusErr.toString()}".toString()
     }
     if (result.paused == null && labelPaused) result.paused = true
     if (result.stopped == null && labelStopped) result.stopped = true
-    if (!read) issues << (visual ? "health check failed: the Visual Rule's definition could not be read" : "health check failed: neither the app's page nor its compiled state could be read").toString()
+    if (!read) issues << (visual ? "health check failed: the Visual Rule's definition could not be read" : "health check failed: neither the app's status page nor its compiled state could be read").toString()
     result.unreadable = !read
     result.ok = read && issues.isEmpty() && checkErrors.isEmpty() && result.broken != true && result.validationErrors.isEmpty()
     return result
@@ -35826,13 +35882,13 @@ A single tool can also be switched off under **Advanced: Per-tool Overrides**. A
 - **hub_list_device_dependents** — check it before deleting, disabling or replacing a device. `appsUsing` rows carry id, name (the app type), label, trueLabel and disabled.
 - **hub_get_app_config** renders one page as opening it in the UI does, which runs the app's page code.
   - The page's links are in `page.hrefs`: `{page, title}` for a sub-page, `{url, title}` for an external link, with the summary the page prints under a link as `description`. A sub-page's own links are in its `page.hrefs` (Room Lighting's optionsOnPage is linked from onMeansPage). A linked page's inputs are not in `sections`: read them with `pageName`.
-  - `controls` are the page's buttons and links as hub_set_rule(operation='form') (Rule Machine) or hub_set_native_app(operation='form') returns them; activate one there by its control_id after opening the same page.
+  - `controls` are the page's buttons and links as hub_set_rule(operation='form') (Rule Machine) or hub_set_native_app(operation='form') returns them; activate one there by its id (controlId in hub_set_rule, control_id in hub_set_native_app) after opening the same page.
   - On a Rule Machine rule a paragraph holding a disabled action or trigger reads `{text, disabled: [...]}`, listing the text of each disabled row it holds; a `page.hrefs` entry whose summary holds one (the main page's action link) carries the same `disabled` list. On selectActions (Button Rule: selectActionsX) a disabled action's `disable<N>` control reads 'Enable Action', and the control named `<N>.0.<bool>` carries that action's text; N is the action index, not the row position. The button toggles: never replay a click whose response was lost. hub_set_app_disabled disables the whole app.
   - `pageNote` appears when the hub rendered another page than `pageName`: the app reaches that page only through its link, so open it in a form workflow.
   - Each input is the field hub_set_native_app(operation='form') returns; a device picker adds `selected`, its devices with labels. `unsupported` lists page parts a form cannot drive, such as a community app's create button. When the page cannot be modelled, `formError` says why: inputs carry no values and there are no controls.
   - `appType.namespace` and `appType.name` name the type; `appType.system` and `appType.menu` are the fields hub_list_apps(scope='types') gives for every type at once.
   - `includeSettings=true` adds the raw settings map: 500-1000 app-encoded keys on large apps (Room Lighting stores per-device scene levels as `dm~<deviceId>~<scene>`). Secrets read `***redacted (password)***`: every setting the hub types as a password, on any page, and free-text settings with credential-shaped names (password, pass, secret, token, API key, credential, PIN, lock or alarm code, ...). OAuth accessToken settings follow the Hide access tokens setting. Page inputs read as in the form tools: a password input carries no value and `redacted: true`; a credential-named input reads the marker. With Hide passwords and credentials turned off in the MCP app's settings they read as stored. When the setting types cannot be read the map is withheld and `settingsNote` says why.
-  - `includeStatus=true` adds the app's App Status lists, for any app and also with `summary=true`: `appState` (the app's stored state as `[{name, value}]`; a community app's working data, a webCoRE piston's definition, logs and trace), `eventSubscriptions` and `scheduledJobs`. With Hide passwords and credentials on, a value whose name looks like a credential reads `***redacted (password)***`, also inside nested maps (a rule's local variables); `statusRedactionNote` says so. Access tokens (an `accessToken` entry, each per-client token in `clientTokens`) read `***redacted (access token)***` whenever Hide access tokens is on, and always for a per-client token; `statusRedactionNote` also says whether an app's stored token is shown. When the lists would push the response past the size cap (a webCoRE piston's state can), `appState` lists names only with its values omitted, `statusTruncated` is true and `statusTruncatedNote` says what was cut; if that is still too large, `eventSubscriptions` and `scheduledJobs` are cut too, with `eventSubscriptionsTotal` / `scheduledJobsTotal` giving their full counts, and as a last resort `appState` is left out with `appStateTotal` giving its count. When the status page cannot be read the three lists are omitted and `statusNote` says why. hub_get_rule counts a rule's subscriptions and jobs from the same read.
+  - `includeStatus=true` adds the app's App Status lists, for any app and also with `summary=true`: `appState` (the app's stored state as `[{name, value}]`; a community app's working data, a webCoRE piston's definition, logs and trace), `eventSubscriptions` and `scheduledJobs`. With Hide passwords and credentials on, a value whose name looks like a credential reads `***redacted (password)***`, also inside nested maps (a rule's local variables); `statusRedactionNote` says so. Access tokens (an `accessToken` entry, each per-client token in `clientTokens`) read `***redacted (access token)***` whenever Hide access tokens is on, and always for a per-client token; `statusRedactionNote` also says whether an app's stored token is shown; for a per-client token it says both are always hidden. A status page that carried no app state reads `appState: []` with `appStateMissing: true`, unlike an app whose state is empty. When the lists would push the response past the size cap (a webCoRE piston's state can), `appState` lists names only with its values omitted, `statusTruncated` is true and `statusTruncatedNote` says what was cut; if that is still too large, `eventSubscriptions` and `scheduledJobs` are cut too, with `eventSubscriptionsTotal` / `scheduledJobsTotal` giving their full counts, and as a last resort `appState` is left out with `appStateTotal` giving its count. When the status page cannot be read the three lists are omitted and `statusNote` says why. hub_get_rule counts a rule's subscriptions and jobs from the same read.
   - A type='mode' input's `value` is its stored setting. Day Lights uses ten of them for per-mode levels, gated by `useModeOverrides`; most apps use one as an "only during these modes" restriction.
   - **Mode gating in the built-in apps.** The hub has no "modes in use by" list, so read each app; resolve mode IDs with hub_list_modes.
     - **Notifier** — `modes` (mode ids) on `moreOptions`; restricts.
@@ -35865,16 +35921,16 @@ A single tool can also be switched off under **Advanced: Per-tool Overrides**. A
 Rule runtime control surface (hub_list_rules = Read master; hub_call_rule and the private boolean = Write master):
 (hub_list_rules, hub_call_rule, hub_set_rule_private_boolean and hub_get_rule are also in hub_manage_rule_machine, with hub_set_rule. The reads hub_list_rules and hub_get_rule are also in hub_read_rules.)
 
-- **hub_list_rules** — every Rule Machine 5.x rule (deduplicated by id; older rule types are not supported on current firmware and are not listed) with a live **status** ("active" | "paused" | "stopped" | "disabled" | "unknown"), the **disabled** and **paused** booleans (omitted when unknown) and, only when detected, **requiredExpressionFalse: true**.
+- **hub_list_rules** — lists Rule Machine 5.x rules, each with a live **status** ("active" | "paused" | "stopped" | "disabled" | "unknown"), the **disabled** and **paused** booleans (omitted when unknown) and, only when detected, **requiredExpressionFalse: true**.
   - **disabled** is the app's red-X flag from /hub2/appsList.
   - **paused** and **stopped** come from Rule Machine's name decoration. The appsList name and the RMUtils label are compared with markup stripped and entities decoded; the text the appsList name adds — "(Paused)", "(Stopped)", "(Required Expression false)" — sets the flag. A rule literally NAMED "... (Paused)" or "... (Stopped)" carries the suffix in both strings and is not flagged. A stopped rule's label and name come back without the decoration, in the encoding they already use.
   - The name shows one decoration at a time ("(Stopped)" hides "(Paused)"), so a decorated row also reads that rule's own paused/stopped state; undecorated rows make no extra read. If that read fails, the name decides and the row carries **statusSource: "name"**, with **statusSourceNote** listing those ids. Rule Machine refreshes the decoration when the rule's page renders: hub_call_rule(action="stop"/"start"/"pause"/"resume") renders it, so the list is current after an MCP stop, start, pause or resume, while a stop made elsewhere shows once the rule's page is next opened.
   - **status** precedence is disabled > stopped > paused > active; the booleans stay independent (a paused rule disabled later reads disabled:true, paused:true, status:"disabled").
   - **unknown**: when /hub2/appsList cannot be read, every rule is unknown, the list is unfiltered (deleted rules may linger) and the result carries **statusNote**; when one rule's entry lacks data, only that rule is unknown.
-  - For one rule's state call hub_get_rule. For the disabled flag of other classic apps (Room Lighting, Notifier, Basic Rules, Button Controllers) use hub_list_apps (scope='instances').
-- **hub_call_rule** — run, stop, start, pause or resume one or more rules (ruleId takes an id or an array): Rule Machine rules and Button Rules, and Visual Rules for actions, pause and resume. Each rule is acted on in turn, with per-rule results and failedRuleIds/remainingRuleIds on a partial batch; see hub_call_rule below.
+  - For one rule's state call hub_get_rule. Button Rules, Basic Rules and other classic apps (Room Lighting, Notifier, Button Controllers) are listed, with their disabled flag, by hub_list_apps (scope='instances'; nameFilter matches the app type too, so 'Button Rule' finds Button Rules), and Visual Rules by hub_get_visual_rule.
+- **hub_call_rule** — run, stop, start, pause or resume one or more rules (ruleId takes an id or an array): Rule Machine rules and Button Rules, and Visual Rules for pause, resume and (Visual Rule Builder 2.0 only) actions. Each rule is acted on in turn, with per-rule results and failedRuleIds/remainingRuleIds on a partial batch; see hub_call_rule below.
 - **hub_set_rule_private_boolean** — set the private boolean of one or more Rule Machine rules in one RMUtils dispatch (ruleId takes an id or an array; Boolean or lowercase "true"/"false" only); hub_get_rule reads it back as health.privateBoolean. It is the only rule tool that dispatches through RMUtils, so the hub's per-app load limiter can refuse it: a refusal changes nothing, and a reset of the app runtime statistics (hub_delete_logs(mode='appRuntimeStats', confirm=true), or the server's automatic reset) followed by a retry clears it.
-- Every id is checked before anything is dispatched: an id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), refuses the whole call, a batch included; a lookup that fails refuses it too, with success:false.
+- Every id is checked before anything is dispatched: an id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), refuses the whole call, a batch included; a lookup that fails refuses it too, with success:false. The refusal names the tools that list each kind of rule id.
 
 Native CRUD (also requires the Write master):
 - **hub_set_native_app** — create, update or drive the forms of every classic app other than Rule Machine rules (see set_native_app_reference). Rule Machine rules use hub_set_rule.
@@ -35915,33 +35971,32 @@ For BACKUP enumeration and restore, use the unified **hub_list_backups** (in hub
 
 `action` selects what to do (default `actions`):
 
-- **`actions`**: run the rule's actions directly, skipping condition evaluation. A Rule Machine rule's Run Actions button (`runAction`) is clicked; a Visual Rule runs through its builder's run endpoint, whose conditions still pick the branch. A Visual Rule the hub does not run comes back as success:false with the hub's own message.
+- **`actions`**: run the rule's actions directly, skipping condition evaluation. A Rule Machine rule's Run Actions button (`runAction`) is clicked; a Visual Rule Builder 2.0 rule runs through its builder's run endpoint, whose conditions still pick the branch, and a run the hub declines comes back as success:false with the hub's own message. A Visual Rule Builder 1.0 rule has no run button, so `actions` naming one refuses the whole call before anything runs; pause and resume work on it.
 - **`stop`**: halt the rule's in-progress actions (Rule Machine only).
 - **`start`**: restart a stopped rule (clears stopped and re-initializes it; the private boolean is unchanged; Rule Machine only).
 - **`pause`** / **`resume`**: pause or resume the rule; a paused rule does not fire on its triggers. A Rule Machine rule's Pause button (`pausRule`) is clicked; a Visual Rule is paused through its builder's pause endpoint.
 
-Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume the rule's page is rendered once, so hub_list_rules shows the new status at once. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: a toggle reads the rule's state and then clicks, so two overlapping calls on one rule can both click and undo each other; to act on several rules, name them all in one call's `ruleId` array. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean.
+Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume click the rule's page is rendered once, so hub_list_rules shows the new status at once, and the flag is read again: the hub accepts a click that changes nothing, so a flag still not in the target state returns success:false, and hub_get_rule shows where the rule ended up. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: a toggle reads the rule's state and then clicks, so two overlapping calls on one rule can both click and undo each other (the read after the click reports it as success:false); to act on several rules, name them all in one call's `ruleId` array. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean, which acts only on Rule Machine rules and Button Rules.
 
 ### hub_get_rule
 
-`hub_get_rule(ruleId, sections?, cursor?, limit?)` reads one rule. It returns `ruleId`, `health`, `localVariables` and, for a Rule Machine 5.1 rule or Button Rule, the document hub_set_rule(operation='read') returns: `actions`, `conditions`, `triggers`, `expressions` and `settings`, all by default, or the ones named in `sections`; `sections: []` returns the health and local variables alone. A long rule's whole document can exceed the response size cap, so read its health with `sections: []` and its rows one section at a time. Page one section with `cursor` ("" first, then each `nextCursor`) and `limit` (1-100, default 50), exactly as the hub_set_rule read does (see set_rule_reference). A Visual Rule or a classic app returns `health`, `localVariables: null` and a `note` naming the tool that reads it.
+`hub_get_rule(ruleId, sections?, cursor?, limit?)` reads one Rule Machine rule, Button Rule or Basic Rule. It returns `ruleId`, `health`, `localVariables` and, for a Rule Machine 5.1 rule or Button Rule, the document hub_set_rule(operation='read') returns: `actions`, `conditions`, `triggers`, `expressions` and `settings`, all by default, or the ones named in `sections`; `sections: []` returns the health and local variables alone. A long rule's whole document can exceed the response size cap, so read its health with `sections: []` and its rows one section at a time. Page one section with `cursor` ("" first, then each `nextCursor`) and `limit` (1-100, default 50), exactly as the hub_set_rule read does (see set_rule_reference). A Basic Rule returns `health`, `localVariables: null` and its `settings` (the same `[{name, type, multiple, value, deviceIds}]` rows; whole, so `cursor` and `limit` are refused; `settingsError` says why when they cannot be read). Any other app returns `health`, `localVariables: null` and a `note`: a Visual Rule's definition is read with hub_get_visual_rule, any other app's configuration and App Status with hub_get_app_config(includeStatus: true).
 
 - `localVariables`: `[{name, type, value}]`, the rule's own list, including a value the running rule just set. `type` is Rule Machine's token (integer, bigdecimal, string, boolean, datetime), the value a hub_set_rule variable change takes. A credential-named variable's value is hidden (`redacted:true`) while credential hiding is on. Hub globals are read with hub_list_variables.
 - If the local variables alone cannot be read, `localVariables` is null and `localVariablesError` says why; the health and the requested sections still return.
-- A read that fails returns `success:false` with `error` and `note`. The read renders the app's page as opening it in the hub UI does. For a Rule Machine rule that only re-shows its settings, so a retry is safe, except that a render drops an edit still open, and not yet compiled, in Rule Machine's own editor. Another app's page runs that app's own code (rendering a Swap Device instance swaps its devices again), and so does hub_get_app_config without summary=true; check such an app with hub_get_app_config(summary=true), which does not render it, and inspect its devices with hub_get_device before reading it again.
+- The read writes nothing and does not open the app's page, so it never runs the app's page code. A read that fails returns `success:false` with `error` and `note`; retrying it once is safe.
 
-`health` has the same shape here, in hub_set_rule's read and in its write responses' documents:
+`health` has the same shape here, in hub_set_rule's read and in the update pre-check:
 
 - `ruleFormat` says what was inspected: `rm` (any Rule Machine rule or Button Rule) / `vrb-graph` / `vrb-classic` / `basic-rule` / `button-controller` / `classic-app`.
-- Every app with a classic page has it rendered once first. Rule Machine updates its `broken` flag only then, so a rule whose trigger device was deleted reads broken here without opening the editor.
-- **Rule Machine**: `broken` (from /app/ruleBuilderJson), `brokenRows` (`[{kind: trigger|action|condition, text, position}]`, each row the page marks `**Broken Trigger|Action|Condition**`; `position` is the row's line in its page section, and `text` is null when the hub replaced the row's whole description with the marker), `disabledActions` and `disabledTriggers` (native ids of rows switched off; `[]` when none), `structuralIssues` (the IF/Repeat block and expression check hub_set_rule runs) and `privateBoolean`.
-- **Visual Rules Builder**: the engine's own verdict, a graph rule's `validationErrors` (broken when non-empty), and its pause state, with the rule's own name as `label`.
-- **Other apps** (Basic Rule, Button Controller, Room Lighting, user and community apps): label, red-X and page errors; `broken` is null.
-- `paused`, `stopped` and `privateBoolean` come from the app's state on its App Status page; when the state carries no flag, the page name's "(Paused)" or "(Stopped)" decoration is used. `label` has that decoration removed. `disabled` is the red-X flag.
+- **Rule Machine**: `broken` comes from the rule's own broken() check (a Rule Machine 5.1 rule or Button Rule; an older rule type reports its stored flag), so a rule whose trigger device was deleted reads broken without anyone opening it. `brokenRows` (`[{kind: trigger|action|condition, id, setting, text?}]`) lists each row whose device setting no longer names a device: `id` is the row's native id, the one hub_set_rule changes and operation:'form' use (trigger 2 is `tDev2`), `setting` the setting that lost its device, and `text` the trigger's or condition's stored description. A row that is broken for another reason (a deleted variable) is not listed, so `broken:true` with no rows means the broken row has no device setting, unless checkErrors says brokenRows was not listed (the rule's compiled state or settings went unread). `disabledActions` and `disabledTriggers` (native ids of rows switched off; `[]` when none), `structuralIssues` (the IF/Repeat block and expression check hub_set_rule runs) and `privateBoolean`.
+- **Visual Rules Builder**: the engine's own verdict, a graph rule's `validationErrors` (broken when non-empty), and its pause state from its builder, with the rule's own name as `label`.
+- **Other apps** (Basic Rule, Button Controller, Room Lighting, user and community apps): label, red-X flag and the state flags below; `broken` is null.
+- `paused`, `stopped` and `privateBoolean` come from the app's state on its App Status page. A Rule Machine rule with no `paused` or `stopped` entry reads `false`, and so does a Basic Rule with no `paused` entry; for an app whose state has no flag, or when the status page cannot be read, the name's "(Paused)" or "(Stopped)" decoration is used. `privateBoolean` has no such fallback. An entry stored as neither true nor false reads null with a `checkErrors` entry. `label` has the decoration removed. `disabled` is the red-X flag.
 - `eventSubscriptionCount` and `scheduledJobCount` count the app's live subscriptions and scheduled jobs from the same read; the lists themselves come from hub_get_app_config(includeStatus=true).
 - A value the hub does not return reads null.
 
-`ok:true` means everything was read and nothing is wrong. `ok:false` with `unreadable:false` means `issues` names a problem or `checkErrors` names a read that failed, leaving part of the rule unchecked; `unreadable:true` means nothing could be read, which is not evidence of breakage. A `checkErrors` entry is not evidence about the rule either. For a Rule Machine rule, repeat the call to finish the check (the render drops an edit still open in Rule Machine's own editor); for another app, whose page runs its own code, check it with hub_get_app_config(summary=true) instead of repeating the read. A structural issue is expected while a block is built across several calls; finish it with a hub_set_rule(operation='update') terminator change, and compare with hub_get_rule(sections=['actions']) before considering a restore. hub_set_rule(operation='update') refuses a rule that is already broken before writing anything.
+`ok:true` means everything was read and nothing is wrong. `ok:false` with `unreadable:false` means `issues` names a problem or `checkErrors` names a read that failed, leaving part of the rule unchecked; `unreadable:true` means nothing could be read, which is not evidence of breakage. A `checkErrors` entry is not evidence about the rule either. A Rule Machine rule whose `broken` could not be read always has a `checkErrors` entry, so `broken:null` never reads `ok:true`; hub_set_rule(operation='update') refuses a rule with `broken:null`, or whose compiled state went unread (`disabledActions:null`), before any backup or write. A structural issue is expected while a block is built across several calls; finish it with a hub_set_rule(operation='update') terminator change, and compare with hub_get_rule(sections=['actions']) before considering a restore. hub_set_rule(operation='update') refuses a rule that is already broken before any backup or write, naming each broken row by kind and native id.
 
 ### hub_delete_native_app
 
