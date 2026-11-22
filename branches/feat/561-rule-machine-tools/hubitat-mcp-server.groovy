@@ -22279,7 +22279,7 @@ def _getAllToolDefinitions_partNativeRM() {
     return [
         [
             name: "hub_list_rules",
-            description: "List the Rule Machine 5.x rules, with each rule's id, label, and live `status` (`active`/`paused`/`stopped`/`disabled`).[[FLAT_TRIM]] Requires the Read master.[[/FLAT_TRIM]][[FLAT_TRIM]] `status` is `unknown` when the hub's app list is momentarily unreadable. Status reflects Rule Machine's name decoration (refreshed after an MCP stop, start, pause or resume); a decorated rule's paused/stopped come from its own state, and a row marked statusSource:'name' fell back to the decoration because that state could not be read. A stop made outside MCP may show only after the rule's page is next opened. For ONE rule's state, call hub_get_rule(ruleId) instead of listing every rule — its health returns that rule's paused/disabled/stopped/broken directly. Button Rules, Basic Rules and other classic apps (Room Lighting, Notifier, Button Controllers) are not listed here: `hub_list_apps` (scope='instances') lists them with their enabled/disabled state (nameFilter:'Button Rule' finds Button Rules), and hub_get_visual_rule lists Visual Rules. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the status-detection semantics and platform limitations on RM rule internals.[[/FLAT_TRIM]]",
+            description: "List the Rule Machine 5.x rules, with each rule's id, label, and live `status` (`active`/`paused`/`stopped`/`disabled`).[[FLAT_TRIM]] Requires the Read master.[[/FLAT_TRIM]][[FLAT_TRIM]] `status` is `unknown` when the hub's app list is momentarily unreadable. Status reflects Rule Machine's name decoration (refreshed after an MCP stop, start, pause or resume); a decorated rule's paused/stopped come from its own state, and a row marked statusSource:'name' fell back to the decoration for one flag or both because that state could not be fully read. A stop made outside MCP may show only after the rule's page is next opened, which hub_get_app_config(appId) does. For ONE rule's state, call hub_get_rule(ruleId) instead of listing every rule — its health returns that rule's paused/disabled/stopped/broken directly. Button Rules, Basic Rules and other classic apps (Room Lighting, Notifier, Button Controllers) are not listed here: `hub_list_apps` (scope='instances') lists them with their enabled/disabled state (nameFilter:'Button Rule' finds Button Rules), and hub_get_visual_rule lists Visual Rules. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the status-detection semantics and platform limitations on RM rule internals.[[/FLAT_TRIM]]",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -22319,7 +22319,7 @@ def _getAllToolDefinitions_partNativeRM() {
         ],
         [
             name: "hub_get_rule",
-            description: """Read one Rule Machine rule, Button Rule or Basic Rule: its health and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; for a Basic Rule, its settings. Any other installed app returns its health alone.[[FLAT_TRIM]] Nothing is written and the rule's page is not opened: broken comes from the rule's own check, and is also true when a row's device is gone. health carries broken, brokenRows (each row whose device is gone, by kind and native id), paused, stopped, privateBoolean, disabledActions, disabledTriggers, structuralIssues, the red-X disabled flag and the live eventSubscriptionCount and scheduledJobCount; the raw subscription and job lists come from hub_get_app_config(includeStatus: true).[[/FLAT_TRIM]] health.ok=false with unreadable=false means issues names a problem or checkErrors names a failed read; unreadable=true means nothing could be read, which is not evidence of breakage. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the full health reference.""",
+            description: """Read one Rule Machine rule, Button Rule or Basic Rule: its health and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; for a Basic Rule, its settings. Any other installed app returns its health alone.[[FLAT_TRIM]] The rule's page is not opened and its configuration is not changed: broken comes from the rule's own check, which can refresh the rule's stored broken flag, and is also true when a row's device is gone. health carries broken, brokenRows (each row whose device is gone, by kind and native id), paused, stopped, privateBoolean, disabledActions, disabledTriggers, structuralIssues, the red-X disabled flag and the live eventSubscriptionCount and scheduledJobCount; the raw subscription and job lists come from hub_get_app_config(includeStatus: true).[[/FLAT_TRIM]] health.ok=false with unreadable=false means issues names a problem or checkErrors names a failed read; unreadable=true means nothing could be read, which is not evidence of breakage. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the full health reference.""",
             inputSchema: [
                 type: "object",
                 properties: [
@@ -22481,7 +22481,7 @@ def toolListRmRules(args) {
         result.statusNote = "/hub2/appsList was unreadable, so each rule's status is \"unknown\" (enabled/paused/stopped/disabled could not be determined). Retry; if it persists the hub's internal API may need Hub Security credentials."
     }
     if (nameOnly) {
-        result.statusSourceNote = "The state of rule(s) ${nameOnly.join(', ')} could not be read, so their paused/stopped status comes from the name decoration alone (statusSource:'name'), which shows one of them at a time and can lag a stop made elsewhere. hub_get_rule reads one rule's state.".toString()
+        result.statusSourceNote = "The state of rule(s) ${nameOnly.join(', ')} could not be fully read, so their paused flag, stopped flag or both come from the name decoration (statusSource:'name'), which shows one of them at a time and can lag a stop made elsewhere. hub_get_rule reads one rule's state.".toString()
     }
     def classMissing = { String msg ->
         if (!msg) return false
@@ -22780,7 +22780,8 @@ private Map _rmToggleButton(Integer ruleId, String action, String flag, String b
     def out = [success: true, ruleId: ruleId, rmAction: clicked]
     String renderError = null
     try {
-        _rmFetchConfigJson(ruleId)
+        def pageError = _rmFetchConfigJson(ruleId)?.configPage?.error
+        if (pageError) renderError = "the page reported: ${pageError}".toString()
     } catch (Exception e) {
         renderError = e.message ?: e.toString()
     }
@@ -22791,7 +22792,7 @@ private Map _rmToggleButton(Integer ruleId, String action, String flag, String b
         return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: the ${button} click was accepted, but the rule's ${flag} state then read ${seen}, not ${target}".toString(),
                 note: "Another change to the rule may have run at the same time. Read it with hub_get_rule, then send the action again if it is still needed: a rule already in the target state is left alone. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
     }
-    if (renderError != null) out.note = "The rule's ${flag} state changed, but re-rendering its page failed (${renderError}), so hub_list_rules may show the old status until the rule's page is next opened. hub_get_rule reads the rule's own state.".toString()
+    if (renderError != null) out.note = "The rule's ${flag} state changed, but re-rendering its page failed (${renderError}), so hub_list_rules may show the old status until the rule's page next renders without an error; hub_get_app_config(appId: ${ruleId}) opens it. hub_get_rule reads the rule's own state.".toString()
     return out
 }
 private Map _vrbTogglePaused(Integer ruleId, String action) {
@@ -24221,8 +24222,13 @@ def toolGetNativeRule(args) {
     try { target = getAppByAppId(id) }
     catch (Exception lookup) {
         mcpLogError("rm-native", "hub_get_rule lookup failed for app ${id}", lookup)
-        return [success: false, ruleId: id, error: "Rule ${id} could not be read: ${lookup.message ?: lookup.toString()}".toString(),
-                note: "The read writes nothing and does not open the rule's page, so retrying once is safe. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
+        String why = lookup.message ?: lookup.toString()
+        String retry = "The read does not open the rule's page or change its configuration, so retrying once is safe. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules')."
+        Map health = _rmCheckRuleHealth(id as Integer)
+        if (health.unreadable == true) return [success: false, ruleId: id, error: "Rule ${id} could not be read: ${why}".toString(), note: retry]
+        String unread = "Rule ${id} could not be identified (${why}), so its document and local variables were not read; its health was read without it.".toString()
+        if (read.sections) return [success: false, ruleId: id, error: unread, health: health, localVariables: null, note: retry]
+        return [ruleId: id, health: health, localVariables: null, documentError: unread, note: retry]
     }
     if (target == null) throw new IllegalArgumentException(_rmMissingAppText(id))
     String typeName = target.appType?.name?.toString()
@@ -25860,7 +25866,7 @@ Map toolGetRuleDocument(Map args) {
     } catch (Exception failure) {
         mcpLogError('rm-native', "${toolName} read failed for rule ${id}: ${failure.message}".toString(), failure)
         [success: false, ruleId: id, error: "Rule ${id} could not be read: ${failure.message ?: failure.toString()}".toString(),
-         note: "The read writes nothing and does not open the rule's page, so retrying once is safe. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
+         note: "The read does not open the rule's page or change its configuration, so retrying once is safe. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
     }
 }
 private List _ndChanges(Object changes, boolean allowEmpty = false) {
@@ -36040,7 +36046,7 @@ Rule runtime control surface (hub_list_rules = Read master; hub_call_rule and th
 - **hub_list_rules** — lists Rule Machine 5.x rules, each with a live **status** ("active" | "paused" | "stopped" | "disabled" | "unknown"), the **disabled** and **paused** booleans (omitted when unknown) and, only when detected, **requiredExpressionFalse: true**.
   - **disabled** is the app's red-X flag from /hub2/appsList.
   - **paused** and **stopped** come from Rule Machine's name decoration. The appsList name and the RMUtils label are compared with markup stripped and entities decoded; the text the appsList name adds — "(Paused)", "(Stopped)", "(Required Expression false)" — sets the flag. A rule literally NAMED "... (Paused)" or "... (Stopped)" carries the suffix in both strings and is not flagged. A stopped rule's label and name come back without the decoration, in the encoding they already use.
-  - The name shows one decoration at a time ("(Stopped)" hides "(Paused)"), so a decorated row also reads that rule's own paused/stopped state; undecorated rows make no extra read. If that read fails, the name decides and the row carries **statusSource: "name"**, with **statusSourceNote** listing those ids. Rule Machine refreshes the decoration when the rule's page renders: hub_call_rule(action="stop"/"start"/"pause"/"resume") renders it, so the list is current after an MCP stop, start, pause or resume (unless that render failed, which the call's note reports; hub_get_rule then reads the flag), while a stop made elsewhere shows once the rule's page is next opened.
+  - The name shows one decoration at a time ("(Stopped)" hides "(Paused)"), so a decorated row also reads that rule's own paused/stopped state; undecorated rows make no extra read. If that read fails, or one flag is stored as neither true nor false, the name decides that flag (or both) and the row carries **statusSource: "name"**, with **statusSourceNote** listing those ids. Rule Machine refreshes the decoration when the rule's page renders: hub_call_rule(action="stop"/"start"/"pause"/"resume") renders it, so the list is current after an MCP stop, start, pause or resume (unless that render failed, which the call's note reports; hub_get_rule then reads the flag), while a stop made elsewhere shows once the rule's page is next opened (hub_get_app_config(appId: <ruleId>) opens it).
   - **status** precedence is disabled > stopped > paused > active; the booleans stay independent (a paused rule disabled later reads disabled:true, paused:true, status:"disabled").
   - **unknown**: when /hub2/appsList cannot be read, every rule is unknown, the list is unfiltered (deleted rules may linger) and the result carries **statusNote**; when one rule's entry lacks data, only that rule is unknown.
   - For one rule's state call hub_get_rule. Button Rules, Basic Rules and other classic apps (Room Lighting, Notifier, Button Controllers) are listed, with their disabled flag, by hub_list_apps (scope='instances'; nameFilter matches the app type too, so 'Button Rule' finds Button Rules), and Visual Rules by hub_get_visual_rule.
@@ -36094,7 +36100,7 @@ For BACKUP enumeration and restore, use the unified **hub_list_backups** (in hub
 - **`start`**: restart a stopped rule (clears stopped and re-initializes it; the private boolean is unchanged; Rule Machine only).
 - **`pause`** / **`resume`**: pause or resume the rule; a paused rule does not fire on its triggers. A Rule Machine rule's Pause button (`pausRule`) is clicked; a Visual Rule is paused through its builder's pause endpoint, and its paused state is read again afterwards, so an endpoint success that left it unchanged returns success:false.
 
-Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume click the rule's page is rendered once, so hub_list_rules shows the new status at once (when that render fails, the result's note says so and hub_list_rules may show the old status until the rule's page is next opened; repeating the call does not refresh it, since the rule is already in the target state, so check the flag with hub_get_rule), and the flag is read again: the hub accepts a click that changes nothing, so a flag still not in the target state returns success:false, and hub_get_rule shows where the rule ended up. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: a toggle reads the rule's state and then clicks, so two overlapping calls on one rule can both click and undo each other (the read after the click reports it as success:false); to act on several rules, name them all in one call's `ruleId` array. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean, which acts only on Rule Machine rules and Button Rules.
+Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume click the rule's page is rendered once, so hub_list_rules shows the new status at once (when that render fails, the result's note says so and hub_list_rules may show the old status until the rule's page is next opened; repeating the call does not refresh it, since the rule is already in the target state; check the flag with hub_get_rule, and open the page with hub_get_app_config(appId: <ruleId>) to refresh the list), and the flag is read again: the hub accepts a click that changes nothing, so a flag still not in the target state returns success:false, and hub_get_rule shows where the rule ended up. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: a toggle reads the rule's state and then clicks, so two overlapping calls on one rule can both click and undo each other (the read after the click reports it as success:false); to act on several rules, name them all in one call's `ruleId` array. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean, which acts only on Rule Machine rules and Button Rules.
 
 ### hub_get_rule
 
@@ -36102,7 +36108,8 @@ Every action on a Rule Machine rule drives the rule's own page buttons (`runActi
 
 - `localVariables`: `[{name, type, value}]`, the rule's own list, including a value the running rule just set. `type` is Rule Machine's token (integer, bigdecimal, string, boolean, datetime), the value a hub_set_rule variable change takes. A credential-named variable's value is hidden (`redacted:true`) while credential hiding is on. Hub globals are read with hub_list_variables.
 - If the local variables alone cannot be read, `localVariables` is null and `localVariablesError` says why; the health and the requested sections still return.
-- The read writes nothing and does not open the app's page, so it never runs the app's page code. A read that fails returns `success:false` with `error` and `note`; retrying it once is safe.
+- If the rule cannot be identified but its health can still be read, that health returns with `localVariables: null` and no document sections: as `success:false` with the reason in `error` when sections were requested, and with the reason in `documentError` for `sections: []`.
+- The read does not open the app's page or change its configuration, so it never runs the app's page code; a Rule Machine 5.1 rule's or Button Rule's own broken() check can refresh its stored broken flag. A read that fails returns `success:false` with `error` and `note`; retrying it once is safe.
 
 `health` has the same shape here, in hub_set_rule's read and in the update pre-check:
 
