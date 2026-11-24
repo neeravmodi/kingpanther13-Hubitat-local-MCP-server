@@ -23,7 +23,12 @@
 @groovy.transform.Field static final Set LIVE_WRITE_EXECUTIONS = new java.util.HashSet()
 @groovy.transform.Field Map REQUEST_SETTINGS = null
 private Map _requestSettingsSnapshot() {
-    [backupBeforeRuleEdits: settings?.backupBeforeRuleEdits?.toString(), backupEveryRuleWrite: settings?.backupEveryRuleWrite?.toString()]
+    [backupBeforeRuleEdits: settings?.backupBeforeRuleEdits?.toString(), backupEveryRuleWrite: settings?.backupEveryRuleWrite?.toString(),
+     requestSource: _requestSource()]
+}
+private String _requestSource() {
+    try { return request?.requestSource?.toString() ?: null }
+    catch (Exception e) { return null }
 }
 private void _keepRequestSettings(Map snap) { REQUEST_SETTINGS = snap ?: null }
 private String _requestSetting(String key) { (REQUEST_SETTINGS ?: [:]).get(key)?.toString() }
@@ -16811,238 +16816,272 @@ private String _appConfigNote(String step) {
     return "${step}; see hub_get_tool_guide(section='builtin_app_tools_apps').".toString()
 }
 def toolGetAppConfig(args) {
-    if (args?.appId == null || args.appId.toString().trim() == "") {
-        throw new IllegalArgumentException("appId is required")
-    }
-    def appIdStr = args.appId.toString().trim()
-    if (!appIdStr.isInteger()) {
-        throw new IllegalArgumentException("appId must be numeric: ${appIdStr}")
-    }
-    def pageName = args?.pageName?.toString()?.trim()
-    if (pageName && !pageName.matches(/[A-Za-z0-9_]+/)) {
-        throw new IllegalArgumentException("pageName must be alphanumeric/underscore only: ${pageName}")
-    }
-    boolean includeSettings = args?.includeSettings == true
-    boolean includeStatus = args?.includeStatus == true
-    if (args?.summary == true) {
-        def summaryPath = "/installedapp/json/${appIdStr}"
-        mcpLog("info", "hub-admin", "hub_get_app_config appId=${appIdStr} summary mode")
-        def summaryText
+    return { wrapped ->
+        if (args?.appId == null || args.appId.toString().trim() == "") {
+            throw new IllegalArgumentException("appId is required")
+        }
+        def appIdStr = args.appId.toString().trim()
+        if (!appIdStr.isInteger()) {
+            throw new IllegalArgumentException("appId must be numeric: ${appIdStr}")
+        }
+        def pageName = args?.pageName?.toString()?.trim()
+        if (pageName && !pageName.matches(/[A-Za-z0-9_]+/)) {
+            throw new IllegalArgumentException("pageName must be alphanumeric/underscore only: ${pageName}")
+        }
+        boolean includeSettings = args?.includeSettings == true
+        boolean includeStatus = args?.includeStatus == true
+        if (args?.summary == true) {
+            def summaryPath = "/installedapp/json/${appIdStr}"
+            mcpLog("info", "hub-admin", "hub_get_app_config appId=${appIdStr} summary mode")
+            def summaryText
+            try {
+                summaryText = hubInternalGet(summaryPath, null, 30)
+            } catch (Exception e) {
+                Map gone = _appConfigNotFound(e, summaryPath, appIdStr)
+                if (gone) return gone
+                mcpLogError("hub-admin", "hub_get_app_config summary fetch failed", e)
+                return [success: false, error: "Failed to fetch app summary [${e.class.simpleName}]: ${e.message}", note: _appConfigNote('Retry once; if it fails again, check that the hub answers with hub_get_info'), appId: appIdStr as Integer]
+            }
+            if (!summaryText) {
+                return [success: false, error: "Empty response from ${summaryPath}.", note: _appConfigNote('Retry once; if it fails again, read the app without summary=true'), appId: appIdStr as Integer]
+            }
+            def summaryParsed
+            try {
+                summaryParsed = new groovy.json.JsonSlurper().parseText(summaryText)
+            } catch (Exception e) {
+                mcpLogError("hub-admin", "hub_get_app_config summary JSON parse failed", e)
+                return [success: false, error: "Failed to parse app summary JSON: ${e.message}", note: _appConfigNote('Retry once; if it fails again, read the app without summary=true'), appId: appIdStr as Integer]
+            }
+            if (!(summaryParsed instanceof Map)) {
+                return [success: false, error: "Unexpected response shape: the app summary is not a JSON object.", note: _appConfigNote('Retry once; if it fails again, read the app without summary=true'), appId: appIdStr as Integer, fingerprint: "top-level not a Map"]
+            }
+            def summaryResult = [:]
+            summaryResult.putAll(summaryParsed)
+            try { summaryResult.namespace = getAppByAppId(appIdStr as Long)?.appType?.namespace?.toString() }
+            catch (Exception lookup) { mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: type namespace unreadable: ${lookup.message}") }
+            summaryResult.success = true
+            summaryResult.endpoint = summaryPath
+            if (includeStatus) _appConfigAttachStatus(summaryResult, appIdStr as Integer)
+            return summaryResult
+        }
+        def path = "/installedapp/configure/json/${appIdStr}"
+        if (pageName) path += "/${pageName}"
+        mcpLog("info", "hub-admin", "hub_get_app_config appId=${appIdStr} page=${pageName ?: 'main'} includeSettings=${includeSettings}")
+        def responseText
         try {
-            summaryText = hubInternalGet(summaryPath, null, 30)
+            responseText = hubInternalGet(path, null, 30)
         } catch (Exception e) {
-            Map gone = _appConfigNotFound(e, summaryPath, appIdStr)
+            Map gone = _appConfigNotFound(e, path, appIdStr)
             if (gone) return gone
-            mcpLogError("hub-admin", "hub_get_app_config summary fetch failed", e)
-            return [success: false, error: "Failed to fetch app summary [${e.class.simpleName}]: ${e.message}", note: _appConfigNote('Retry once; if it fails again, check that the hub answers with hub_get_info'), appId: appIdStr as Integer]
+            mcpLogError("hub-admin", "hub_get_app_config fetch failed", e)
+            return [success: false, error: "Failed to fetch app config [${e.class.simpleName}]: ${e.message}", note: _appConfigNote('Retry once; if it fails again, check that the hub answers with hub_get_info'), appId: appIdStr as Integer]
         }
-        if (!summaryText) {
-            return [success: false, error: "Empty response from ${summaryPath}.", note: _appConfigNote('Retry once; if it fails again, read the app without summary=true'), appId: appIdStr as Integer]
+        if (!responseText) {
+            return [success: false, error: "Empty response from ${path}.", note: _appConfigNote('Retry once; if it fails again, check that the app still exists with hub_get_app_config(summary=true)'), appId: appIdStr as Integer]
         }
-        def summaryParsed
+        def parsed
         try {
-            summaryParsed = new groovy.json.JsonSlurper().parseText(summaryText)
+            parsed = new groovy.json.JsonSlurper().parseText(responseText)
         } catch (Exception e) {
-            mcpLogError("hub-admin", "hub_get_app_config summary JSON parse failed", e)
-            return [success: false, error: "Failed to parse app summary JSON: ${e.message}", note: _appConfigNote('Retry once; if it fails again, read the app without summary=true'), appId: appIdStr as Integer]
+            mcpLogError("hub-admin", "hub_get_app_config JSON parse failed", e)
+            return [success: false, error: "Failed to parse app config JSON: ${e.message}", note: _appConfigNote('Retry once; if it fails again, check that the app still exists with hub_get_app_config(summary=true)'), appId: appIdStr as Integer]
         }
-        if (!(summaryParsed instanceof Map)) {
-            return [success: false, error: "Unexpected response shape: the app summary is not a JSON object.", note: _appConfigNote('Retry once; if it fails again, read the app without summary=true'), appId: appIdStr as Integer, fingerprint: "top-level not a Map"]
+        if (!(parsed instanceof Map)) {
+            return [success: false, error: "Unexpected response shape: the page is not a JSON object.", note: _appConfigNote('Retry once; if it fails again, check that the app still exists with hub_get_app_config(summary=true)'), appId: appIdStr as Integer, fingerprint: "top-level not a Map"]
         }
-        def summaryResult = [:]
-        summaryResult.putAll(summaryParsed)
-        try { summaryResult.namespace = getAppByAppId(appIdStr as Long)?.appType?.namespace?.toString() }
-        catch (Exception lookup) { mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: type namespace unreadable: ${lookup.message}") }
-        summaryResult.success = true
-        summaryResult.endpoint = summaryPath
-        if (includeStatus) _appConfigAttachStatus(summaryResult, appIdStr as Integer)
-        return summaryResult
-    }
-    def path = "/installedapp/configure/json/${appIdStr}"
-    if (pageName) path += "/${pageName}"
-    mcpLog("info", "hub-admin", "hub_get_app_config appId=${appIdStr} page=${pageName ?: 'main'} includeSettings=${includeSettings}")
-    def responseText
-    try {
-        responseText = hubInternalGet(path, null, 30)
-    } catch (Exception e) {
-        Map gone = _appConfigNotFound(e, path, appIdStr)
-        if (gone) return gone
-        mcpLogError("hub-admin", "hub_get_app_config fetch failed", e)
-        return [success: false, error: "Failed to fetch app config [${e.class.simpleName}]: ${e.message}", note: _appConfigNote('Retry once; if it fails again, check that the hub answers with hub_get_info'), appId: appIdStr as Integer]
-    }
-    if (!responseText) {
-        return [success: false, error: "Empty response from ${path}.", note: _appConfigNote('Retry once; if it fails again, check that the app still exists with hub_get_app_config(summary=true)'), appId: appIdStr as Integer]
-    }
-    def parsed
-    try {
-        parsed = new groovy.json.JsonSlurper().parseText(responseText)
-    } catch (Exception e) {
-        mcpLogError("hub-admin", "hub_get_app_config JSON parse failed", e)
-        return [success: false, error: "Failed to parse app config JSON: ${e.message}", note: _appConfigNote('Retry once; if it fails again, check that the app still exists with hub_get_app_config(summary=true)'), appId: appIdStr as Integer]
-    }
-    if (!(parsed instanceof Map)) {
-        return [success: false, error: "Unexpected response shape: the page is not a JSON object.", note: _appConfigNote('Retry once; if it fails again, check that the app still exists with hub_get_app_config(summary=true)'), appId: appIdStr as Integer, fingerprint: "top-level not a Map"]
-    }
-    if (!(parsed.app instanceof Map)) {
-        return [success: false, error: "Unexpected response shape: the page names no app.", note: _appConfigNote("Check the id with hub_list_apps(scope='instances')"), appId: appIdStr as Integer, fingerprint: "missing app"]
-    }
-    if (!(parsed.configPage instanceof Map)) {
-        return [success: false, error: "Unexpected response shape: the page has no configPage.", note: _appConfigNote('Retry once; if it fails again, check that the app still exists with hub_get_app_config(summary=true)'), appId: appIdStr as Integer, fingerprint: "missing configPage"]
-    }
-    if (!(parsed.configPage.sections instanceof List)) {
-        return [success: false, error: "This page has no sections to read.", note: _appConfigNote("Read the app's default page (omit pageName) and read another page from its page.hrefs"), appId: appIdStr as Integer, fingerprint: "sections not a list"] +
-            (parsed.configPage.error ? [configPageError: parsed.configPage.error] : [:])
-    }
-    def appTypeRaw = parsed.app.appType
-    def appObj = [
-        id: parsed.app.id,
-        label: stripAppConfigHtml(parsed.app.trueLabel ?: parsed.app.label),
-        name: parsed.app.name,
-        appType: appTypeRaw instanceof Map ? [namespace: appTypeRaw.namespace, name: appTypeRaw.name, system: appTypeRaw.system == true, menu: appTypeRaw.menu] : null,
-        disabled: parsed.app.disabled == true,
-        parentAppId: parsed.app.parentAppId,
-        installed: parsed.app.installed == true
-    ]
-    def appTypeNamespace = appTypeRaw instanceof Map ? appTypeRaw.namespace : null
-    List typeNames = [appTypeRaw instanceof Map ? appTypeRaw.name : null, parsed.app.name]
-    boolean isRmRule = typeNames.any { _rmIsRuleAppType(appTypeNamespace, it) }
-    boolean rmHasDisabled = isRmRule
-    if (isRmRule && typeNames.any { _rmIsEditableRuleType(appTypeNamespace, it) }) {
+        if (!(parsed.app instanceof Map)) {
+            return [success: false, error: "Unexpected response shape: the page names no app.", note: _appConfigNote("Check the id with hub_list_apps(scope='instances')"), appId: appIdStr as Integer, fingerprint: "missing app"]
+        }
+        if (!(parsed.configPage instanceof Map)) {
+            return [success: false, error: "Unexpected response shape: the page has no configPage.", note: _appConfigNote('Retry once; if it fails again, check that the app still exists with hub_get_app_config(summary=true)'), appId: appIdStr as Integer, fingerprint: "missing configPage"]
+        }
+        if (!(parsed.configPage.sections instanceof List)) {
+            return [success: false, error: "This page has no sections to read.", note: _appConfigNote("Read the app's default page (omit pageName) and read another page from its page.hrefs"), appId: appIdStr as Integer, fingerprint: "sections not a list"] +
+                (parsed.configPage.error ? [configPageError: parsed.configPage.error] : [:])
+        }
+        def appTypeRaw = parsed.app.appType
+        def appObj = [
+            id: parsed.app.id,
+            label: stripAppConfigHtml(parsed.app.trueLabel ?: parsed.app.label),
+            name: parsed.app.name,
+            appType: appTypeRaw instanceof Map ? [namespace: appTypeRaw.namespace, name: appTypeRaw.name, system: appTypeRaw.system == true, menu: appTypeRaw.menu] : null,
+            disabled: parsed.app.disabled == true,
+            parentAppId: parsed.app.parentAppId,
+            installed: parsed.app.installed == true
+        ]
+        def appTypeNamespace = appTypeRaw instanceof Map ? appTypeRaw.namespace : null
+        List typeNames = [appTypeRaw instanceof Map ? appTypeRaw.name : null, parsed.app.name]
+        boolean isRmRule = typeNames.any { _rmIsRuleAppType(appTypeNamespace, it) }
+        boolean rmHasDisabled = isRmRule
+        if (isRmRule && typeNames.any { _rmIsEditableRuleType(appTypeNamespace, it) }) {
+            try {
+                Map rmState = _nrState(appIdStr as Long)
+                rmHasDisabled = [rmState.disabledActions, rmState.disabledTriggers].any { it instanceof Collection && !it.isEmpty() }
+            } catch (Exception unreadable) {
+                mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: rule state unreadable (${unreadable.class.simpleName}: ${unreadable.message}); disabled rows read from the page")
+            }
+        }
+        Map formFields = null
+        Map form = null
+        String formError = null
         try {
-            Map rmState = _nrState(appIdStr as Long)
-            rmHasDisabled = [rmState.disabledActions, rmState.disabledTriggers].any { it instanceof Collection && !it.isEmpty() }
-        } catch (Exception unreadable) {
-            mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: rule state unreadable (${unreadable.class.simpleName}: ${unreadable.message}); disabled rows read from the page")
+            form = _nfPublic(_nfContext(appIdStr as Long, parsed as Map), [])
+            formFields = form.get('fields').collectEntries { [(it.name): it] }
+        } catch (IllegalStateException unmodelled) {
+            mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: page form unreadable: ${unmodelled.message}")
+            formError = unmodelled.message
+        } catch (Exception unexpected) {
+            mcpLogError("hub-admin", "hub_get_app_config app ${appIdStr}: page form read failed", unexpected)
+            formError = "${unexpected.class.simpleName}: ${unexpected.message}".toString()
         }
-    }
-    Map formFields = null
-    Map form = null
-    String formError = null
-    try {
-        form = _nfPublic(_nfContext(appIdStr as Long, parsed as Map), [])
-        formFields = form.get('fields').collectEntries { [(it.name): it] }
-    } catch (IllegalStateException unmodelled) {
-        mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: page form unreadable: ${unmodelled.message}")
-        formError = unmodelled.message
-    } catch (Exception unexpected) {
-        mcpLogError("hub-admin", "hub_get_app_config app ${appIdStr}: page form read failed", unexpected)
-        formError = "${unexpected.class.simpleName}: ${unexpected.message}".toString()
-    }
-    def passwordInputNames = [] as Set
-    def sections = []
-    def pageHrefs = []
-    for (s in parsed.configPage.sections) {
-        if (!(s instanceof Map)) continue
-        def section = [title: stripAppConfigHtml(s.title), inputs: []]
-        def paragraphs = []
-        def components = []
-        List elements = (s.body instanceof List ? s.body : []) + (s.input instanceof List ? s.input.findAll { it instanceof Map && (it.element ?: 'input') == 'input' } : [])
-        Set seen = [] as Set
-        for (b in elements) {
-            if (!(b instanceof Map)) continue
-            String element = b.element?.toString() ?: 'input'
-            if (element == 'input' && b.name && b.type != 'button') {
-                if (!seen.add(b.name.toString())) continue
-                if (b.type == 'password') passwordInputNames << b.name.toString()
-                section.inputs << _appConfigInput(b, formFields?.get(b.name.toString()), parsed.settings)
-            } else if (element in ['label', 'mode']) {
-                Map appField = formFields?.get(element == 'mode' ? 'mode[mode]' : 'label')
-                if (appField) section.inputs << appField
-            } else if (element == 'component' && b.name) {
-                components << [name: b.name, title: stripAppConfigHtml(b.title), description: stripAppConfigHtml(b.description)].findAll { k, v -> v }
-            } else if (element == 'href' && (b.page || b.url)) {
-                Map link = b.url ? [url: b.url.toString()] : [page: b.page.toString()]
-                link.title = _uiPlainTitle(b.title)
-                def description = _appConfigShownText(b.description)
-                if (description) link.description = description
-                List disabled = rmHasDisabled ? _appConfigDisabledRows(b.description) : []
-                if (disabled) link.disabled = disabled
-                pageHrefs << link
-            } else if (element == 'paragraph') {
-                def rawHtml = (b.description ?: b.title)?.toString()
-                def text = _appConfigShownText(rawHtml)
-                if (!text) continue
-                List disabled = rmHasDisabled ? _appConfigDisabledRows(rawHtml) : []
-                paragraphs << (disabled ? [text: text, disabled: disabled] : text)
-            }
-        }
-        if (paragraphs) section.paragraphs = paragraphs
-        if (components) section.components = components
-        sections << section
-    }
-    def children = (parsed.childApps instanceof List ? parsed.childApps : []).findAll { it instanceof Map }.collect { c ->
-        [id: c.id, label: stripAppConfigHtml(c.label ?: c.name), name: c.name]
-    }
-    def childDevices = (parsed.childDevices instanceof List ? parsed.childDevices : []).findAll { it instanceof Map }.collect { d ->
-        [id: d.id, name: stripAppConfigHtml(d.label ?: d.name)]
-    }
-    Map modeNames = parsed.modeMap instanceof Map ? parsed.modeMap : [:]
-    appObj.restrictedModes = _nfAppValue(parsed as Map, true).collect { id -> [value: id, label: modeNames.get(id)?.toString()] }
-    def result = [
-        success: true,
-        app: appObj,
-        page: [
-            name: parsed.configPage.name,
-            title: stripAppConfigHtml(parsed.configPage.title),
-            install: parsed.configPage.install == true,
-            refreshInterval: parsed.configPage.refreshInterval,
-            sections: sections
-        ],
-        childApps: children,
-        childDevices: childDevices,
-        endpoint: path
-    ]
-    if (parsed.configPage.error) result.configPageError = parsed.configPage.error
-    if (pageHrefs) result.page.hrefs = pageHrefs
-    if (pageName && parsed.configPage.name != null && parsed.configPage.name.toString() != pageName) {
-        String formTool = isRmRule ? "hub_set_rule" : "hub_set_native_app"
-        result.pageNote = "The hub rendered '${parsed.configPage.name}' instead of '${pageName}'; this app reaches that page only through its own link: open it with ${formTool}(operation:'form') and activate the href.".toString()
-    }
-    if (form != null) {
-        result.controls = form.get('controls')
-        if (form.get('unsupported')) result.unsupported = form.get('unsupported')
-    } else {
-        result.formError = formError
-        result.note = _appConfigNote("Input values and controls are withheld: ${formError}. Read the stored values with includeSettings=true")
-    }
-    int settingsCount = (parsed.settings instanceof Map) ? parsed.settings.size() : 0
-    result.settingsKeyCount = settingsCount
-    if (includeSettings) {
-        def rawSettings = (parsed.settings instanceof Map) ? parsed.settings : [:]
-        if (!rawSettings || !_redactsCredentials()) {
-            result.settings = rawSettings
-        } else {
-            Map settingTypes = _appConfigSettingTypes(appIdStr as Integer)
-            List untyped = settingTypes == null ? [] : rawSettings.findAll { k, v ->
-                String key = k?.toString()
-                !passwordInputNames.contains(key) && !settingTypes.containsKey(key) && !_appConfigEmptyValue(v) && !(v instanceof Boolean) && !_appConfigSecretName(key)
-            }.keySet().collect { it.toString() }
-            if (settingTypes == null) {
-                result.settingsNote = "Raw settings withheld: the app's setting types could not be read from /installedapp/statusJson/${appIdStr}, so password values could not be identified for redaction. Retry; the config page above is unaffected.".toString()
-            } else if (untyped) {
-                mcpLog("warn", "hub-admin", "hub_get_app_config: statusJson for app ${appIdStr} types none of ${untyped}; raw settings withheld")
-                result.settingsNote = "Raw settings withheld: /installedapp/statusJson/${appIdStr} carries no type for ${untyped.take(5).join(', ')}${untyped.size() > 5 ? " and ${untyped.size() - 5} more" : ''}, so a password among them could not be told apart. Retry; the config page above is unaffected.".toString()
-            } else {
-                def redactedPw = _appConfigRedactedMarker()
-                def redacted = [:]
-                rawSettings.each { k, v ->
-                    String key = k?.toString()
-                    String type = passwordInputNames.contains(key) ? "password" : settingTypes.get(key)
-                    redacted.put(k, _appConfigIsSecretSetting(key, type, v) ? redactedPw : v)
+        def passwordInputNames = [] as Set
+        def sections = []
+        def pageHrefs = []
+        for (s in parsed.configPage.sections) {
+            if (!(s instanceof Map)) continue
+            def section = [title: stripAppConfigHtml(s.title), inputs: []]
+            def paragraphs = []
+            def components = []
+            List elements = (s.body instanceof List ? s.body : []) + (s.input instanceof List ? s.input.findAll { it instanceof Map && (it.element ?: 'input') == 'input' } : [])
+            Set seen = [] as Set
+            for (b in elements) {
+                if (!(b instanceof Map)) continue
+                String element = b.element?.toString() ?: 'input'
+                if (element == 'input' && b.name && b.type != 'button') {
+                    if (!seen.add(b.name.toString())) continue
+                    if (b.type == 'password') passwordInputNames << b.name.toString()
+                    section.inputs << _appConfigInput(b, formFields?.get(b.name.toString()), parsed.settings)
+                } else if (element in ['label', 'mode']) {
+                    Map appField = formFields?.get(element == 'mode' ? 'mode[mode]' : 'label')
+                    if (appField) section.inputs << appField
+                } else if (element == 'component' && b.name) {
+                    components << [name: b.name, title: stripAppConfigHtml(b.title), description: stripAppConfigHtml(b.description)].findAll { k, v -> v }
+                } else if (element == 'href' && (b.page || b.url)) {
+                    Map link = b.url ? [url: b.url.toString()] : [page: b.page.toString()]
+                    link.title = _uiPlainTitle(b.title)
+                    def description = _appConfigShownText(b.description)
+                    if (description) link.description = description
+                    List disabled = rmHasDisabled ? _appConfigDisabledRows(b.description) : []
+                    if (disabled) link.disabled = disabled
+                    pageHrefs << link
+                } else if (element == 'paragraph') {
+                    def rawHtml = (b.description ?: b.title)?.toString()
+                    def text = _appConfigShownText(rawHtml)
+                    if (!text) continue
+                    List disabled = rmHasDisabled ? _appConfigDisabledRows(rawHtml) : []
+                    paragraphs << (disabled ? [text: text, disabled: disabled] : text)
                 }
-                result.settings = redacted
-                result.settingsRedactionNote = "Secret values read ${redactedPw}: every setting the hub types as a password, on any page of the app, plus free-text settings whose names look like credentials (password, passwd, pwd, pass, passphrase, passcode, secret, token, API/access/private key, credential, psk, a PIN, or a code named for a lock, user, alarm, keypad, installer or similar). OAuth accessToken settings follow the Hide access tokens setting instead. Empty values are shown as-is. Turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
             }
+            if (paragraphs) section.paragraphs = paragraphs
+            if (components) section.components = components
+            sections << section
         }
-    } else if (settingsCount > 0) {
-        result.settingsNote = "Raw settings omitted; pass includeSettings=true to include them."
-    }
-    if (includeStatus) _appConfigAttachStatus(result, appIdStr as Integer)
-    return result
+        def children = (parsed.childApps instanceof List ? parsed.childApps : []).findAll { it instanceof Map }.collect { c ->
+            [id: c.id, label: stripAppConfigHtml(c.label ?: c.name), name: c.name]
+        }
+        def childDevices = (parsed.childDevices instanceof List ? parsed.childDevices : []).findAll { it instanceof Map }.collect { d ->
+            [id: d.id, name: stripAppConfigHtml(d.label ?: d.name)]
+        }
+        Map modeNames = parsed.modeMap instanceof Map ? parsed.modeMap : [:]
+        appObj.restrictedModes = _nfAppValue(parsed as Map, true).collect { id -> [value: id, label: modeNames.get(id)?.toString()] }
+        def result = [
+            success: true,
+            app: appObj,
+            page: [
+                name: parsed.configPage.name,
+                title: stripAppConfigHtml(parsed.configPage.title),
+                install: parsed.configPage.install == true,
+                refreshInterval: parsed.configPage.refreshInterval,
+                sections: sections
+            ],
+            childApps: children,
+            childDevices: childDevices,
+            endpoint: path
+        ]
+        if (parsed.configPage.error) result.configPageError = parsed.configPage.error
+        if (pageHrefs) result.page.hrefs = pageHrefs
+        if (pageName && parsed.configPage.name != null && parsed.configPage.name.toString() != pageName) {
+            String formTool = isRmRule ? "hub_set_rule" : "hub_set_native_app"
+            result.pageNote = "The hub rendered '${parsed.configPage.name}' instead of '${pageName}'; this app reaches that page only through its own link: open it with ${formTool}(operation:'form') and activate the href.".toString()
+        }
+        if (form != null) {
+            result.controls = form.get('controls')
+            if (form.get('unsupported')) result.unsupported = form.get('unsupported')
+        } else {
+            result.formError = formError
+            result.note = _appConfigNote("Input values and controls are withheld: ${formError}. Read the stored values with includeSettings=true")
+        }
+        Map lock = _ruleLockParams(parsed.settings instanceof Map ? parsed.settings : [:])
+        result.page = _ruleSecretsMasked(result.page, lock)
+        Map fetched = [:]
+        int settingsCount = (parsed.settings instanceof Map) ? parsed.settings.size() : 0
+        result.settingsKeyCount = settingsCount
+        if (includeSettings) {
+            def rawSettings = (parsed.settings instanceof Map) ? parsed.settings : [:]
+            if (!rawSettings || !_redactsCredentials()) {
+                result.settings = rawSettings
+            } else {
+                Map settingTypes = _appConfigSettingTypes(appIdStr as Integer, fetched)
+                List untyped = settingTypes == null ? [] : rawSettings.findAll { k, v ->
+                    String key = k?.toString()
+                    !passwordInputNames.contains(key) && !settingTypes.containsKey(key) && !_appConfigEmptyValue(v) && !(v instanceof Boolean) && !_appConfigSecretName(key)
+                }.keySet().collect { it.toString() }
+                if (settingTypes == null) {
+                    result.settingsNote = "Raw settings withheld: the app's setting types could not be read from /installedapp/statusJson/${appIdStr}, so password values could not be identified for redaction. Retry; the config page above is unaffected.".toString()
+                } else if (untyped) {
+                    mcpLog("warn", "hub-admin", "hub_get_app_config: statusJson for app ${appIdStr} types none of ${untyped}; raw settings withheld")
+                    result.settingsNote = "Raw settings withheld: /installedapp/statusJson/${appIdStr} carries no type for ${untyped.take(5).join(', ')}${untyped.size() > 5 ? " and ${untyped.size() - 5} more" : ''}, so a password among them could not be told apart. Retry; the config page above is unaffected.".toString()
+                } else {
+                    def redactedPw = _appConfigRedactedMarker()
+                    def redacted = [:]
+                    rawSettings.each { k, v ->
+                        String key = k?.toString()
+                        String type = passwordInputNames.contains(key) ? "password" : settingTypes.get(key)
+                        redacted.put(k, _appConfigIsSecretSetting(key, type, v) ? redactedPw : v)
+                    }
+                    result.settings = _ruleSecretsMasked(redacted, lock)
+                    result.settingsRedactionNote = "Secret values read ${redactedPw}: every setting the hub types as a password, on any page of the app, plus free-text settings whose names look like credentials (password, passwd, pwd, psw, pass, passphrase, passcode, secret, token, API/access/private key, credential, psk, cookie, session, bearer, a PIN, or a code named for a lock, user, alarm, keypad, installer or similar), the value of a URL query parameter named like one (an HTTP action's apikey= or token=), and every parameter of a lock-code custom action (setCode), here and in the page text. Other free-text values are not recognised. OAuth accessToken settings follow the Hide access tokens setting instead. Empty values are shown as-is. Turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
+                }
+            }
+        } else if (settingsCount > 0) {
+            result.settingsNote = "Raw settings omitted; pass includeSettings=true to include them."
+        }
+        if (includeStatus && fetched.status == null) {
+            try { fetched.status = _rmFetchStatusJson(appIdStr as Integer) }
+            catch (Exception unread) { mcpLog("debug", "hub-admin", "hub_get_app_config app ${appIdStr}: status read deferred (${unread.message})") }
+        }
+        if (includeStatus) _appConfigAttachStatus(result, appIdStr as Integer, fetched.status)
+        List hidden = []
+        _appConfigMaskedLeaves(parsed.settings, result.settings, hidden)
+        def rawState = fetched.status instanceof Map ? fetched.status.appState : null
+        Map rawRows = rawState instanceof Map ? rawState : (rawState instanceof List ? rawState.findAll { it instanceof Map }.collectEntries { [(it.name?.toString()): it.value] } : [:])
+        (result.appState instanceof List ? result.appState : []).each { row -> _appConfigMaskedLeaves(rawRows.get(row?.name?.toString()), row?.value, hidden) }
+        if (typeNames.any { _rmIsEditableRuleType(appTypeNamespace, it) }) {
+            try {
+                def locals = _nrHandle(appIdStr as Long).getAllLocalVars()
+                (locals instanceof Map ? locals : [:]).each { name, row ->
+                    def value = row instanceof Map ? row.value : row
+                    if (_appConfigMasksSetting(name?.toString(), row instanceof Map && row.type?.toString() == 'boolean' ? 'bool' : 'text', value) && value?.toString()?.size() >= 4) hidden << value.toString()
+                }
+            } catch (Exception unread) { mcpLog("warn", "hub-admin", "hub_get_app_config app ${appIdStr}: local variables unreadable (${unread.message}); page text not checked for them") }
+        }
+        hidden = hidden.unique()
+        if (hidden) result.keySet().findAll { !(it in ['settings', 'appState']) }.each { key -> result.put(key, _ruleSecretsMasked(result.get(key), [names: [], codes: [], texts: hidden])) }
+        return result
+    }.call(null)
 }
-private void _appConfigAttachStatus(Map result, Integer appId) {
+private void _appConfigMaskedLeaves(Object raw, Object masked, List out) {
+    if (raw == null || masked == null) return
+    if (masked instanceof CharSequence && masked.toString() == _appConfigRedactedMarker()) {
+        Closure leaves
+        leaves = { node -> node instanceof Map ? node.values().each { leaves.call(it) } : (node instanceof List ? node.each { leaves.call(it) } : (node instanceof CharSequence || node instanceof Number ? (node.toString().size() >= 4 && node.toString() != _appConfigRedactedMarker() ? out << node.toString() : null) : null)) }
+        leaves.call(raw)
+    } else if (raw instanceof Map && masked instanceof Map) masked.each { k, v -> _appConfigMaskedLeaves(raw.get(k), v, out) }
+    else if (raw instanceof List && masked instanceof List && raw.size() == masked.size()) for (i in 0..<raw.size()) _appConfigMaskedLeaves(raw.get(i), masked.get(i), out)
+}
+private void _appConfigAttachStatus(Map result, Integer appId, Object fetched = null) {
     try {
-        Map status = _appStatusRead(appId)
+        Map status = _appStatusRead(appId, fetched)
         result.appState = status.appState
         result.eventSubscriptions = status.eventSubscriptions
         result.scheduledJobs = status.scheduledJobs
@@ -17050,8 +17089,13 @@ private void _appConfigAttachStatus(Map result, Integer appId) {
         List redaction = []
         if (callerClient != null) redaction << "This client's token always reads credential-named appState values and access tokens as redacted, whatever the MCP app's settings say."
         else if (_redactsCredentials()) redaction << "appState values whose names look like credentials, at any depth, read ${_appConfigRedactedMarker()}, as settings do; turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
-        if (callerClient == null && status.appState.any { it.name?.toString() in ['accessToken', 'clientTokens'] })
-            redaction << (_redactsAccessTokens() ? "The app's access tokens read as redacted (Hide access tokens is on)." : "The app's access tokens are shown, because Hide access tokens is off in the MCP app's settings.")
+        List held = callerClient == null ? status.appState.findAll { it.name?.toString() in ['accessToken', 'clientTokens'] }*.name*.toString() : []
+        if (held && _redactsAccessTokens()) redaction << "The app's access tokens read as redacted (Hide access tokens is on)."
+        else if (held) {
+            List shown = _redactsCredentials() ? held - ['clientTokens'] : held
+            if (shown) redaction << "The app's ${shown.join(' and ')} ${shown.size() > 1 ? 'are' : 'is'} shown, because Hide access tokens is off in the MCP app's settings.".toString()
+            if (shown.size() < held.size()) redaction << "Its clientTokens read as redacted under Hide passwords and credentials."
+        }
         if (redaction) result.statusRedactionNote = redaction.join(' ')
         _appConfigFitStatus(result)
     } catch (Exception e) {
@@ -17115,10 +17159,11 @@ private Map _appConfigInput(Map element, Map field, Object storedSettings) {
     if (_nrIsDeviceType(field.type?.toString()) && stored instanceof Map) input.selected = stored.collect { id, label -> [value: id.toString(), label: stripAppConfigHtml(label)] }
     return input
 }
-private Map _appConfigSettingTypes(Integer appId) {
+private Map _appConfigSettingTypes(Integer appId, Map fetched = [:]) {
     def status
     try {
         status = _rmFetchStatusJson(appId)
+        fetched.status = status
     } catch (Exception e) {
         mcpLog("warn", "hub-admin", "hub_get_app_config: statusJson read for app ${appId} failed (${e.message}); raw settings withheld")
         return null
@@ -18904,7 +18949,7 @@ A transport drop can lose the response while the hub still commits this write; v
                     appId: [type: "string", description: "Installed-app ID (decimal). From hub_list_apps (scope='instances'), hub_list_rules, or the numeric id in the Hubitat UI URL (/installedapp/configure/<id>)."],
                     pageName: [type: "string", description: "The page to read instead of the default page: a page.hrefs[].page name from a page of this app already read."],
                     includeSettings: [type: "boolean", description: "Include the raw app-internal settings key-value map (default false). Set true only for power-user inspection.", default: false],
-                    includeStatus: [type: "boolean", description: "Also return the app's App Status lists: appState (the app's stored state as [{name, value}], credential-named values redacted), eventSubscriptions and scheduledJobs (default false). Works with summary=true. Lists too large for one response come back cut, with statusTruncated=true.", default: false],
+                    includeStatus: [type: "boolean", description: "Also return the app's App Status lists: appState (the app's stored state as [{name, value}], credential-named values redacted), eventSubscriptions and scheduledJobs, whose map data is masked by key name and string data shown as stored, a secret URL query value masked (default false). Works with summary=true. Lists too large for one response come back cut, with statusTruncated=true.", default: false],
                     summary: [type: "boolean", description: "Fast identity-only read: returns the thin app record (id, name, type, disabled, user) and the type's namespace, no config page; pageName/includeSettings ignored.", default: false]
                 ],
                 required: ["appId"]
@@ -22276,7 +22321,7 @@ def _toolDisplayMeta_partDiscovery() {
     ]
 }
 def _getAllToolDefinitions_partNativeRM() {
-    return [
+    def defs = { [
         [
             name: "hub_list_rules",
             description: "List the Rule Machine 5.x rules, with each rule's id, label, and live `status` (`active`/`paused`/`stopped`/`disabled`).[[FLAT_TRIM]] Requires the Read master.[[/FLAT_TRIM]][[FLAT_TRIM]] `status` is `unknown` when the hub's app list is momentarily unreadable. Status reflects Rule Machine's name decoration (refreshed after an MCP stop, start, pause or resume); a decorated rule's paused/stopped come from its own state, and a row marked statusSource:'name' fell back to the decoration for one flag or both because that state could not be fully read. A stop made outside MCP may show only after the rule's page is next opened, which hub_get_app_config(appId) does. For ONE rule's state, call hub_get_rule(ruleId) instead of listing every rule — its health returns that rule's paused/disabled/stopped/broken directly. Button Rules, Basic Rules and other classic apps (Room Lighting, Notifier, Button Controllers) are not listed here: `hub_list_apps` (scope='instances') lists them with their enabled/disabled state (nameFilter:'Button Rule' finds Button Rules), and hub_get_visual_rule lists Visual Rules. Call `hub_get_tool_guide(section='builtin_app_tools_rules')` for the status-detection semantics and platform limitations on RM rule internals.[[/FLAT_TRIM]]",
@@ -22295,9 +22340,9 @@ def _getAllToolDefinitions_partNativeRM() {
                 type: "object",
                 properties: [
                     ruleId: [type: ["integer", "array"], items: [type: "integer"], description: "Rule ID from hub_list_rules (a Button Rule's from hub_list_apps(nameFilter:'Button Rule'), a Visual Rule's from hub_get_visual_rule), or an array of rule IDs to act on in one call"],
-                    action: [type: "string", enum: ["actions", "stop", "start", "pause", "resume"], description: "actions (the default) runs the rule's actions; stop/start stop or restart a Rule Machine rule; pause/resume pause or resume the rule."],
+                    action: [type: "string", enum: ["actions", "stop", "start", "pause", "resume"], description: "Required. actions runs the rule's actions at once, without checking its conditions or Required Expression; stop/start stop or restart a Rule Machine rule; pause/resume pause or resume the rule."],
                 ],
-                required: ["ruleId"]
+                required: ["ruleId", "action"]
             ]
         ],
         [
@@ -22360,7 +22405,8 @@ Requires Write master + confirm=true + recent hub backup.""",
                 required: ["appId", "disabled"]
             ]
         ],
-    ]
+    ] }
+    return defs()
 }
 def toolSetAppDisabled(args) {
     def id = args?.appId
@@ -22567,7 +22613,7 @@ private boolean _rmSettleRuleStatusFromState(Map entry, Map flags) {
     boolean stopped = flags.stopped
     boolean fromState = true
     try {
-        Map status = _appStatusRead(flags.appId as Integer)
+        Map status = _appStatusFlagsRead(flags.appId as Integer)
         Map statePaused = _appStatusFlag(status, "paused")
         Map stateStopped = _appStatusFlag(status, "stopped")
         if (statePaused.missing) throw new IllegalStateException("its status page carried no appState")
@@ -22613,9 +22659,9 @@ private List<Integer> _rmRuleIdListArg(Object raw) {
 def toolRunRmRule(args) {
     if (args?.ruleId == null) throw new IllegalArgumentException("ruleId is required")
     List<Integer> ruleIds = _rmRuleIdListArg(args.ruleId)
-    def action = args?.action ?: "actions"
+    def action = args?.action
     if (!(action in ["actions", "stop", "start", "pause", "resume"])) {
-        throw new IllegalArgumentException("Invalid action '${action}'. Must be 'actions', 'stop', 'start', 'pause' or 'resume'.")
+        throw new IllegalArgumentException("${action == null ? 'action is required' : "Invalid action '${action}'"}: 'actions' (runs every action without checking conditions or the Required Expression), 'stop', 'start', 'pause' or 'resume'. Nothing was dispatched.")
     }
     ruleIds.each { _requireUnprotectedAppMutation(it, "change rule runtime") }
     Map guard = _rmRequireRuleTargets(ruleIds, "hub_call_rule", true)
@@ -22746,7 +22792,7 @@ private Map _rmRunActionsButton(Integer ruleId) {
     return [success: true, ruleId: ruleId, rmAction: "runAction button"]
 }
 private boolean _rmRuntimeFlag(Integer ruleId, String name) {
-    Map flag = _appStatusFlag(_appStatusRead(ruleId), name)
+    Map flag = _appStatusFlag(_appStatusFlagsRead(ruleId), name)
     if (flag.missing) throw new IllegalStateException("its status page carried no appState")
     if (flag.present && flag.value == null) throw new IllegalStateException("its ${name} state is neither true nor false")
     return flag.value == true
@@ -22760,40 +22806,44 @@ private Map _rmTogglePaused(Integer ruleId, String action) {
         action == "pause" ? "pausRule button -> state.paused=true" : "pausRule button -> state.paused=false")
 }
 private Map _rmToggleButton(Integer ruleId, String action, String flag, String button, boolean target, String clicked) {
-    boolean now
-    try {
-        now = _rmRuntimeFlag(ruleId, flag)
-    } catch (Exception e) {
-        return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: cannot read the rule's ${flag} state before the toggle (${e.message})".toString(),
-                note: "Nothing was clicked. Retry; hub_get_rule reads the rule's state."]
-    }
-    if (now == target) {
-        return [success: true, ruleId: ruleId, rmAction: "noop",
-                note: "Rule was already ${target ? flag : 'not ' + flag} -- ${button} button not clicked.".toString()]
-    }
-    try {
-        _rmClickAppButton(ruleId, button)
-    } catch (Exception e) {
-        return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: ${button} button click failed (${e.message})".toString(),
-                note: "Re-issuing is safe: the rule's state is read first and a rule already ${target ? flag : 'not ' + flag} is left alone. Confirm with hub_get_rule or hub_list_rules. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
-    }
-    def out = [success: true, ruleId: ruleId, rmAction: clicked]
-    String renderError = null
-    try {
-        def pageError = _rmFetchConfigJson(ruleId)?.configPage?.error
-        if (pageError) renderError = "the page reported: ${pageError}".toString()
-    } catch (Exception e) {
-        renderError = e.message ?: e.toString()
-    }
-    def seen
-    try { seen = _rmRuntimeFlag(ruleId, flag) }
-    catch (Exception e) { seen = e.message ?: e.toString() }
-    if (seen != target) {
-        return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: the ${button} click was accepted, but the rule's ${flag} state then read ${seen}, not ${target}".toString(),
-                note: "Another change to the rule may have run at the same time. Read it with hub_get_rule, then send the action again if it is still needed: a rule already in the target state is left alone. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
-    }
-    if (renderError != null) out.note = "The rule's ${flag} state changed, but re-rendering its page failed (${renderError}), so hub_list_rules may show the old status until the rule's page next renders without an error; hub_get_app_config(appId: ${ruleId}) opens it. hub_get_rule reads the rule's own state.".toString()
-    return out
+    return { wrapped ->
+        boolean current
+        try {
+            current = _rmRuntimeFlag(ruleId, flag)
+        } catch (Exception e) {
+            return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: cannot read the rule's ${flag} state before the toggle (${e.message})".toString(),
+                    note: "Nothing was clicked. Retry; hub_get_rule reads the rule's state."]
+        }
+        if (current == target) {
+            return [success: true, ruleId: ruleId, rmAction: "noop",
+                    note: "Rule was already ${target ? flag : 'not ' + flag} -- ${button} button not clicked.".toString()]
+        }
+        try {
+            _rmClickAppButton(ruleId, button)
+        } catch (Exception e) {
+            return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: ${button} button click failed (${e.message})".toString(),
+                    note: "Re-issuing is safe: the rule's state is read first and a rule already ${target ? flag : 'not ' + flag} is left alone. Confirm with hub_get_rule or hub_list_rules. See hub_get_tool_guide(section='builtin_app_tools_rules').".toString()]
+        }
+        def out = [success: true, ruleId: ruleId, rmAction: clicked]
+        String renderError = null
+        boolean formOpen = NATIVE_FORM_CONTEXTS.values().any { it?.app_id?.toString() == ruleId.toString() && it.expires >= now() }
+        if (!formOpen) try {
+            def pageError = _rmFetchConfigJson(ruleId)?.configPage?.error
+            if (pageError) renderError = "the page reported: ${pageError}".toString()
+        } catch (Exception e) {
+            renderError = e.message ?: e.toString()
+        }
+        def seen
+        try { seen = _rmRuntimeFlag(ruleId, flag) }
+        catch (Exception e) { seen = e.message ?: e.toString() }
+        if (seen != target) {
+            return [success: false, ruleId: ruleId, error: "hub_call_rule action=${action}: the ${button} click was accepted, but the rule's ${flag} state then read ${seen}, not ${target}".toString(),
+                    note: "Another change to the rule may have run at the same time. Read it with hub_get_rule, then send the action again if it is still needed: a rule already in the target state is left alone. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
+        }
+        if (formOpen) out.note = "The rule's ${flag} state changed. Its page was not rendered because a hub_set_rule form session is open on it, so hub_list_rules may show the old status until that session finishes or the page next renders.".toString()
+        if (renderError != null) out.note = "The rule's ${flag} state changed, but re-rendering its page failed (${renderError}), so hub_list_rules may show the old status until the rule's page next renders without an error; hub_get_app_config(appId: ${ruleId}) opens it. hub_get_rule reads the rule's own state.".toString()
+        return out
+    }.call(null)
 }
 private Map _vrbTogglePaused(Integer ruleId, String action) {
     boolean target = (action == "pause")
@@ -22846,7 +22896,23 @@ def toolSetRmRuleBoolean(args) {
     ruleIds.each { _requireUnprotectedAppMutation(it, "set rule private boolean") }
     Map guard = _rmRequireRuleTargets(ruleIds, "hub_set_rule_private_boolean")
     if (guard.failure) return guard.failure + [ruleIds: ruleIds]
-    return sendRmAction(ruleIds, rmAction, "hub_set_rule_private_boolean value=${resolved}")
+    Map sent = sendRmAction(ruleIds, rmAction, "hub_set_rule_private_boolean value=${resolved}")
+    if (sent.success != true) return sent
+    return { wrapped ->
+        Map seen = [:]
+        for (attempt in 0..<5) {
+            if (attempt > 0) pauseExecution(500)
+            ruleIds.findAll { seen.get(it) != resolved }.each { id ->
+                try { seen.put(id, _appStatusFlag(_appStatusFlagsRead(id), 'private').value) }
+                catch (Exception unread) { seen.put(id, "unreadable (${unread.message ?: unread.toString()})".toString()) }
+            }
+            if (ruleIds.every { seen.get(it) == resolved }) return sent
+        }
+        List off = ruleIds.findAll { seen.get(it) != resolved }
+        sent + [success: false, unconfirmedRuleIds: off,
+            error: "The ${rmAction} dispatch was accepted, but the private boolean of rule(s) ${off.join(', ')} then read ${off.collect { seen.get(it) }.join(', ')}, not ${resolved}.".toString(),
+            note: "Read each rule with hub_get_rule (health.privateBoolean) before sending the value again; setting a value a rule already has changes nothing. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
+    }.call(null)
 }
 private Map sendRmAction(List<Integer> ruleIds, String rmAction, String logContext) {
     def appLabel = app?.label ?: "MCP Rule Server"
@@ -22993,7 +23059,7 @@ Map _rmDeleteAction(Integer appId, Integer actionIdx, boolean skipStructuralChec
         throw new IllegalStateException("removeAction(${actionIdx}) blocked: rule ${appId} has state.editAct=${stuckEditAct} set from a prior interrupted action edit. RM 5.1 silently no-ops delAct clicks until this clears. Recovery options: (a) wait ~60s and retry (RM's stale-state timeout -- UNVERIFIED for this marker: an artificially-set editAct observed live did NOT clear after 5+ minutes); (b) open the rule in the Hubitat UI and finish or cancel the open action editor. Verified live on fw 2.5.1.135: cancelBtn/cancelAct clicks, updateRule, and an in-place hub_restore_backup do NOT clear a stuck editAct (restore-in-place rewrites settings, not app state) -- if (a) and (b) fail, delete the rule, then hub_restore_backup(scope='source', backupKey='<a recent rm-rule snapshot for this rule>', confirm=true), which RECREATES it with fresh state.")
     }
     def sType = settingsByName["actSubType.${actionIdx}".toString()]?.value?.toString()
-    def structuralSubTypes = ["getIfThen", "getElseIf", "getElse", "getEndIf", "getRepeat", "getWhile", "getEndRepeat"]
+    def structuralSubTypes = ["getIfThen", "getElseIf", "getElse", "getEndIf", "getRepeat", "getWhile", "getUntil", "getRepeatWhile", "getEndRepeat"]
     if (sType in structuralSubTypes && !skipStructuralCheck) {
         def humanKind = [
             "getIfThen": "IF",
@@ -23002,6 +23068,8 @@ Map _rmDeleteAction(Integer appId, Integer actionIdx, boolean skipStructuralChec
             "getEndIf": "END-IF",
             "getRepeat": "Repeat",
             "getWhile": "Repeat-While",
+            "getUntil": "Repeat-Until",
+            "getRepeatWhile": "Repeat-While",
             "getEndRepeat": "END-REP"
         ][sType] ?: sType
         def orderedIndices = _rmOrderedActionIndices(appId)
@@ -24257,6 +24325,7 @@ def toolGetNativeRule(args) {
 Map _rmPublicLocalVariable(String name, Map row) {
     Map result = [name: name, type: row?.type, value: row?.value]
     if (_appConfigMasksSetting(name, row?.type == 'boolean' ? 'bool' : 'text', row?.value)) { result.value = null; result.redacted = true }
+    else if (_redactsAccessTokens() && name ==~ /(?i)access_?token/ && row?.value instanceof CharSequence) result.value = _accessTokenRedactedMarker()
     result
 }
 private boolean _rmReusableBackupFileMatches(Map entry, Integer ruleId) {
@@ -25281,7 +25350,7 @@ private void _nmRefreshHealth(Long ruleId, Map baseline) {
     if (!(health instanceof Map) || !(health.broken instanceof Boolean)) throw new IllegalStateException('Native row health could not be verified after cancellation')
     if (validated != (baseline.broken == true) || health.broken != validated) throw new IllegalStateException('Native row health was not restored after cancellation')
 }
-private boolean _nmActionLabel(Long ruleId, String id) {
+private String _nmActionLabel(Long ruleId, String id) {
     Map before = _nrState(ruleId)
     List keys = ['actLabelIndent', 'nestedLabel', 'inIf', 'inRepeat', 'broken']
     Map format = before.findAll { key, value -> key in keys }
@@ -25293,7 +25362,8 @@ private boolean _nmActionLabel(Long ruleId, String id) {
         label = _nrHandle(ruleId).thisActionLabel(id)
         broken = _nrState(ruleId).broken == true
     } finally { _nrStatePatch(ruleId, format, keys.findAll { !format.containsKey(it) }) }
-    label instanceof String && label.trim() && !broken && !(label =~ /<span\b[^>]*>\s*\*\*Broken [^*]+\*\*\s*<\/span>/).find()
+    if (!(label instanceof String) || !label.trim()) return 'empty'
+    broken || (label =~ /<span\b[^>]*>\s*\*\*Broken [^*]+\*\*\s*<\/span>/).find() ? 'marked' : null
 }
 private Map _nmRejectEdit(Long ruleId, String id, Map baseline, Map savedSettings, List keys, Map entries, Closure cancel, Map failure) {
     String cleanupError = null
@@ -25410,120 +25480,117 @@ Map _nmUpsertCondition(Long ruleId, boolean trigger, Map row) {
     }
 }
 Map _nmUpsertAction(Long ruleId, Map row) {
-    if (row == null || row.keySet().any { !(it in ['id', 'type', 'subtype', 'fields', 'expression', 'events', 'condition']) } || !(row.type instanceof String) || !row.type.trim() || !(row.subtype instanceof String) || !row.subtype.trim()) throw new IllegalArgumentException('Action type, subtype and typed fields are required')
-    boolean waitEvents = row.subtype == 'getWaitEvents'
-    boolean waitRule = row.subtype == 'getWaitRule'
-    if (row.subtype.toString().toLowerCase().contains('wait') && !waitEvents && !waitRule) throw new IllegalArgumentException('Unsupported native wait action')
-    if (waitEvents) {
-        if (!(row.events instanceof List) || row.events.empty || row.events.size() > 16) throw new IllegalArgumentException('Wait actions require between one and sixteen events')
-        row.events.each { event ->
-            if (!(event instanceof Map) || event.keySet().any { !(it in ['capability', 'fields']) } || !(event.capability instanceof String) || !event.capability.trim()) throw new IllegalArgumentException('Wait events require a capability and typed fields')
-            List preview = _nmFields(event.get('fields') as List, '-1')
-            if (preview.any { it.name == 'tCapab-1' } || preview.collect { it.name }.unique().size() != preview.size()) throw new IllegalArgumentException('Wait fields must not repeat selectors or native inputs')
-        }
-    } else if (row.containsKey('events')) throw new IllegalArgumentException('Only Wait for Events accepts event rows')
-    Map before = _nrState(ruleId)
-    List priorOrder = before.actionList instanceof List ? before.actionList.collect { it.toString() } : []
-    boolean editing = row.containsKey('id')
-    String id = _nmId(editing ? row.id : before.actNdx)
-    def prior = _nmEntry(before.actions instanceof Map ? before.actions : [:], id)
-    if (editing && !(prior instanceof Map)) throw new IllegalArgumentException('Native action does not exist')
-    if (!editing && prior != null) throw new IllegalArgumentException('Native action allocation slot is already occupied')
-    if (waitEvents && editing && (!(prior.wait instanceof List) || prior.wait.size() != row.events.size())) throw new IllegalArgumentException('Editing waits currently requires the existing event count')
-    if (!editing && row.subtype in ND_EXPRESSION_SUBTYPES && !row.containsKey('expression')) throw new IllegalArgumentException('New expression actions require expression tokens')
-    String expectedExpressionId = null
-    if (row.containsKey('expression')) {
-        if (!(row.subtype in ND_EXPRESSION_SUBTYPES)) throw new IllegalArgumentException('Unsupported native expression action')
-        _nmTokens(row.expression as List, before.capabsfalse instanceof Map ? before.capabsfalse : [:])
-    }
-    String conditionId = row.containsKey('condition') ? _nmId(row.condition) : (editing && prior.cond ? prior.cond.toString() : null)
-    if (row.containsKey('condition')) {
-        _nmTokens([conditionId], before.capabsfalse instanceof Map ? before.capabsfalse : [:])
-        if (row.containsKey('expression') || row.type in ['condActs', 'repeatActs', 'delayActs']) throw new IllegalArgumentException('A simple condition requires an ordinary native action')
-    }
-    List fields = _nmFields(row.get('fields') as List, id)
-    if (fields.any { it.name in ["actType.${id}".toString(), "actSubType.${id}".toString()] }) throw new IllegalArgumentException('Action selectors must not be repeated')
-    List settings = [[name: "actType.${id}".toString(), type: 'enum', value: row.type], [name: "actSubType.${id}".toString(), type: 'enum', value: row.subtype]] + fields
-    String editToken = 'N'
-    if (editing) {
-        boolean expressionAction = prior.method in ['getIfThen', 'getWhile', 'getUntil', 'getWaitRule']
-        editToken = "${id}.${conditionId ?: 0}.${expressionAction}".toString()
-    }
-    Map savedSettings = _nmSettingsInventory(ruleId)
-    Map baseline = [:] + before
-    ['actions', 'actionList', 'capabsfalse', 'capabstrue', 'eval', 'predCapabs', 'firstR', 'waitNdx', 'waitDone'].each { key ->
-        if (before.get(key) instanceof Map || before.get(key) instanceof List) baseline.put(key, new groovy.json.JsonSlurper().parseText(groovy.json.JsonOutput.toJson(before.get(key))))
-    }
-    Closure render = { unused -> _nrHandle(ruleId).doActPage() }
-    Closure reject = { Map failure -> _nmRejectAction(ruleId, id, baseline, savedSettings, settings, render, failure) }
-    try {
-        _nrStatePatch(ruleId, [doActN: editToken])
-        if (row.containsKey('condition') && !editing) {
-            List conditional = [
-                [name: "actType.${id}".toString(), type: 'enum', value: 'condActs'],
-                [name: "actSubType.${id}".toString(), type: 'enum', value: 'getCondAct'],
-                [name: "useCond.${id}".toString(), type: 'bool', value: true],
-                [name: "useCondNdx.${id}".toString(), type: 'enum', value: conditionId]
-            ]
-            Map selected = _nmWriteExposed(ruleId, conditional, conditional.take(2).collect { it.name }, render.call(), render)
-            if (selected.success != true) return reject.call(selected)
-            _nrHandle(ruleId).appButtonHandler('hasAll')
-            render.call()
-        }
-        Map inputValidation = _nmWriteExposed(ruleId, waitRule ? settings.take(2) : settings, settings.take(2).collect { it.name }, render.call(), render)
-        if (inputValidation.success != true) return reject.call(inputValidation)
-        List waitIds = null
+    return { wrapped ->
+        if (row == null || row.keySet().any { !(it in ['id', 'type', 'subtype', 'fields', 'expression', 'events', 'condition']) } || !(row.type instanceof String) || !row.type.trim() || !(row.subtype instanceof String) || !row.subtype.trim()) throw new IllegalArgumentException('Action type, subtype and typed fields are required')
+        boolean waitEvents = row.subtype == 'getWaitEvents'
+        boolean waitRule = row.subtype == 'getWaitRule'
+        if (row.subtype.toString().toLowerCase().contains('wait') && !waitEvents && !waitRule) throw new IllegalArgumentException('Unsupported native wait action')
         if (waitEvents) {
-            Map waits = _nmCompileWait(ruleId, id, row.events as List, editing)
-            if (waits.success != true) return reject.call(waits + [waitEvents: waits])
-            waitIds = waits.eventIds
-            settings.addAll(waits.settings)
-        }
+            if (!(row.events instanceof List) || row.events.empty || row.events.size() > 16) throw new IllegalArgumentException('Wait actions require between one and sixteen events')
+            row.events.each { event ->
+                if (!(event instanceof Map) || event.keySet().any { !(it in ['capability', 'fields']) } || !(event.capability instanceof String) || !event.capability.trim()) throw new IllegalArgumentException('Wait events require a capability and typed fields')
+                List preview = _nmFields(event.get('fields') as List, '-1')
+                if (preview.any { it.name == 'tCapab-1' } || preview.collect { it.name }.unique().size() != preview.size()) throw new IllegalArgumentException('Wait fields must not repeat selectors or native inputs')
+            }
+        } else if (row.containsKey('events')) throw new IllegalArgumentException('Only Wait for Events accepts event rows')
+        Map before = _nrState(ruleId)
+        List priorOrder = before.actionList instanceof List ? before.actionList.collect { it.toString() } : []
+        boolean editing = row.containsKey('id')
+        String id = _nmId(editing ? row.id : before.actNdx)
+        def prior = _nmEntry(before.actions instanceof Map ? before.actions : [:], id)
+        if (editing && !(prior instanceof Map)) throw new IllegalArgumentException('Native action does not exist')
+        if (!editing && prior != null) throw new IllegalArgumentException('Native action allocation slot is already occupied')
+        if (waitEvents && editing && (!(prior.wait instanceof List) || prior.wait.size() != row.events.size())) throw new IllegalArgumentException('Editing waits currently requires the existing event count')
+        if (!editing && row.subtype in ND_EXPRESSION_SUBTYPES && !row.containsKey('expression')) throw new IllegalArgumentException('New expression actions require expression tokens')
+        String expectedExpressionId = null
         if (row.containsKey('expression')) {
-            String expressionId = _nmId(editing && prior.rule != null ? prior.rule : _nrState(ruleId).ruleNdx, true)
-            expectedExpressionId = expressionId
-            Map expression = _nmSetExpression(ruleId, expressionId, row.expression as List)
-            if (expression.success != true) return reject.call([error: expression.error ?: 'Native action expression failed', expression: expression])
-            if (waitRule && fields) {
+            if (!(row.subtype in ND_EXPRESSION_SUBTYPES)) throw new IllegalArgumentException('Unsupported native expression action')
+            _nmTokens(row.expression as List, before.capabsfalse instanceof Map ? before.capabsfalse : [:])
+        }
+        String conditionId = row.containsKey('condition') ? _nmId(row.condition) : (editing && prior.cond ? prior.cond.toString() : null)
+        if (row.containsKey('condition')) {
+            _nmTokens([conditionId], before.capabsfalse instanceof Map ? before.capabsfalse : [:])
+            if (row.containsKey('expression') || row.type in ['condActs', 'repeatActs', 'delayActs']) throw new IllegalArgumentException('A simple condition requires an ordinary native action')
+        }
+        List fields = _nmFields(row.get('fields') as List, id)
+        if (fields.any { it.name in ["actType.${id}".toString(), "actSubType.${id}".toString()] }) throw new IllegalArgumentException('Action selectors must not be repeated')
+        List settings = [[name: "actType.${id}".toString(), type: 'enum', value: row.type], [name: "actSubType.${id}".toString(), type: 'enum', value: row.subtype]] + fields
+        String editToken = 'N'
+        if (editing) {
+            boolean expressionAction = prior.method in ['getIfThen', 'getWhile', 'getUntil', 'getWaitRule']
+            editToken = "${id}.${conditionId ?: 0}.${expressionAction}".toString()
+        }
+        Map savedSettings = _nmSettingsInventory(ruleId)
+        Map baseline = [:] + before
+        ['actions', 'actionList', 'capabsfalse', 'capabstrue', 'eval', 'predCapabs', 'firstR', 'waitNdx', 'waitDone'].each { key ->
+            if (before.get(key) instanceof Map || before.get(key) instanceof List) baseline.put(key, new groovy.json.JsonSlurper().parseText(groovy.json.JsonOutput.toJson(before.get(key))))
+        }
+        Closure render = { unused -> _nrHandle(ruleId).doActPage() }
+        Closure reject = { Map failure -> _nmRejectAction(ruleId, id, baseline, savedSettings, settings, render, failure) }
+        try {
+            _nrStatePatch(ruleId, [doActN: editToken])
+            if (row.containsKey('condition') && !editing) {
+                List conditional = [
+                    [name: "actType.${id}".toString(), type: 'enum', value: 'condActs'],
+                    [name: "actSubType.${id}".toString(), type: 'enum', value: 'getCondAct'],
+                    [name: "useCond.${id}".toString(), type: 'bool', value: true],
+                    [name: "useCondNdx.${id}".toString(), type: 'enum', value: conditionId]
+                ]
+                Map selected = _nmWriteExposed(ruleId, conditional, conditional.take(2).collect { it.name }, render.call(), render)
+                if (selected.success != true) return reject.call(selected)
+                _nrHandle(ruleId).appButtonHandler('hasAll')
+                render.call()
+            }
+            Map inputValidation = _nmWriteExposed(ruleId, waitRule ? settings.take(2) : settings, settings.take(2).collect { it.name }, render.call(), render)
+            if (inputValidation.success != true) return reject.call(inputValidation)
+            List waitIds = null
+            if (waitEvents) {
+                Map waits = _nmCompileWait(ruleId, id, row.events as List, editing)
+                if (waits.success != true) return reject.call(waits + [waitEvents: waits])
+                waitIds = waits.eventIds
+                settings.addAll(waits.settings)
+            }
+            if (row.containsKey('expression')) {
+                String expressionId = _nmId(editing && prior.rule != null ? prior.rule : _nrState(ruleId).ruleNdx, true)
+                expectedExpressionId = expressionId
+                Map expression = _nmSetExpression(ruleId, expressionId, row.expression as List)
+                if (expression.success != true) return reject.call([error: expression.error ?: 'Native action expression failed', expression: expression])
+                if (waitRule && fields) {
+                    Map durationInputs = _nmWriteExposed(ruleId, fields, [], render.call(), render)
+                    if (durationInputs.success != true) return reject.call(durationInputs)
+                }
+                _nrHandle(ruleId).appButtonHandler('hasRule')
+                _nrHandle(ruleId).doActPage()
+                if (waitRule) _nrHandle(ruleId).doActPage()
+            }
+            if (waitRule && fields && !row.containsKey('expression')) {
                 Map durationInputs = _nmWriteExposed(ruleId, fields, [], render.call(), render)
                 if (durationInputs.success != true) return reject.call(durationInputs)
             }
-            _nrHandle(ruleId).appButtonHandler('hasRule')
-            _nrHandle(ruleId).doActPage()
-            if (waitRule) _nrHandle(ruleId).doActPage()
+            if (!(waitRule && row.containsKey('expression'))) {
+                _nrHandle(ruleId).appButtonHandler('actionDone')
+                _nrHandle(ruleId).doActPage()
+            }
+            if (waitEvents) _nrHandle(ruleId).selectTriggers()
+            Map after = _nrState(ruleId)
+            def action = _nmEntry(after.actions instanceof Map ? after.actions : [:], id)
+            boolean listed = after.actionList instanceof List && after.actionList.any { it.toString() == id }
+            List expectedOrder = editing ? priorOrder : priorOrder + [id]
+            boolean ordered = after.actionList instanceof List && after.actionList.collect { it.toString() } == expectedOrder
+            boolean compiled = action instanceof Map && action.method == row.subtype
+            boolean expressionVerified = expectedExpressionId == null || (action instanceof Map && action.rule?.toString() == expectedExpressionId && _nmEntry(after.eval instanceof Map ? after.eval : [:], expectedExpressionId) == row.expression)
+            boolean waitsVerified = waitIds == null || (action instanceof Map && action.wait instanceof List && action.wait.collect { it.toString() } == waitIds)
+            boolean conditionVerified = conditionId == null || (action instanceof Map && action.cond?.toString() == conditionId)
+            Map echoed = _nrSettings(ruleId, settings.collect { it.name })
+            boolean persisted = settings.every { echoed.get(it.name)?.type?.toString() == it.type && _nrComparableSetting(it.type, echoed.get(it.name)?.value) == _nrComparableSetting(it.type, it.value) }
+            if (!(listed && ordered && compiled && persisted && expressionVerified && waitsVerified && conditionVerified)) return reject.call([error: 'Native action compilation or input verification failed', settingsVerified: persisted, expressionVerified: expressionVerified, waitsVerified: waitsVerified, conditionVerified: conditionVerified])
+            if (_nmActionLabel(ruleId, id) != null) return reject.call([error: 'Rule Machine marks this action broken or draws no label for it, so the change was rolled back. If it is gated on a condition Rule Machine marks, move it to another condition, or repair or delete that condition first'])
+            [success: true, id: id, action: action, partial: false, settingsVerified: true, expressionVerified: true, waitsVerified: true, conditionVerified: true]
+        } catch (Exception failure) {
+            mcpLogError('rm-native', "Native action change failed for rule ${ruleId}: ${failure.message}".toString(), failure)
+            reject.call([error: failure.message ?: 'Native action authoring failed'])
         }
-        if (waitRule && fields && !row.containsKey('expression')) {
-            Map durationInputs = _nmWriteExposed(ruleId, fields, [], render.call(), render)
-            if (durationInputs.success != true) return reject.call(durationInputs)
-        }
-        if (!(waitRule && row.containsKey('expression'))) {
-            _nrHandle(ruleId).appButtonHandler('actionDone')
-            _nrHandle(ruleId).doActPage()
-        }
-        if (waitEvents) _nrHandle(ruleId).selectTriggers()
-        Map after = _nrState(ruleId)
-        def action = _nmEntry(after.actions instanceof Map ? after.actions : [:], id)
-        boolean listed = after.actionList instanceof List && after.actionList.any { it.toString() == id }
-        List expectedOrder = editing ? priorOrder : priorOrder + [id]
-        boolean ordered = after.actionList instanceof List && after.actionList.collect { it.toString() } == expectedOrder
-        boolean compiled = action instanceof Map && action.method == row.subtype
-        boolean expressionVerified = expectedExpressionId == null || (action instanceof Map && action.rule?.toString() == expectedExpressionId && _nmEntry(after.eval instanceof Map ? after.eval : [:], expectedExpressionId) == row.expression)
-        boolean waitsVerified = waitIds == null || (action instanceof Map && action.wait instanceof List && action.wait.collect { it.toString() } == waitIds)
-        boolean conditionVerified = conditionId == null || (action instanceof Map && action.cond?.toString() == conditionId)
-        Map echoed = _nrSettings(ruleId, settings.collect { it.name })
-        boolean persisted = settings.every { echoed.get(it.name)?.type?.toString() == it.type && _nrComparableSetting(it.type, echoed.get(it.name)?.value) == _nrComparableSetting(it.type, it.value) }
-        if (!(listed && ordered && compiled && persisted && expressionVerified && waitsVerified && conditionVerified)) return reject.call([error: 'Native action compilation or input verification failed', settingsVerified: persisted, expressionVerified: expressionVerified, waitsVerified: waitsVerified, conditionVerified: conditionVerified])
-        boolean marked = !_nmActionLabel(ruleId, id)
-        boolean allowed = !marked || (editing && { unused ->
-            List markedIds = _ndMarkedNow(ruleId).rows.findAll { it.kind == 'condition' }*.id
-            [baseline, after].every { state -> _nmNamedConditions([actionList: [id], actions: state.actions, eval: state.eval], false).any { it in markedIds } }
-        }.call(null))
-        if (!allowed) return reject.call([error: 'Native action label is missing or broken'])
-        [success: true, id: id, action: action, partial: false, settingsVerified: true, expressionVerified: true, waitsVerified: true, conditionVerified: true]
-    } catch (Exception failure) {
-        mcpLogError('rm-native', "Native action change failed for rule ${ruleId}: ${failure.message}".toString(), failure)
-        reject.call([error: failure.message ?: 'Native action authoring failed'])
-    }
+    }.call(null)
 }
 private Map _nmCompileWait(Long ruleId, String actionId, List events, boolean editing) {
     String key = ".${actionId}".toString()
@@ -25679,7 +25746,9 @@ Map _nmDeleteRow(Long ruleId, String part, Object rowId) {
             _nmEntry(after.eval instanceof Map ? after.eval : [:], expression) == _nmEntry(before.eval instanceof Map ? before.eval : [:], expression)
         } && after.predCapabs == before.predCapabs
     } else {
-        referencesPreserved = ['eval', 'predCapabs', 'actions', part == 'trigger' ? 'capabsfalse' : 'capabstrue'].every { after.get(it) == before.get(it) }
+        boolean bound = after.predCapabs == before.predCapabs || (part == 'condition' && before.predCapabs instanceof List && after.predCapabs instanceof List &&
+            after.predCapabs*.toString() == before.predCapabs*.toString().findAll { it != id })
+        referencesPreserved = bound && ['eval', 'actions', part == 'trigger' ? 'capabsfalse' : 'capabstrue'].every { after.get(it) == before.get(it) }
     }
     boolean verified = deleted && preserved && ordered && cleaned && settingsPreserved && callbackConsumed && referencesPreserved
     [success: verified, partial: !verified, deleted: deleted, part: part, id: id,
@@ -25747,11 +25816,13 @@ private Boolean _ndNativeFlag(Map health, String name) {
 private List _ndSettings(Long id) {
     def response = _ndJson(hubInternalGet("/installedapp/settings/${id}"))
     if (!(response instanceof Map) || !(response.settings instanceof List)) throw new IllegalStateException('Native settings are unavailable')
+    if (response.settings.any { !(it instanceof Map) || !(it.name instanceof String) }) throw new IllegalStateException('Unexpected native setting row')
+    Map lock = _ruleLockParams(response.settings.collectEntries { [(it.name): it.value] })
     response.settings.collect { row ->
-        if (!(row instanceof Map) || !(row.name instanceof String)) throw new IllegalStateException('Unexpected native setting row')
-        boolean secret = _redactsCredentials() && (row.type == 'password' || _appConfigIsSecretSetting(row.name, row.type, row.value))
-        def setting = [name: row.name, type: row.type, multiple: row.multiple, value: secret ? null : row.value, deviceIds: row.deviceList instanceof Map ? row.deviceList.keySet().collect { it.toString() }.sort() : null]
+        boolean secret = _redactsCredentials() && (row.type == 'password' || _appConfigIsSecretSetting(row.name, row.type, row.value) || row.name in lock.names)
+        def setting = [name: row.name, type: row.type, multiple: row.multiple, value: secret ? null : _ruleSecretsMasked(row.value, lock), deviceIds: row.deviceList instanceof Map ? row.deviceList.keySet().collect { it.toString() }.sort() : null]
         if (secret) setting.redacted = true
+        else if (_redactsAccessTokens() && row.name ==~ /(?i)access_?token/ && row.value instanceof CharSequence) setting.value = _accessTokenRedactedMarker()
         setting
     }
 }
@@ -25838,7 +25909,7 @@ private List _ndLocalVariables(Long id) {
 private int _ndEnvelopeBytes(Map document) {
     groovy.json.JsonOutput.toJson(jsonRpcResult(0, [content: [[type: 'text', text: groovy.json.JsonOutput.toJson(document)]]])).getBytes('UTF-8').length
 }
-Map toolGetRuleDocument(Map args) {
+Map toolGetRuleDocument(Map args, Object health = null) {
     Long id = _ndId(args.ruleId)
     boolean withLocals = args.localVariables == true
     String toolName = withLocals ? 'hub_get_rule' : 'hub_set_rule'
@@ -25849,7 +25920,7 @@ Map toolGetRuleDocument(Map args) {
     def limit = read.limit
     _nrHandle(id)
     try {
-        def document = [health: _rmCheckRuleHealth(id as Integer), ruleId: id]
+        def document = health == false ? [ruleId: id] : [health: health ?: _rmCheckRuleHealth(id as Integer), ruleId: id]
         Map nativeState = sections.any { it in ['actions', 'conditions', 'triggers', 'expressions'] } ? _nrState(id) : null
         String key = withLocals ? 'localVariables' : 'variables'
         boolean readLocals = withLocals ? !(read.paged && sections[0] != key) : key in sections
@@ -25861,6 +25932,9 @@ Map toolGetRuleDocument(Map args) {
                 mcpLog('warn', 'rm-native', "${toolName}: rule ${id}'s local variables could not be read (${localsFailure.message})")
                 document.put(key, null)
                 document.localVariablesError = (localsFailure.message ?: localsFailure.toString()).toString()
+                if (read.paged && sections[0] == key) return [success: false, health: document.health, ruleId: id, localVariablesError: document.localVariablesError, cursor: cursor,
+                    error: "Rule ${id}'s local variables could not be read: ${document.localVariablesError}".toString(),
+                    note: "Nothing was read past this point; retry with the same cursor. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
             }
         }
         if ('actions' in sections) document.actions = (nativeState.actionList instanceof List ? nativeState.actionList : []).collect { actionId ->
@@ -25869,7 +25943,14 @@ Map toolGetRuleDocument(Map args) {
         if ('conditions' in sections) document.conditions = nativeState.capabsfalse instanceof Map ? nativeState.capabsfalse : [:]
         if ('triggers' in sections) document.triggers = nativeState.capabstrue instanceof Map ? nativeState.capabstrue : [:]
         if ('expressions' in sections) document.expressions = nativeState.eval instanceof Map ? nativeState.eval : [:]
-        if ('settings' in sections) document.settings = _ndSettings(id)
+        if ('settings' in sections) {
+            try { document.settings = _ndSettings(id) }
+            catch (Exception settingsFailure) {
+                String why = (settingsFailure.message ?: settingsFailure.toString()).toString()
+                return [success: false, health: document.health, ruleId: id, settings: null, settingsError: why, error: "Rule ${id} could not be read: ${why}".toString(),
+                    note: "The read does not open the rule's page or change its configuration, so retrying once is safe. If it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
+            }
+        }
         int budget = _responseSizeLimitBytes() - 1024
         String section = read.paged ? sections[0] : null
         boolean overCap = !read.paged && _ndEnvelopeBytes(document) > budget
@@ -25948,52 +26029,56 @@ private void _ndValidateFields(Object fields, List selectors, String selectorMes
     if (names.any { it in selectors }) throw new IllegalArgumentException(selectorMessage)
 }
 private void _ndValidateChange(Object change) {
-    if (!(change instanceof Map) || change.keySet().any { !(it in ['part', 'value']) } || !(change.value instanceof Map)) throw new IllegalArgumentException('Each change requires part and value')
-    def value = change.value
-    if (!ND_CHANGE_KEYS.containsKey(change.part) || value.keySet().any { !(it in ND_CHANGE_KEYS.get(change.part)) }) throw new IllegalArgumentException('Unknown change part or field')
-    if (value.containsKey('id') && (value.id == null || !value.id.toString().isInteger() || value.id.toString().toInteger() < (change.part == 'expression' ? 0 : 1))) throw new IllegalArgumentException('Invalid native row ID')
-    if (change.part in ['condition', 'trigger']) {
-        if (!(value.capability instanceof String) || !value.capability.trim()) throw new IllegalArgumentException('Native capability is required')
-        _ndValidateFields(value.get('fields'), ['tCapab1', 'rCapab_1'], 'Capability selector must not be repeated in fields')
-    }
-    if (change.part == 'action') {
-        if (!(value.type instanceof String) || !value.type.trim() || !(value.subtype instanceof String) || !value.subtype.trim() || (value.subtype.toLowerCase().contains('wait') && !(value.subtype in ['getWaitEvents', 'getWaitRule']))) throw new IllegalArgumentException('A supported native action type and subtype are required')
-        _ndValidateFields(value.get('fields'), ['actType.1', 'actSubType.1'], 'Action selectors must not be repeated')
-        if (value.containsKey('expression') && (!(value.expression instanceof List) || !value.expression || !(value.subtype in ND_EXPRESSION_SUBTYPES))) throw new IllegalArgumentException('Invalid action expression')
-        if (!value.containsKey('id') && value.subtype in ND_EXPRESSION_SUBTYPES && !value.containsKey('expression')) throw new IllegalArgumentException('New expression actions require expression tokens')
-        if (value.containsKey('condition')) {
-            _nmId(value.condition)
-            if (value.containsKey('expression') || value.type in ['condActs', 'repeatActs', 'delayActs']) throw new IllegalArgumentException('A simple condition requires an ordinary native action')
+    Closure checks = { wrapped ->
+        if (!(change instanceof Map) || change.keySet().any { !(it in ['part', 'value']) } || !(change.value instanceof Map)) throw new IllegalArgumentException('Each change requires part and value')
+        def value = change.value
+        if (!ND_CHANGE_KEYS.containsKey(change.part) || value.keySet().any { !(it in ND_CHANGE_KEYS.get(change.part)) }) throw new IllegalArgumentException('Unknown change part or field')
+        if (value.containsKey('id') && (value.id == null || !value.id.toString().isInteger() || value.id.toString().toInteger() < (change.part == 'expression' ? 0 : 1))) throw new IllegalArgumentException('Invalid native row ID')
+        if (change.part in ['condition', 'trigger']) {
+            if (!(value.capability instanceof String) || !value.capability.trim()) throw new IllegalArgumentException('Native capability is required')
+            _ndValidateFields(value.get('fields'), ['tCapab1', 'rCapab_1'], 'Capability selector must not be repeated in fields')
         }
-        if (value.subtype == 'getWaitEvents') {
-            if (!(value.events instanceof List) || !value.events || value.events.size() > 16) throw new IllegalArgumentException('Wait events require between 1 and 16 events')
-            value.events.eachWithIndex { event, index ->
-                try {
-                    if (!(event instanceof Map) || event.keySet().any { !(it in ['capability', 'fields']) } || !(event.capability instanceof String) || !event.capability.trim()) throw new IllegalArgumentException('Wait events require a capability and typed fields')
-                    _ndValidateFields(event.get('fields'), ['tCapab1'], 'Wait fields must not repeat selectors or native inputs')
-                } catch (IllegalArgumentException failure) { throw new IllegalArgumentException("events[${index}]: ${failure.message}".toString()) }
+        if (change.part == 'action') {
+            if (!(value.type instanceof String) || !value.type.trim() || !(value.subtype instanceof String) || !value.subtype.trim() || (value.subtype.toLowerCase().contains('wait') && !(value.subtype in ['getWaitEvents', 'getWaitRule']))) throw new IllegalArgumentException('A supported native action type and subtype are required')
+            _ndValidateFields(value.get('fields'), ['actType.1', 'actSubType.1'], 'Action selectors must not be repeated')
+            if (value.containsKey('expression') && (!(value.expression instanceof List) || !value.expression || !(value.subtype in ND_EXPRESSION_SUBTYPES))) throw new IllegalArgumentException('Invalid action expression')
+            if (!value.containsKey('id') && value.subtype in ND_EXPRESSION_SUBTYPES && !value.containsKey('expression')) throw new IllegalArgumentException('New expression actions require expression tokens')
+            if (value.containsKey('condition')) {
+                _nmId(value.condition)
+                if (value.containsKey('expression') || value.type in ['condActs', 'repeatActs', 'delayActs']) throw new IllegalArgumentException('A simple condition requires an ordinary native action')
             }
-        } else if (value.containsKey('events')) throw new IllegalArgumentException('Only wait-event actions accept events')
+            if (value.subtype == 'getWaitEvents') {
+                if (!(value.events instanceof List) || !value.events || value.events.size() > 16) throw new IllegalArgumentException('Wait events require between 1 and 16 events')
+                value.events.eachWithIndex { event, index ->
+                    try {
+                        if (!(event instanceof Map) || event.keySet().any { !(it in ['capability', 'fields']) } || !(event.capability instanceof String) || !event.capability.trim()) throw new IllegalArgumentException('Wait events require a capability and typed fields')
+                        _ndValidateFields(event.get('fields'), ['tCapab1'], 'Wait fields must not repeat selectors or native inputs')
+                    } catch (IllegalArgumentException failure) { throw new IllegalArgumentException("events[${index}]: ${failure.message}".toString()) }
+                }
+            } else if (value.containsKey('events')) throw new IllegalArgumentException('Only wait-event actions accept events')
+        }
+        if (change.part == 'expression' && (!value.containsKey('id') || !(value.tokens instanceof List) || !value.tokens)) throw new IllegalArgumentException('Expression ID and tokens are required')
+        if (change.part == 'expression' && value.id.toString() == '0') throw new IllegalArgumentException("Expression 0 is the Required Expression: change it with {part:'required', value:{tokens}}, which also updates the conditions it uses")
+        if (change.part == 'delete' && (!(value.part in ['action', 'condition', 'trigger']) || !value.containsKey('id'))) throw new IllegalArgumentException('Deletion requires a native collection and ID')
+        if (change.part == 'order') {
+            if (!(value.ids instanceof List) || value.ids.any { it == null || !it.toString().isInteger() || it.toString().toInteger() <= 0 } || value.ids.collect { it.toString() }.unique(false).size() != value.ids.size()) throw new IllegalArgumentException('Ordering requires unique positive native action IDs')
+        }
+        if (change.part == 'required' && (!(value.tokens instanceof List) || !value.tokens)) throw new IllegalArgumentException('Required expression tokens are required')
+        if (change.part == 'terminator' && !(value.subtype in ND_TERMINATOR_METHODS.keySet())) throw new IllegalArgumentException('Unsupported terminator')
+        def tokens = change.part in ['expression', 'required'] ? value.tokens : (change.part == 'action' ? value.expression : null)
+        if (tokens instanceof List) {
+            def operands = [:]
+            tokens.each { token -> if (token != null && token.toString().isInteger() && token.toString().toInteger() > 0) operands.put(token.toString(), 'condition') }
+            _nmTokens(tokens, operands)
+        }
+        if (change.part == 'variable') {
+            if (!(value.operation in ['create', 'set', 'delete']) || !(value.name instanceof String) || !(value.name ==~ /[A-Za-z_][A-Za-z0-9_ ]{0,79}/) || value.name != value.name.trim()) throw new IllegalArgumentException('Invalid native variable change')
+            if (value.operation in ['create', 'set'] && !value.containsKey('value')) throw new IllegalArgumentException('Variable value is required')
+            if (value.operation != 'create' && value.containsKey('type')) throw new IllegalArgumentException('Variable type is accepted only when creating a local variable')
+            if (value.operation == 'create') _nmLocalValue(value.type?.toString(), value.value)
+        }
     }
-    if (change.part == 'expression' && (!value.containsKey('id') || !(value.tokens instanceof List) || !value.tokens)) throw new IllegalArgumentException('Expression ID and tokens are required')
-    if (change.part == 'delete' && (!(value.part in ['action', 'condition', 'trigger']) || !value.containsKey('id'))) throw new IllegalArgumentException('Deletion requires a native collection and ID')
-    if (change.part == 'order') {
-        if (!(value.ids instanceof List) || value.ids.any { it == null || !it.toString().isInteger() || it.toString().toInteger() <= 0 } || value.ids.collect { it.toString() }.unique(false).size() != value.ids.size()) throw new IllegalArgumentException('Ordering requires unique positive native action IDs')
-    }
-    if (change.part == 'required' && (!(value.tokens instanceof List) || !value.tokens)) throw new IllegalArgumentException('Required expression tokens are required')
-    if (change.part == 'terminator' && !(value.subtype in ND_TERMINATOR_METHODS.keySet())) throw new IllegalArgumentException('Unsupported terminator')
-    def tokens = change.part in ['expression', 'required'] ? value.tokens : (change.part == 'action' ? value.expression : null)
-    if (tokens instanceof List) {
-        def operands = [:]
-        tokens.each { token -> if (token != null && token.toString().isInteger() && token.toString().toInteger() > 0) operands.put(token.toString(), 'condition') }
-        _nmTokens(tokens, operands)
-    }
-    if (change.part == 'variable') {
-        if (!(value.operation in ['create', 'set', 'delete']) || !(value.name instanceof String) || !(value.name ==~ /[A-Za-z_][A-Za-z0-9_ ]{0,79}/) || value.name != value.name.trim()) throw new IllegalArgumentException('Invalid native variable change')
-        if (value.operation in ['create', 'set'] && !value.containsKey('value')) throw new IllegalArgumentException('Variable value is required')
-        if (value.operation != 'create' && value.containsKey('type')) throw new IllegalArgumentException('Variable type is accepted only when creating a local variable')
-        if (value.operation == 'create') _nmLocalValue(value.type?.toString(), value.value)
-    }
+    checks.call(null)
 }
 private boolean _ndKnownRow(Map rows, String rowId, String missing) {
     if (rowId in rows.deleted) throw new IllegalArgumentException(missing)
@@ -26022,7 +26107,8 @@ private void _ndDropRow(Map rows, String rowId, String missing) {
     else { rows.predicted.remove(rowId); rows.added-- }
     rows.deleted << rowId
 }
-private void _ndPreflight(Long id, List changes) {
+private void _ndPreflight(Long id, List changes, Map marked = null) {
+    List inUse = marked?.inUse
     Map before = id == null ? [:] : _nrState(id)
     Map conditions = before.capabsfalse instanceof Map ? [:] + before.capabsfalse : [:]
     Map triggers = before.capabstrue instanceof Map ? [:] + before.capabstrue : [:]
@@ -26041,7 +26127,6 @@ private void _ndPreflight(Long id, List changes) {
     Map condTrigs = null
     boolean requiredOn = false
     Set freed = [] as Set
-    List inUse = null
     Closure references = { unused ->
         List names = requiredOn && expressions.get('0') instanceof List ? expressions.get('0')*.toString() : []
         projectedOrder.each { actionId ->
@@ -26071,6 +26156,8 @@ private void _ndPreflight(Long id, List changes) {
             List named = change.part in ['expression', 'required'] ? value.tokens :
                 (change.part == 'action' ? (value.expression instanceof List ? value.expression : []) + (value.containsKey('condition') ? [value.condition] : []) : [])
             named.findAll { it != null && it.toString().isInteger() }.each { token -> _ndKnownRow(rows.condition, token.toString(), 'Expression references an unknown condition') }
+            def gone = change.part in ['expression', 'required'] ? named.find { it?.toString() in (marked?.emptied ?: []) } : null
+            if (gone != null) throw new IllegalArgumentException("Expression names condition ${gone}, whose device is gone, so Rule Machine would mark it broken; repair or delete that condition first".toString())
             if (change.part == 'variable') {
                 if (locals == null) {
                     def fresh = _nrHandle(id).getAllLocalVars()
@@ -26139,7 +26226,6 @@ private void _ndPreflight(Long id, List changes) {
                 String target = value.id.toString()
                 _ndKnownRow(rows.condition, target, 'Native row does not exist')
                 if (target in condTrigs.values().findAll { it.ticked }*.cond) throw new IllegalArgumentException('Referenced trigger conditions must be detached before deletion')
-                if (id != null && inUse == null) inUse = _rmMarkedRows(_nrHandle(id), before, []).inUse
                 boolean held = target in references(null) || (inUse != null && target in inUse && !(target in freed))
                 if (held) throw new IllegalArgumentException('Referenced native conditions must be detached before deletion')
                 _ndDropRow(rows.condition, target, 'Native row does not exist')
@@ -26159,8 +26245,10 @@ private Map _ndMarkedNow(Long id) {
     _rmMarkedRows(_nrHandle(id), state, settings)
 }
 private Map _ndApply(Long id, List changes, boolean created, Map before = null) {
+    return { wrapped ->
     def outcomes = []
     boolean started = created
+    int stage = 0
     try {
         def beforeHealth = _ndRuleHealth(id)
         if (!(beforeHealth instanceof Map) || !(beforeHealth.broken instanceof Boolean)) throw new IllegalStateException('Native rule health is unavailable before changes')
@@ -26175,19 +26263,22 @@ private Map _ndApply(Long id, List changes, boolean created, Map before = null) 
         }
         for (change in changes) {
             def value = change.value
-            started = true
             Map outcome
-            switch (change.part) {
-                case 'condition': outcome = _nmUpsertCondition(id, false, value); break
-                case 'trigger': outcome = _nmUpsertCondition(id, true, value); break
-                case 'action': outcome = _nmUpsertAction(id, value); break
-                case 'expression': outcome = _nmSetExpression(id, value.id, value.tokens); break
-                case 'delete': outcome = _nmDeleteRow(id, value.part, value.id); break
-                case 'order': outcome = _nmOrderActions(id, value.ids); break
-                case 'required': outcome = _nmSetRequired(id, value.tokens); break
-                case 'variable': outcome = _nmLocal(id, value.operation, value.name, value.value, value.type); break
-                case 'terminator': outcome = _nmAddTerminator(id, value.subtype); break
-            }
+            boolean wrote = started
+            started = true
+            try {
+                switch (change.part) {
+                    case 'condition': outcome = _nmUpsertCondition(id, false, value); break
+                    case 'trigger': outcome = _nmUpsertCondition(id, true, value); break
+                    case 'action': outcome = _nmUpsertAction(id, value); break
+                    case 'expression': outcome = _nmSetExpression(id, value.id, value.tokens); break
+                    case 'delete': outcome = _nmDeleteRow(id, value.part, value.id); break
+                    case 'order': outcome = _nmOrderActions(id, value.ids); break
+                    case 'required': outcome = _nmSetRequired(id, value.tokens); break
+                    case 'variable': outcome = _nmLocal(id, value.operation, value.name, value.value, value.type); break
+                    case 'terminator': outcome = _nmAddTerminator(id, value.subtype); break
+                }
+            } catch (IllegalArgumentException refused) { started = wrote; throw refused }
             outcomes << [part: change.part, result: outcome]
             if (outcome?.success != true) {
                 boolean landed = created || outcomes.size() > 1 || outcome?.partial == true
@@ -26195,6 +26286,7 @@ private Map _ndApply(Long id, List changes, boolean created, Map before = null) 
                     error: outcome?.error?.toString() ?: "Native ${change.part} change did not verify".toString(), note: _ndFailureNote(landed, created)]
             }
         }
+        stage = 1
         ['selectTriggers', pages.actions, pages.primary].unique().each { page -> _ndRender(id, page) }
         def health = _ndRuleHealth(id)
         Map renderedState = _nrState(id) + (health instanceof Map ? health : [:])
@@ -26205,33 +26297,39 @@ private Map _ndApply(Long id, List changes, boolean created, Map before = null) 
         if (marks != null) {
             Map after = _ndMarkedNow(id)
             added = after.rows.findAll { row -> row.id != null && !marks.rows.any { it.kind == row.kind && it.id == row.id } }.collect { "${it.kind} ${it.id}".toString() }
-            after.marks.each { kind, count -> if (count > (marks.marks.get(kind) ?: 0)) added << "${kind} (${count} marked, ${marks.marks.get(kind) ?: 0} before)".toString() }
+            List grown = []
+            after.marks.each { kind, count -> if (count > (marks.marks.get(kind) ?: 0)) { grown << kind; added << "${kind} (${count} marked, ${marks.marks.get(kind) ?: 0} before)".toString() } }
+            List was = marks.rows.findAll { it.id == null }.collect { "${it.kind} ('${it.text}')".toString() }
+            List lost = marks.rows.findAll { row -> row.id != null && !after.rows.any { it.kind == row.kind && it.id == row.id } }*.kind
+            after.rows.findAll { it.id == null && !(it.kind in grown) }.each { row -> String key = "${row.kind} ('${row.text}')".toString(); if (!was.remove(key) && !lost.remove(row.kind)) added << key }
         }
         if (added) structuralIssues << "The write adds rows Rule Machine marks broken: ${added.join('; ')}".toString()
         if (structuralIssues) throw new IllegalStateException(structuralIssues.join('; '))
         def flag = _nrHandle(id).broken()
         boolean healthy = health instanceof Map && flag == false
         String unhealthy = flag == true ? "The change was written, but Rule Machine's own broken() check now calls rule ${id} broken, so Done was not pressed".toString() : 'Native rule health is broken or unverified'
-        if (!healthy) return [success: false, partial: true, ruleId: id, created: created, results: outcomes, broken: flag, error: unhealthy, note: _ndFailureNote(true, created)]
+        if (!healthy) return [success: false, partial: true, ruleId: id, created: created, results: outcomes, broken: flag, error: unhealthy, note: _ndFailureNote(true, created, 1)]
+        stage = 2
         def done = hubInternalPostFormRaw('/installedapp/update/json', 'id=' + id.toString() + '&_action_update=Done&_cancellable=true')
         def doneStatus = done instanceof Map ? done.get('status') : null
-        if (doneStatus != null && doneStatus.toString().isInteger() && doneStatus.toInteger() >= 400) throw new IllegalStateException('Native Done was rejected')
+        String failed = doneStatus != null && doneStatus.toString().isInteger() && doneStatus.toInteger() >= 400 ? 'Native Done was rejected' : null
         def doneBody = done instanceof Map ? done.get('data') : null
-        if (doneBody instanceof Map || (doneBody != null && doneBody.toString().trim())) _nfJson(doneBody)
+        if (failed == null && (doneBody instanceof Map || (doneBody != null && doneBody.toString().trim()))) _nfJson(doneBody)
         def finalHealth = _ndRuleHealth(id)
-        healthy = finalHealth instanceof Map && _nrHandle(id).broken() == false
-        if (!healthy) throw new IllegalStateException('Native rule health failed after Done')
-        boolean stopped = _ndNativeFlag(finalHealth, 'stopped') == true
-        boolean paused = _ndNativeFlag(finalHealth, 'paused') == true
-        if (!created) {
-            if (wasStopped != stopped) _nrHandle(id).appButtonHandler('stopRule')
-            if (wasPaused != paused) _nrHandle(id).appButtonHandler('pausRule')
+        boolean readable = finalHealth instanceof Map && finalHealth.broken instanceof Boolean
+        if (!created && readable) {
+            Boolean nowStopped = _ndNativeFlag(finalHealth, 'stopped')
+            Boolean nowPaused = _ndNativeFlag(finalHealth, 'paused')
+            if (nowStopped != null && nowStopped != wasStopped) _nrHandle(id).appButtonHandler('stopRule')
+            if (nowPaused != null && nowPaused != wasPaused) _nrHandle(id).appButtonHandler('pausRule')
             finalHealth = _ndRuleHealth(id)
-            stopped = finalHealth instanceof Map && _ndNativeFlag(finalHealth, 'stopped') == true
-            paused = finalHealth instanceof Map && _ndNativeFlag(finalHealth, 'paused') == true
-            healthy = finalHealth instanceof Map && _nrHandle(id).broken() == false && wasStopped == stopped && wasPaused == paused
-            if (!healthy) throw new IllegalStateException('Native stopped or paused state was not preserved')
+            readable = finalHealth instanceof Map && finalHealth.broken instanceof Boolean
         }
+        boolean stopped = readable && _ndNativeFlag(finalHealth, 'stopped') == true
+        boolean paused = readable && _ndNativeFlag(finalHealth, 'paused') == true
+        if (failed == null && !(readable && _nrHandle(id).broken() == false)) failed = 'Native rule health failed after Done'
+        if (failed == null && !created && (wasStopped != stopped || wasPaused != paused)) failed = 'Native stopped or paused state was not preserved'
+        if (failed != null) throw new IllegalStateException(failed)
         def status = _ndJson(hubInternalGet("/installedapp/statusJson/${id}"))
         if (!(status instanceof Map) || !status.containsKey('eventSubscriptions') || !status.containsKey('scheduledJobs')) throw new IllegalStateException('Native activation status is unavailable')
         def subscriptions = status.get('eventSubscriptions')
@@ -26252,26 +26350,39 @@ private Map _ndApply(Long id, List changes, boolean created, Map before = null) 
             persistedState.stPrimed == false
         if (actualTriggers && !stopped && !paused && !suppressed && subscriptions.empty && jobs.empty) throw new IllegalStateException('Native triggers have no active subscriptions or scheduled jobs')
         if (created && getAppByAppId(id)?.installed != true) throw new IllegalStateException('Native rule is not installed after Done')
-        Map written = [success: true, ruleId: id, created: created, results: outcomes, broken: false, stopped: stopped, paused: paused, eventSubscriptions: subscriptions, scheduledJobs: jobs, verification: 'Native persistence, compilation and activation checks passed; verify intended device behavior independently.']
+        Map lists = _appStatusLists(subscriptions, jobs)
+        Map written = [success: true, ruleId: id, created: created, results: outcomes, broken: false, stopped: stopped, paused: paused, eventSubscriptions: lists.eventSubscriptions, scheduledJobs: lists.scheduledJobs, verification: 'Native persistence, compilation and activation checks passed; verify intended device behavior independently.']
         if (suppressed) written.subscriptionSettle = 'SUPPRESSED: Required Expression is false'
+        int budget = _responseSizeLimitBytes() - 3072
+        if (_ndEnvelopeBytes(written) > budget) {
+            written.remove('eventSubscriptions')
+            written.remove('scheduledJobs')
+            written.eventSubscriptionCount = subscriptions.size()
+            written.scheduledJobCount = jobs.size()
+            written.results = outcomes.collect { [part: it.part, success: it.result?.success] }
+            written.trimmed = "The receipt is too large to return whole: results keep each change's part and success, and the activation lists are counts. hub_get_app_config(appId: ${id}, includeStatus: true) lists the subscriptions and jobs.".toString()
+        }
         Map document
-        try { document = toolGetRuleDocument([ruleId: id, sections: ['actions', 'conditions', 'triggers', 'expressions', 'variables']]) }
+        try { document = toolGetRuleDocument([ruleId: id, sections: ['actions', 'conditions', 'triggers', 'expressions', 'variables']], false) }
         catch (Exception readBack) { document = [success: false, error: readBack.message ?: readBack.toString()] }
         if (document.success == false) {
             written.documentReadError = document.error
             written.note = "The changes were written and verified; only reading the rule back failed. Do not send them again: read the rule with hub_set_rule(operation:'read') or hub_get_rule. See hub_get_tool_guide(section='set_rule_reference')."
-        } else if (document.pagedSection != null || _ndEnvelopeBytes(written + [document: document]) > _responseSizeLimitBytes() - 1024) {
+        } else if (document.pagedSection != null || _ndEnvelopeBytes(written + [document: document]) > budget) {
             written.documentOmitted = true
             written.note = "The changes were written and verified; the rule's document is too large to return with them. Do not send them again: read it one section at a time with hub_set_rule(operation:'read', args:{sections:['actions'], cursor:'', limit:50}) and follow nextCursor. See hub_get_tool_guide(section='set_rule_reference')."
         } else written.document = document
         written
     } catch (Exception failure) {
         mcpLogError('rm-native', "hub_set_rule ${created ? 'create' : 'update'} failed for rule ${id}: ${failure.message}".toString(), failure)
-        [success: false, partial: started, ruleId: id, created: created, results: outcomes, remaining: changes.drop(outcomes.size()), error: failure.message?.toString(), note: _ndFailureNote(started, created)]
+        [success: false, partial: started, ruleId: id, created: created, results: outcomes, remaining: changes.drop(outcomes.size()), error: failure.message?.toString(), note: _ndFailureNote(started, created, stage)]
     }
+    }.call(null)
 }
-private String _ndFailureNote(boolean landed, boolean created) {
-    String written = landed ? "Changes before the failure may have been written; read the rule with hub_set_rule(operation:'read') and resubmit only what is missing." : 'No change was written.'
+private String _ndFailureNote(boolean landed, boolean created, int stage = 0) {
+    String written = stage == 2 ? "Every change was written and Done was sent, but it may or may not have taken, or a check after it failed. Do not send the changes again: read the rule with hub_get_rule before anything else." :
+        stage == 1 ? "Every change was written, but a check after the write failed, so Done was not pressed. Do not send the changes again: read the rule with hub_get_rule, then repair it or restore the backup." :
+        landed ? "Changes before the failure may have been written; read the rule with hub_set_rule(operation:'read') and resubmit only what is missing." : 'No change was written.'
     String recovery = created ? ' The new rule exists; delete it with hub_delete_native_app if it is not wanted.' : " An update's response carries backup.backupKey for hub_restore_backup when pre-edit backups are on."
     (written + recovery + " See hub_get_tool_guide(section='set_rule_reference').").toString()
 }
@@ -26286,21 +26397,15 @@ Map toolUpdateRuleDocument(Map args) {
     try {
         _nrHandle(id)
         if (getAppByAppId(id)?.disabled == true) throw new IllegalArgumentException('Enable the native rule before editing its document')
-        try { _ndPreflight(id, changes) }
-        catch (Exception failure) { return [success: false, partial: false, ruleId: id, error: failure.message?.toString()] }
-        Map beforeHealth = _rmCheckRuleHealth(id as Integer)
+        Map marked = [:]
+        Map beforeHealth = _rmCheckRuleHealth(id as Integer, marked)
         if (beforeHealth.broken == true) {
             String rows = beforeHealth.brokenRows ? ': ' + beforeHealth.brokenRows.collect { "${it.kind} ${it.id}" + (it.text ? " ('${it.text}')" : '') }.unique().join('; ') : ''
             return [success: false, partial: false, ruleId: id, broken: true, brokenRows: beforeHealth.brokenRows, checkErrors: beforeHealth.checkErrors,
                 error: "Rule ${id} is already broken${rows}; no change was written.".toString(),
                 note: "Repair the broken rows first: open the rule with hub_set_rule(operation:'form') or in the Hubitat UI and replace or remove what refers to the missing device or variable, then retry. hub_get_rule lists the broken rows; see hub_get_tool_guide(section='set_rule_reference').".toString()]
         }
-        boolean unread = beforeHealth.broken == null || beforeHealth.disabledActions == null || beforeHealth.brokenRows == null
-        Map marked = null
-        if (!unread) {
-            try { marked = _ndMarkedNow(id) }
-            catch (Exception markFailure) { unread = true; beforeHealth.checkErrors << "marked rows: ${markFailure.message ?: markFailure.toString()}".toString() }
-        }
+        boolean unread = beforeHealth.broken == null || beforeHealth.disabledActions == null || beforeHealth.brokenRows == null || !marked
         if (unread) {
             String why = beforeHealth.broken == null ? "broken flag could not be read before the write, so whether it is already broken is unknown" :
                 beforeHealth.disabledActions == null ? "compiled state could not be read before the write, so it is not known to be intact" :
@@ -26309,6 +26414,8 @@ Map toolUpdateRuleDocument(Map args) {
                 error: "Rule ${id}'s ${why}; no change was written.".toString(),
                 note: "checkErrors says why. Check that the hub answers with hub_get_info, then read the rule with hub_get_rule: send the update once its health reads broken:false and lists disabledActions and brokenRows. If it stays unreadable, check the rule in the Hubitat UI or with hub_set_rule(operation:'form') before editing it. See hub_get_tool_guide(section='set_rule_reference')."]
         }
+        try { _ndPreflight(id, changes, marked) }
+        catch (Exception failure) { return [success: false, partial: false, ruleId: id, error: failure.message?.toString()] }
         Map backup
         try { backup = _ndEditBackup(id, 'pre-document-update') }
         catch (Exception failure) { return [success: false, partial: false, ruleId: id, error: "Pre-edit backup failed; no document changes were applied: ${failure.message}".toString()] }
@@ -26464,12 +26571,12 @@ Read hub_set_rule(operation:"read",ruleId,args:{sections:[...]}) before editing 
 
 For large rules, read one section with args:{sections:["settings"],cursor:"",limit:50}. Paging requires exactly one section; limit is 1..100 (default 50). The section keeps its usual map or list shape. Pass the returned top-level nextCursor into args.cursor until nextCursor is null. page returns offset, limit, total and revision, a hash of the complete section; restart if revision changes. Pages may contain fewer than limit rows to fit the response size cap; a row too large to send beside the health alone returns success:false with the health, never truncated. Actions retain native order, settings sort by name, and map sections sort by string key. Omit cursor and limit for an unpaged read; one too large for the response cap returns health and the parts that fit whole, pages the first part that does not (pagedSection, nextCursor) and lists the other parts that do not fit in omittedSections.
 
-Writes require confirm=true and a recent hub backup. Automatic pre-edit recovery is enabled by default: an update captures one recovery point for its whole changes batch, and a rule form captures one before its first render and reuses it through that workflow. Recovery metadata is returned as backup, including after partial failure; capture failure stops the requested edit. Rule Machine parent creation/navigation has no existing child configuration to recover; opening the child starts its own protected workflow. hub_set_rule(operation:"update",ruleId,args:{changes:[...]},confirm:true) applies changes in order. hub_set_rule(operation:"create",args:{parentId,name,changes:[...]},confirm:true) creates a Rule-5.1 child under native Rule Machine; parentId is the installed Rule Machine app's id, which hub_list_apps(scope:"instances") lists. A failed creation can leave a native child: inspect returned ruleId and parent before retrying. A partial update can leave preceding changes committed; inspect before resubmitting. An update first reads the same health and, before any backup or write, refuses a rule that is already broken (its own broken() check), naming each marked row by kind and native id (trigger 2), or a rule whose broken flag, compiled state or marked rows cannot be read, with checkErrors saying why: repair broken rows with operation:"form" or in the Hubitat UI. A rule whose page marks rows without being broken (a condition whose device was deleted) is updated: brokenRowsBefore lists the rows marked before the write, and the write fails only if it adds a newly marked row, so it can also repair them.
+Writes require confirm=true and a recent hub backup. Automatic pre-edit recovery is enabled by default: an update captures one recovery point for its whole changes batch, and a rule form captures one before its first render and reuses it through that workflow. Recovery metadata is returned as backup, including after partial failure; capture failure stops the requested edit. Rule Machine parent creation/navigation has no existing child configuration to recover; opening the child starts its own protected workflow. hub_set_rule(operation:"update",ruleId,args:{changes:[...]},confirm:true) applies changes in order. hub_set_rule(operation:"create",args:{parentId,name,changes:[...]},confirm:true) creates a Rule-5.1 child under native Rule Machine; parentId is the installed Rule Machine app's id, which hub_list_apps(scope:"instances") lists. A failed creation can leave a native child: inspect returned ruleId and parent before retrying. A partial update can leave preceding changes committed; inspect before resubmitting. An update first reads the same health and, before any backup or write, refuses a rule that is already broken (its own broken() check), naming each marked row by kind and native id (trigger 2), or a rule whose broken flag, compiled state or marked rows cannot be read, with checkErrors saying why: repair broken rows with operation:"form" or in the Hubitat UI. A rule whose page marks rows without being broken (a condition whose device was deleted) is updated: brokenRowsBefore lists the rows marked before the write, and the write fails only if it adds a newly marked row, so it can also repair them. An action change whose action comes back marked or with no label is rolled back, even when it was marked before: an action left gated on a marked condition turns the rule's own broken() check true, so move the action to another condition, or repair or delete that condition, first. After a check that follows the writes fails, every change is on the rule: do not send them again, read the rule and repair it or restore the backup.
 
 Each change is {part,value}. Supported parts:
 - condition or trigger: {id?,capability,fields:[{name,type,value}]}.
 - action: {id?,type,subtype,fields:[{name,type,value}],expression?,events?,condition?}. condition is an existing native condition ID for a Simple Conditional Action.
-- expression: {id,tokens}; required: {tokens}.
+- expression: {id,tokens}, id 1 or more; required: {tokens} sets the Required Expression (expression 0, which an expression change refuses).
 - getWaitEvents actions accept events:[{capability,fields}] (1 through 16 native event rows); an edit preserves the event count. Duration fields remain native typed fields.
 - getWaitRule actions accept expression tokens, with optional native timeout/duration fields. New IF, ELSE-IF and Wait for Expression actions require expression tokens.
 - variable: {operation:create|set|delete,name,type?,value?}. Create types: integer,bigdecimal,boolean,string,datetime. DateTime uses native ISO text, e.g. 2026-01-01T12:30:00.000-0500; native date-only/time-only sentinels are accepted.
@@ -26479,7 +26586,7 @@ Each change is {part,value}. Supported parts:
 
 Typed fields use exact native names containing # for the allocated ID, for example logmsg.#. Expressions use existing native condition IDs and (, ), NOT, AND, OR, XOR. Omit an id to append; provide an existing native id to edit. Field names and capability/action variants require verified native contracts; not every capability-specific variant is supported. Discover native options through operation:"form" when a document contract is unavailable. Unknown fields cannot be assumed to compile correctly merely because a setting persists. A successful result establishes native model checks, typed readback, native editor diagnostics, expression-reference checks and nonbroken health with activation status; independently verify device behavior and native UI editing for the intended automation.
 
-Example changes: [{part:"action",value:{type:"messageActs",subtype:"getLogMsg",fields:[{name:"logmsg.#",type:"textarea",value:"Document action"}]}}]. Writes render the native trigger/action/main pages, check health, submit native Done, and read subscriptions plus a fresh document; a document too large to send with the result is left out (documentOmitted:true), so read it by section. These pages can mutate native state; a document read renders none of them.
+Example changes: [{part:"action",value:{type:"messageActs",subtype:"getLogMsg",fields:[{name:"logmsg.#",type:"textarea",value:"Document action"}]}}]. Writes render the native trigger/action/main pages, check health, submit native Done, and read subscriptions plus a fresh document (without health: the write's own checks stand for it); a document too large to send with the result is left out (documentOmitted:true), so read it by section, and a receipt still too large keeps each change's part and success and counts the subscriptions and jobs (trimmed says so). These pages can mutate native state; a document read renders none of them.
 
 ## Native Rule Forms
 
@@ -26500,7 +26607,7 @@ private String _nfText(Object value) { _nfEntities(value?.toString()?.replaceAll
 private String _nfEntities(String value) {
     value.replace('&quot;', '"').replace('&#39;', "'").replace('&apos;', "'").replace('&lt;', '<').replace('&gt;', '>').replace('&nbsp;', ' ').replace('&amp;', '&')
 }
-private String _nfKey(Long id) { "${app.id}:${id}".toString() }
+private String _nfKey(Long id) { "${app?.id}:${id}".toString() }
 private String _nfCallerKey() { "${app.id}:caller:${callerClient == null ? 'main' : 'client:' + callerClient.id}".toString() }
 private Map _nfJson(Object value) {
     def parsed
@@ -28067,7 +28174,7 @@ mappings {
     }
 }
 def hubResponseCapBytes() { 131072 }
-def _responseSizeLimitBytes() { _isCloudRequest() ? 99000 : hubResponseCapBytes() - 11072 }
+def _responseSizeLimitBytes() { (mrtrWorkerSliceStartedAt == null ? _isCloudRequest() : _requestSetting('requestSource') != 'local') ? 99000 : hubResponseCapBytes() - 11072 }
 def handleHealth() {
     if (!_transportEnabled()) {
         return render(status: 403, contentType: "application/json",
@@ -30876,7 +30983,8 @@ private boolean _appConfigSecretName(name) {
     if (raw ==~ /(?i)access_?token/) return false
     String lower = raw.toLowerCase()
     if (!(lower.contains("pass") || lower.contains("pwd") || lower.contains("secret") || lower.contains("token") ||
-          lower.contains("key") || lower.contains("credential") || lower.contains("psk") || lower.contains("pin") || lower.contains("code"))) return false
+          lower.contains("key") || lower.contains("credential") || lower.contains("psk") || lower.contains("pin") || lower.contains("code") ||
+          lower.contains("psw") || lower.contains("cookie") || lower.contains("session") || lower.contains("bearer"))) return false
     String spaced = raw.replaceAll(/([a-z0-9])([A-Z])/, '$1 $2').replaceAll(/([A-Z]+)([A-Z][a-z])/, '$1 $2')
     List words = spaced.toLowerCase().split(/[^a-z]+/).findAll { part -> part }
     Set metadata = ["count", "counter", "cnt", "expiry", "expires", "expire", "expired", "expiration", "time",
@@ -30897,7 +31005,8 @@ private boolean _appConfigSecretName(name) {
         boolean hit = w.contains("password") || w.contains("passwd") || w.contains("passphrase") ||
             w.contains("passcode") || w.contains("pwd") || w.contains("apikey") || w.contains("privatekey") ||
             w.contains("accesskey") || (w.contains("secret") && !w.startsWith("secretar")) ||
-            w.endsWith("token") || w.endsWith("tokens") || w.startsWith("credential") || w == "psk" ||
+            w.endsWith("token") || w.endsWith("tokens") || w.startsWith("credential") || w == "psk" || w == "psw" ||
+            w.endsWith("cookie") || w.endsWith("cookies") || w == "session" || w == "sessions" || w.startsWith("bearer") ||
             (w == "pass" && prev != "by" && (next == null || next in ["word", "phrase", "code", "key"])) ||
             (keyQualifiers.contains(w) && (next == "key" || next == "keys")) ||
             (w in ["pin", "pins", "pincode", "pincodes"] && (qualified ? !(prev in boardPins) : !(prev in hardwarePins))) ||
@@ -34412,8 +34521,8 @@ Boolean _appStateFlag(Object value) {
     if (value == "false") return false
     return null
 }
-Map _appStatusRead(Integer appId) {
-    def status = _rmFetchStatusJson(appId)
+Map _appStatusRead(Integer appId, Object fetched = null) {
+    def status = fetched ?: _rmFetchStatusJson(appId)
     def rawState = status.appState
     List appState
     if (rawState == null) appState = []
@@ -34432,21 +34541,54 @@ Map _appStatusRead(Integer appId) {
         def value = _appStateMasked(key, row.value)
         if (maskTokens) value = _redactAccessTokens([(key): value]).get(key)
         [name: row.name, value: value]
-     },
-     eventSubscriptions: sections.eventSubscriptions ?: [], scheduledJobs: sections.scheduledJobs ?: [],
+     }] + _appStatusLists(sections.eventSubscriptions, sections.scheduledJobs) + [
      appSettings: (sections.appSettings ?: []).findAll { it instanceof Map }.collect { row ->
         def ids = row.deviceIdsForDeviceList instanceof List ? row.deviceIdsForDeviceList : []
         if (!ids && row.deviceList instanceof Map) ids = row.deviceList.keySet().toList()
-        [name: row.name?.toString(), type: row.type?.toString(), value: _appStateMasked(row.name?.toString(), row.value), deviceIds: ids.collect { it.toString() }]
+        [name: row.name?.toString(), type: row.type?.toString(), value: _appStateMasked(row.name?.toString(), row.value, row.type?.toString()), deviceIds: ids.collect { it.toString() }]
      },
      installedApp: [label: status.installedApp?.label?.toString(), disabled: status.installedApp?.disabled,
                     typeName: status.installedApp?.appType?.name?.toString(), namespace: status.installedApp?.appType?.namespace?.toString()]]
 }
-private Object _appStateMasked(String name, Object value) {
-    if (_appConfigMasksSetting(name, null, value)) return _appConfigRedactedMarker()
-    if (value instanceof Map) return value.collectEntries { k, v -> [(k): _appStateMasked(k?.toString(), v)] }
-    if (value instanceof List) return value.collect { item -> _appStateMasked(name, item) }
+private Object _appStateMasked(String name, Object value, String type = null, String parent = null) {
+    boolean secret = _appConfigMasksSetting(name, type, value) || (parent != null && _appConfigMasksSetting("${parent} ${name}".toString(), type, value))
+    if (secret) return _appConfigRedactedMarker()
+    String row = value instanceof Map && value.name instanceof CharSequence && value.containsKey('value') ? value.name.toString() : null
+    if (value instanceof Map) return value.collectEntries { k, v -> [(k): k == 'value' && row != null ? _appStateMasked(row, v) : _appStateMasked(k?.toString(), v, null, name)] }
+    if (value instanceof List) return value.collect { item -> _appStateMasked(name, item, null, parent) }
     value
+}
+private Map _appStatusLists(Object subscriptions, Object jobs) {
+    Map lists = _ruleSecretsMasked([eventSubscriptions: _appStateMasked('eventSubscriptions', subscriptions ?: []), scheduledJobs: _appStateMasked('scheduledJobs', jobs ?: [])], [names: [], codes: []])
+    _redactsAccessTokens() ? _redactAccessTokens(lists) : lists
+}
+private Map _ruleLockParams(Map settings) {
+    List actions = settings.findAll { k, v -> k.toString() ==~ /cCmd\.\d+/ && v?.toString() == 'setCode' }.collect { k, v -> k.toString().substring(5) }
+    List names = actions ? settings.keySet().collect { it.toString() }.findAll { k -> actions.any { k ==~ /cpVal\d+\.${it}/ } } : []
+    [names: names, codes: names.collect { settings.get(it)?.toString() }.findAll { it ==~ /\d{4,}/ }]
+}
+private Object _ruleSecretsMasked(Object value, Map lock) {
+    if (!_redactsCredentials()) return value
+    String marker = _appConfigRedactedMarker()
+    Closure walk
+    walk = { node, String key ->
+        if (node != null && key in lock.names) return marker
+        String row = node instanceof Map && node.name instanceof CharSequence && node.containsKey('value') ? node.name.toString() : null
+        if (node instanceof Map) return node.collectEntries { k, v -> [(k): walk.call(v, k == 'value' && row != null ? row : k?.toString())] }
+        if (node instanceof List) return node.collect { walk.call(it, key) }
+        if (!(node instanceof CharSequence)) return node
+        String text = node.toString().replaceAll(/(?i)([?&](?!access_?token=)(?:[\w.\-]*[_.\-])?(?:api_?key|key|token|secret|pass|passwd|password|pwd|auth|sig|signature|pin)=)(?!\*\*\*redacted)[^&\s"'<>#]+/, '$1' + marker)
+        if (text =~ /\s/) lock.codes.each { code -> text = text.replaceAll('(?<![\\w.])' + java.util.regex.Pattern.quote(code) + '(?![\\w.])', marker) }
+        (lock.texts ?: []).each { secret -> text = text.replace(secret, marker) }
+        text
+    }
+    walk.call(value, null)
+}
+Map _appStatusFlagsRead(Integer appId) {
+    def raw = _rmFetchStatusJson(appId).appState
+    if (raw != null && !(raw instanceof Map) && !(raw instanceof List)) throw new IllegalStateException("App ${appId}'s status page returned appState in an unexpected shape")
+    List rows = raw instanceof Map ? raw.collect { k, v -> [name: k?.toString(), value: v] } : (raw ?: []).findAll { it instanceof Map }
+    [appStateMissing: raw == null, appState: rows.findAll { it.name?.toString() in ['paused', 'stopped', 'private'] }]
 }
 private Map _appStatusFlag(Map status, String name) {
     if (status?.appStateMissing == true) return [present: false, value: null, missing: true]
@@ -34523,7 +34665,7 @@ private List _rmStructuralIssuesFromSequence(List<Map> sequence) {
                 }
             }
         } else if (aType == "repeatActs") {
-            if (sType == "getRepeat" || sType == "getWhile") {
+            if (sType in ["getRepeat", "getWhile", "getUntil", "getRepeatWhile"]) {
                 stack << [kind: "repeat", openIdx: idx]
             } else if (sType == "getEndRepeat") {
                 if (stack.isEmpty()) {
@@ -34554,6 +34696,8 @@ private String _rmActTypeForStructuralSubType(String subType) {
             return "condActs"
         case "getRepeat":
         case "getWhile":
+        case "getUntil":
+        case "getRepeatWhile":
         case "getEndRepeat":
             return "repeatActs"
         default: return null
@@ -34628,23 +34772,29 @@ boolean _rmIsEditableRuleType(namespace, name) {
     return namespace?.toString() == 'hubitat' && name?.toString() in ['Rule-5.1', 'Button Rule-5.1']
 }
 Map _rmMarkedRows(handle, Map compiled, List settings) {
-    Map marks = [trigger: handle.triggerLabel(), condition: handle.conditionLabel(), action: handle.actionLabel()].collectEntries { kind, text ->
-        [(kind): text == null ? 0 : text.toString().findAll(/<span\b[^>]*>\s*\*\*Broken [^*]+\*\*\s*<\/span>/).size()]
+    return { wrapped ->
+    String marker = /<span\b[^>]*>\s*\*\*Broken [^*]+\*\*\s*<\/span>/
+    Map labels = [trigger: handle.triggerLabel(), condition: handle.conditionLabel(), action: handle.actionLabel()]
+    Map marks = labels.collectEntries { kind, text -> [(kind): text == null ? 0 : text.toString().findAll(marker).size()] }
+    Map lock = _ruleLockParams(settings.collectEntries { [(it.name?.toString()): it.value] })
+    Map lines = labels.collectEntries { kind, text ->
+        [(kind): text == null ? [] : text.toString().split(/(?i)<br\s*\/?>|\n/).findAll { it =~ marker }.collect { _ruleSecretsMasked(it.replaceAll(/<[^>]+>/, '').trim(), lock) }]
     }
     def state = handle.getState()
     List inUse = state instanceof Map && state.inUseConds != null ? state.inUseConds.toString().findAll(/\d+/) : []
     boolean required = settings.any { it.name == 'useST' && it.value?.toString() == 'true' }
-    if (required) required = compiled.eval instanceof Map && compiled.eval.get('0') instanceof List
-    if (required) inUse.addAll(compiled.eval.get('0').collect { it.toString() }.findAll { it ==~ /\d+/ })
+    def expression = required && compiled.eval instanceof Map ? _nmEntry(compiled.eval, '0') : null
+    if (expression instanceof List) inUse.addAll(expression.collect { it.toString() }.findAll { it ==~ /\d+/ })
     settings.each { setting ->
         String name = setting.name?.toString()
         boolean binds = name?.startsWith('condTrig.') && setting.value != null
         String triggerId = binds ? name.substring(9) : null
-        if (binds) binds = compiled.capabstrue instanceof Map && compiled.capabstrue.containsKey(triggerId)
+        if (binds) binds = compiled.capabstrue instanceof Map && compiled.capabstrue.keySet().any { it.toString() == triggerId }
         if (binds) binds = settings.any { it.name == 'isCondTrig.' + triggerId && it.value?.toString() == 'true' }
         if (binds) inUse << setting.value.toString()
     }
     def rows = []
+    List emptied = []
     settings.each { setting ->
         if (!setting.type?.startsWith('capability') || setting.deviceIds) return
         String kind = null
@@ -34654,18 +34804,28 @@ Map _rmMarkedRows(handle, Map compiled, List settings) {
             if (match.matches()) { kind = k; id = match.group(1) }
             kind != null
         }
+        if (kind == 'condition') emptied << id
         if (kind == null || !marks.get(kind)) return
         def stored = [trigger: compiled.capabstrue, condition: compiled.capabsfalse, action: compiled.actions].get(kind)
         def held = kind == 'condition' ? inUse : (kind == 'action' ? compiled.actionList : (stored instanceof Map ? stored.keySet() : null))
         if (!(id in (held ?: [])*.toString())) return
         Map row = [kind: kind, id: id, setting: setting.name]
-        if (stored instanceof Map && stored.get(id) instanceof String) row.text = stored.get(id)
+        def text = stored instanceof Map ? _nmEntry(stored, id) : null
+        if (text instanceof String) row.text = _ruleSecretsMasked(text, lock)
         rows << row
     }
-    marks.each { kind, count -> if (count && !rows.any { it.kind == kind }) rows << [kind: kind, id: null] }
+    rows = rows.unique()
+    lines.each { kind, found ->
+        List known = rows.findAll { it.kind == kind && it.text }*.text
+        List free = found.findAll { line -> !known.any { line.contains(it) } }
+        int extra = found.size() - rows.count { it.kind == kind }
+        if (extra <= 0 && marks.get(kind) && !rows.any { it.kind == kind }) extra = 1
+        for (i in 0..<Math.max(extra, 0)) rows << [kind: kind, id: null, text: i < free.size() ? free[i] : null]
+    }
     def kinds = ['trigger', 'condition', 'action']
-    [rows: rows.unique().sort { a, b -> kinds.indexOf(a.kind) <=> kinds.indexOf(b.kind) ?: (a.id ?: '0').toInteger() <=> (b.id ?: '0').toInteger() ?: a.setting <=> b.setting },
-     marks: marks, inUse: inUse]
+    [rows: rows.sort { a, b -> kinds.indexOf(a.kind) <=> kinds.indexOf(b.kind) ?: (a.id ?: '0').toInteger() <=> (b.id ?: '0').toInteger() ?: a.setting <=> b.setting ?: a.text <=> b.text },
+     marks: marks, inUse: inUse, emptied: emptied]
+    }.call(null)
 }
 private List _rmDisabledRowIds(Map compiled, String key, List checkErrors) {
     if (!compiled.containsKey(key) || compiled.get(key) == null) return []
@@ -34674,7 +34834,7 @@ private List _rmDisabledRowIds(Map compiled, String key, List checkErrors) {
     checkErrors << "the rule's ${key} is not a list (${value}), so its disabled rows were not read".toString()
     return null
 }
-Map _rmCheckRuleHealth(Integer appId) {
+Map _rmCheckRuleHealth(Integer appId, Map marked = null) {
     def issues = []
     def checkErrors = []
     def result = [ok: false, unreadable: true, broken: null, ruleFormat: null, label: null, disabled: null,
@@ -34755,7 +34915,11 @@ Map _rmCheckRuleHealth(Integer appId) {
         }
         String rowsUnread = compiled == null ? "the rule's compiled state went unread" : (status == null || status.appSettingsMalformed ? "the rule's settings went unread" : null)
         if (rowsUnread == null) {
-            try { result.brokenRows = _rmMarkedRows(handle, compiled, status.appSettings).rows }
+            try {
+                Map rows = _rmMarkedRows(handle, compiled, status.appSettings)
+                result.brokenRows = rows.rows
+                if (marked != null) marked.putAll(rows)
+            }
             catch (Exception labelErr) { rowsUnread = "the rule's label methods failed (${labelErr.message ?: labelErr.toString()})".toString() }
         }
         if (rowsUnread != null) {
@@ -36108,8 +36272,8 @@ A single tool can also be switched off under **Advanced: Per-tool Overrides**. A
   - `pageNote` appears when the hub rendered another page than `pageName`: the app reaches that page only through its link, so open it in a form workflow.
   - Each input is the field hub_set_native_app(operation='form') returns; a device picker adds `selected`, its devices with labels. `unsupported` lists page parts a form cannot drive, such as a community app's create button. When the page cannot be modelled, `formError` says why: inputs carry no values and there are no controls.
   - `appType.namespace` and `appType.name` name the type; `appType.system` and `appType.menu` are the fields hub_list_apps(scope='types') gives for every type at once.
-  - `includeSettings=true` adds the raw settings map: 500-1000 app-encoded keys on large apps (Room Lighting stores per-device scene levels as `dm~<deviceId>~<scene>`). Secrets read `***redacted (password)***`: every setting the hub types as a password, on any page, and free-text settings with credential-shaped names (password, pass, secret, token, API key, credential, PIN, lock or alarm code, ...). OAuth accessToken settings follow the Hide access tokens setting. Page inputs read as in the form tools: a password input carries no value and `redacted: true`; a credential-named input reads the marker. With Hide passwords and credentials turned off in the MCP app's settings they read as stored. When the setting types cannot be read the map is withheld and `settingsNote` says why.
-  - `includeStatus=true` adds the app's App Status lists, for any app and also with `summary=true`: `appState` (the app's stored state as `[{name, value}]`; a community app's working data, a webCoRE piston's definition, logs and trace), `eventSubscriptions` and `scheduledJobs`. With Hide passwords and credentials on, a value whose name looks like a credential reads `***redacted (password)***`, also inside nested maps (a rule's local variables); `statusRedactionNote` says so. Access tokens (an `accessToken` entry, each per-client token in `clientTokens`) read `***redacted (access token)***` whenever Hide access tokens is on, and always for a per-client token; `statusRedactionNote` also says whether an app's stored token is shown; for a per-client token it says both are always hidden. A status page that carried no app state reads `appState: []` with `appStateMissing: true`, unlike an app whose state is empty. When the lists would push the response past the size cap (a webCoRE piston's state can), `appState` lists names only with its values omitted, `statusTruncated` is true and `statusTruncatedNote` says what was cut; if that is still too large, `eventSubscriptions` and `scheduledJobs` are cut too, with `eventSubscriptionsTotal` / `scheduledJobsTotal` giving their full counts, and as a last resort `appState` is left out with `appStateTotal` giving its count. When the status page cannot be read the three lists are omitted and `statusNote` says why. hub_get_rule counts a rule's subscriptions and jobs from the same read.
+  - `includeSettings=true` adds the raw settings map: 500-1000 app-encoded keys on large apps (Room Lighting stores per-device scene levels as `dm~<deviceId>~<scene>`). Secrets read `***redacted (password)***`: every setting the hub types as a password, on any page, and free-text settings with credential-shaped names (password, pass, psw, secret, token, API key, credential, cookie, session, bearer, PIN, lock or alarm code, ...). A secret-named URL query parameter (an HTTP action's `apikey=` or `token=`) and every parameter of a lock-code custom action (setCode, whose parameters carry the PIN) read the marker too, in the settings and in the page's inputs, links and text; other free-text values are not recognised. OAuth accessToken settings follow the Hide access tokens setting. Page inputs read as in the form tools: a password input carries no value and `redacted: true`; a credential-named input reads the marker. With Hide passwords and credentials turned off in the MCP app's settings they read as stored. When the setting types cannot be read the map is withheld and `settingsNote` says why.
+  - `includeStatus=true` adds the app's App Status lists, for any app and also with `summary=true`: `appState` (the app's stored state as `[{name, value}]`; a community app's working data, a webCoRE piston's definition, logs and trace), `eventSubscriptions` and `scheduledJobs`. With Hide passwords and credentials on, a value whose name looks like a credential (a session cookie included) reads `***redacted (password)***`, also inside nested maps and lists, where a key is judged on its own and after its parent's name (a bare `code` under `lockCodes`) and a `{name, value}` row by its name; in `eventSubscriptions` and `scheduledJobs` map data is masked by key name the same way, while string data (a hub stores `subscriptionData` as a string such as `"3"`) is shown as the hub stores it, except that a secret-named URL query value in it is masked; `statusRedactionNote` says so. Access tokens (an `accessToken` entry, each per-client token in `clientTokens`) read `***redacted (access token)***` whenever Hide access tokens is on, and always for a per-client token; `statusRedactionNote` also says whether an app's stored token is shown; for a per-client token it says both are always hidden. A status page that carried no app state reads `appState: []` with `appStateMissing: true`, unlike an app whose state is empty. When the lists would push the response past the size cap (a webCoRE piston's state can), `appState` lists names only with its values omitted, `statusTruncated` is true and `statusTruncatedNote` says what was cut; if that is still too large, `eventSubscriptions` and `scheduledJobs` are cut too, with `eventSubscriptionsTotal` / `scheduledJobsTotal` giving their full counts, and as a last resort `appState` is left out with `appStateTotal` giving its count. When the status page cannot be read the three lists are omitted and `statusNote` says why. hub_get_rule counts a rule's subscriptions and jobs from the same read.
   - A type='mode' input's `value` is its stored setting. Day Lights uses ten of them for per-mode levels, gated by `useModeOverrides`; most apps use one as an "only during these modes" restriction.
   - **Mode gating in the built-in apps.** The hub has no "modes in use by" list, so read each app; resolve mode IDs with hub_list_modes.
     - **Notifier** — `modes` (mode ids) on `moreOptions`; restricts.
@@ -36144,13 +36308,13 @@ Rule runtime control surface (hub_list_rules = Read master; hub_call_rule and th
 
 - **hub_list_rules** — lists Rule Machine 5.x rules, each with a live **status** ("active" | "paused" | "stopped" | "disabled" | "unknown"), the **disabled** and **paused** booleans (omitted when unknown) and, only when detected, **requiredExpressionFalse: true**.
   - **disabled** is the app's red-X flag from /hub2/appsList.
-  - **paused** and **stopped** come from Rule Machine's name decoration. The appsList name and the RMUtils label are compared with markup stripped and entities decoded; the text the appsList name adds — "(Paused)", "(Stopped)", "(Required Expression false)" — sets the flag. A rule literally NAMED "... (Paused)" or "... (Stopped)" carries the suffix in both strings and is not flagged. A stopped rule's label and name come back without the decoration, in the encoding they already use.
-  - The name shows one decoration at a time ("(Stopped)" hides "(Paused)"), so a decorated row also reads that rule's own paused/stopped state; undecorated rows make no extra read. If that read fails, or one flag is stored as neither true nor false, the name decides that flag (or both) and the row carries **statusSource: "name"**, with **statusSourceNote** listing those ids. Rule Machine refreshes the decoration when the rule's page renders: hub_call_rule(action="stop"/"start"/"pause"/"resume") renders it, so the list is current after an MCP stop, start, pause or resume (unless that render failed, which the call's note reports; hub_get_rule then reads the flag), while a stop made elsewhere shows once the rule's page is next opened (hub_get_app_config(appId: <ruleId>) opens it).
+  - **paused** and **stopped** come from Rule Machine's name decoration: the text the appsList name adds to the RMUtils label ("(Paused)", "(Stopped)", "(Required Expression false)"), compared with markup stripped, sets the flag; a rule literally named "... (Paused)" is not flagged. Labels and names come back without the decoration.
+  - The name shows one decoration at a time, so a decorated row also reads that rule's own paused/stopped state. If that read fails, or a flag is stored as neither true nor false, the name decides and the row carries **statusSource: "name"** (ids in **statusSourceNote**). The decoration refreshes when the rule's page renders, which hub_call_rule's stop, start, pause and resume do (its note says when they did not); a stop made elsewhere shows once the page is next opened (hub_get_app_config(appId: <ruleId>) opens it).
   - **status** precedence is disabled > stopped > paused > active; the booleans stay independent (a paused rule disabled later reads disabled:true, paused:true, status:"disabled").
   - **unknown**: when /hub2/appsList cannot be read, every rule is unknown, the list is unfiltered (deleted rules may linger) and the result carries **statusNote**; when one rule's entry lacks data, only that rule is unknown.
   - For one rule's state call hub_get_rule. Button Rules, Basic Rules and other classic apps (Room Lighting, Notifier, Button Controllers) are listed, with their disabled flag, by hub_list_apps (scope='instances'; nameFilter matches the app type too, so 'Button Rule' finds Button Rules), and Visual Rules by hub_get_visual_rule.
 - **hub_call_rule** — run, stop, start, pause or resume one or more rules (ruleId takes an id or an array): Rule Machine rules and Button Rules, and Visual Rules for pause, resume and (Visual Rule Builder 2.0 only) actions. Each rule is acted on in turn, with per-rule results and failedRuleIds/remainingRuleIds on a partial batch; see hub_call_rule below.
-- **hub_set_rule_private_boolean** — set the private boolean of one or more Rule Machine rules in one RMUtils dispatch (ruleId takes an id or an array; Boolean or lowercase "true"/"false" only); hub_get_rule reads it back as health.privateBoolean. It is the only rule tool that dispatches through RMUtils, so the hub's per-app load limiter can refuse it: a refusal changes nothing, and a reset of the app runtime statistics (hub_delete_logs(mode='appRuntimeStats', confirm=true), or the server's automatic reset) followed by a retry clears it.
+- **hub_set_rule_private_boolean** — set the private boolean of one or more Rule Machine rules in one RMUtils dispatch (ruleId takes an id or an array; Boolean or lowercase "true"/"false" only); hub_get_rule reads it as health.privateBoolean. Each rule's flag is read back for up to two seconds after the dispatch; a rule whose flag does not show the value returns success:false with `unconfirmedRuleIds`. It is the only rule tool that dispatches through RMUtils, so the per-app load limiter can refuse it; a refusal changes nothing, and resetting the app runtime statistics (hub_delete_logs(mode='appRuntimeStats', confirm=true)) then retrying clears it.
 - Every id is checked before anything is dispatched: an id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), refuses the whole call, a batch included; a lookup that fails refuses it too, with success:false. The refusal names the tools that list each kind of rule id.
 
 Native CRUD (also requires the Write master):
@@ -36192,18 +36356,20 @@ For BACKUP enumeration and restore, use the unified **hub_list_backups** (in hub
 
 ### hub_call_rule
 
-`action` selects what to do (default `actions`):
+`action` (required; a call without it is refused) selects what to do:
 
-- **`actions`**: run the rule's actions directly, skipping condition evaluation. A Rule Machine rule's Run Actions button (`runAction`) is clicked; a Visual Rule Builder 2.0 rule runs through its builder's run endpoint, whose conditions still pick the branch, and a run the hub declines comes back as success:false with the hub's own message. A Visual Rule Builder 1.0 rule has no run button, so `actions` naming one refuses the whole call before anything runs; pause and resume work on it.
+- **`actions`**: run the rule's actions directly, without checking its conditions or Required Expression. A Rule Machine rule's Run Actions button (`runAction`) is clicked; a Visual Rule Builder 2.0 rule runs through its builder's run endpoint, whose conditions still pick the branch, and a run the hub declines comes back as success:false with the hub's own message. A Visual Rule Builder 1.0 rule has no run button, so `actions` naming one refuses the whole call before anything runs; pause and resume work on it.
 - **`stop`**: halt the rule's in-progress actions (Rule Machine only).
 - **`start`**: restart a stopped rule (clears stopped and re-initializes it; the private boolean is unchanged; Rule Machine only).
 - **`pause`** / **`resume`**: pause or resume the rule; a paused rule does not fire on its triggers. A Rule Machine rule's Pause button (`pausRule`) is clicked; a Visual Rule is paused through its builder's pause endpoint, and its paused state is read again afterwards, so an endpoint success that left it unchanged returns success:false.
 
-Every action on a Rule Machine rule drives the rule's own page buttons (`runAction`, `stopRule`, `pausRule`), one rule at a time, not RMUtils: that is the route the hub UI takes, so the platform's per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply to them. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After a stop, start, pause or resume click the rule's page is rendered once, so hub_list_rules shows the new status at once (when that render fails, the result's note says so and hub_list_rules may show the old status until the rule's page is next opened; repeating the call does not refresh it, since the rule is already in the target state; check the flag with hub_get_rule, and open the page with hub_get_app_config(appId: <ruleId>) to refresh the list), and the flag is read again: the hub accepts a click that changes nothing, so a flag still not in the target state returns success:false, and hub_get_rule shows where the rule ended up. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: a toggle reads the rule's state and then clicks, so two overlapping calls on one rule can both click and undo each other (the read after the click reports it as success:false); to act on several rules, name them all in one call's `ruleId` array. An id with no app, or an app that is not a rule (the Rule Machine parent app, a Basic Rule, any other app), is refused for every action before anything is dispatched, as it is by hub_set_rule_private_boolean, which acts only on Rule Machine rules and Button Rules.
+On a rule with an open hub_set_rule form session, `stop`, `start`, `pause` and `resume` skip the page render after the click, which would clear the session's in-progress state, and their note says hub_list_rules may show the old status until then.
+
+Every action on a Rule Machine rule clicks the rule's own page button (`runAction`, `stopRule`, `pausRule`), one rule at a time, as the hub UI does, so the per-app load limiter, which refuses RMUtils dispatches on a busy hub, does not apply. `stop`, `start`, `pause` and `resume` read the rule's state first and leave a rule already in the target state alone (rmAction:"noop"), so they are safe to repeat; a repeated `actions` runs the actions again. After the click the rule's page is rendered once, so hub_list_rules shows the new status at once (if that render fails the note says so; a repeat will not refresh it, but hub_get_app_config(appId: <ruleId>) does), and the flag is read again: the hub accepts a click that changes nothing, so a flag not in the target state returns success:false. `stop` or `start` naming a Visual Rule, which has no stop, refuses the whole call before anything runs. Send hub_call_rule calls one at a time: two overlapping toggles on one rule can both click and undo each other (reported as success:false); to act on several rules, name them all in one call's `ruleId` array.
 
 ### hub_get_rule
 
-`hub_get_rule(ruleId, sections?, cursor?, limit?)` reads one Rule Machine rule, Button Rule or Basic Rule. It returns `health` (first), `ruleId`, `localVariables` and, for a Rule Machine 5.1 rule or Button Rule, the document hub_set_rule(operation='read') returns: `actions`, `conditions`, `triggers`, `expressions` and `settings`, all by default, or the ones named in `sections`; `sections: []` returns the health and local variables alone. Page one section, `localVariables` included, with `cursor` ("" first, then each `nextCursor`) and `limit` (1-100, default 50), exactly as the hub_set_rule read does (see set_rule_reference); a page of another section leaves `localVariables` out. A read that would pass the response size cap still returns `health`, then the parts that fit whole; the first part that does not fit comes back as a page (`pagedSection`, `page`, `nextCursor`: continue with `sections: [<pagedSection>]` and that cursor), any other part that does not fit is listed in `omittedSections` (read each with `sections: [<name>]`, `cursor: ""`), and `note` says so; a single row too large to send beside the health alone returns `success:false` with the health. Nothing in the document is readable only through a write tool. A Basic Rule returns `health`, `localVariables: null` and its `settings` (the same `[{name, type, multiple, value, deviceIds}]` rows; whole, so `cursor` and `limit` are refused). Requested settings that cannot be read return `success:false` with `error`, `settingsError` and the health. Any other app returns `health`, `localVariables: null` and a `note`: a Visual Rule's definition is read with hub_get_visual_rule, any other app's configuration and App Status with hub_get_app_config(includeStatus: true).
+`hub_get_rule(ruleId, sections?, cursor?, limit?)` reads one Rule Machine rule, Button Rule or Basic Rule. It returns `health` (first), `ruleId`, `localVariables` and, for a Rule Machine 5.1 rule or Button Rule, the document hub_set_rule(operation='read') returns: `actions`, `conditions`, `triggers`, `expressions` and `settings`, all by default, or the ones named in `sections`; `sections: []` returns the health and local variables alone. Page one section, `localVariables` included, with `cursor` ("" first, then each `nextCursor`) and `limit` (1-100, default 50), exactly as the hub_set_rule read does (see set_rule_reference); a page of another section leaves `localVariables` out. A read over the response size cap returns `health`, then the parts that fit whole; the first that does not fit is paged (`pagedSection`, `page`, `nextCursor`: continue with `sections: [<pagedSection>]` and that cursor), the rest are listed in `omittedSections` (read each with `sections: [<name>]`, `cursor: ""`); a single row too large to send beside the health returns `success:false` with the health. A Basic Rule returns `health`, `localVariables: null` and its `settings` (the same `[{name, type, multiple, value, deviceIds}]` rows; whole, so `cursor` and `limit` are refused). Requested settings that cannot be read return `success:false` with `error`, `settingsError` and the health, for every rule type. With Hide passwords and credentials on, `settings` masks credential-named and password-typed values (`value: null`, `redacted: true`), every parameter of a lock-code custom action (setCode, whose parameters carry the PIN) the same way, and a secret-named URL query parameter inside a value (an HTTP action's `apikey=` or `token=`); other free-text values are not recognised. A paged `localVariables` read that fails returns `success:false` with the `cursor` to retry. Any other app returns `health`, `localVariables: null` and a `note`: a Visual Rule's definition is read with hub_get_visual_rule, any other app's configuration and App Status with hub_get_app_config(includeStatus: true).
 
 - `localVariables`: `[{name, type, value}]`, the rule's own list, including a value the running rule just set. `type` is Rule Machine's token (integer, bigdecimal, string, boolean, datetime), the value a hub_set_rule variable change takes. A credential-named variable's value is hidden (`redacted:true`) while credential hiding is on. Hub globals are read with hub_list_variables.
 - If the local variables alone cannot be read, `localVariables` is null and `localVariablesError` says why; the health and the requested sections still return.
@@ -36213,14 +36379,14 @@ Every action on a Rule Machine rule drives the rule's own page buttons (`runActi
 `health` has the same shape here, in hub_set_rule's read and in the update pre-check:
 
 - `ruleFormat` says what was inspected: `rm` (any Rule Machine rule or Button Rule) / `vrb-graph` / `vrb-classic` / `basic-rule` / `button-controller` / `classic-app`.
-- **Rule Machine**: `broken` comes from the rule's own broken() check alone (a Rule Machine 5.1 rule or Button Rule; an older rule type reports its stored flag): the check behind the `*BROKEN*` name the Automations list shows once the rule's page is opened, so a rule whose trigger device was deleted reads broken without anyone opening it. `brokenRows` (`[{kind: trigger|action|condition, id, setting, text?}]`, Rule Machine 5.1 rules and Button Rules; `[]` for other types) lists the rows Rule Machine's own label methods mark (`**Broken Condition**` and the like), read without opening the page. A marked row does not make the rule broken: Rule Machine marks a condition whose device was deleted without calling the rule broken, so such a rule reads `broken:false`, `ok:false` and an issue naming the marked rows. The marker gives the row's kind; `id` is its native id, the one hub_set_rule changes and operation:'form' use (trigger 2 is `tDev2`), found from the device setting that lost its device (`setting`); `text` is the trigger's or condition's stored description. A condition counts only while Rule Machine lists it as in use. A marked kind with no emptied device setting (a deleted variable, or an action gated on a marked condition) is listed once as `{kind, id: null}`. `brokenRows` is null when it was not listed because the rule's compiled state, settings or label methods went unread; checkErrors says which. `disabledActions` and `disabledTriggers` (native ids of rows switched off; `[]` when none), `structuralIssues` (the IF/Repeat block and expression check hub_set_rule runs) and `privateBoolean`.
+- **Rule Machine**: `broken` comes from the rule's own broken() check alone (a Rule Machine 5.1 rule or Button Rule; an older rule type reports its stored flag): the check behind the `*BROKEN*` name the Automations list shows once the rule's page is opened, so a rule whose trigger device was deleted reads broken without anyone opening it. `brokenRows` (`[{kind: trigger|action|condition, id, setting, text?}]`, Rule Machine 5.1 rules and Button Rules; `[]` for other types) lists the rows Rule Machine's own label methods mark (`**Broken Condition**` and the like), read without opening the page. A marked row does not make the rule broken: Rule Machine marks a condition whose device was deleted without calling the rule broken, so such a rule reads `broken:false`, `ok:false` and an issue naming the marked rows. The marker gives the row's kind; `id` is its native id, the one hub_set_rule changes and operation:'form' use (trigger 2 is `tDev2`), found from the device setting that lost its device (`setting`); `text` is the trigger's or condition's stored description. A marked condition with an emptied device setting is listed by its id while Rule Machine lists it as in use; one nothing uses (for example after an action moved off it) can still be marked and is then listed with `id: null`. A marked row with no emptied device setting (a deleted variable, or an action gated on a marked condition) is listed as `{kind, id: null, text}`, one for each such line its label marks, `text` being that line; a secret-named URL query parameter and a lock code (setCode) parameter in any `text` read as the redaction marker while Hide passwords and credentials is on. `brokenRows` is null when it was not listed because the rule's compiled state, settings or label methods went unread; checkErrors says which. `disabledActions` and `disabledTriggers` (native ids of rows switched off; `[]` when none), `structuralIssues` (the IF/Repeat block and expression check hub_set_rule runs) and `privateBoolean`.
 - **Visual Rules Builder**: the engine's own verdict, a graph rule's `validationErrors` (broken when non-empty), and its pause state from its builder, with the rule's own name as `label`.
 - **Other apps** (Basic Rule, Button Controller, Room Lighting, user and community apps): label, red-X flag and the state flags below; `broken` is null.
 - `paused`, `stopped` and `privateBoolean` come from the app's state on its App Status page. A Rule Machine rule with no `paused` or `stopped` entry reads `false`, and so does a Basic Rule with no `paused` entry; for an app whose state has no flag, or when the status page cannot be read, the name's "(Paused)" or "(Stopped)" decoration is used. `privateBoolean` has no such fallback. An entry stored as neither true nor false reads null with a `checkErrors` entry; neither the compiled state nor the name's decoration replaces it. `label` has the decoration removed. `disabled` is the red-X flag.
 - `eventSubscriptionCount` and `scheduledJobCount` count the app's live subscriptions and scheduled jobs from the same read; the lists themselves come from hub_get_app_config(includeStatus=true).
 - A value the hub does not return reads null.
 
-`ok:true` means everything was read and nothing is wrong. `ok:false` with `unreadable:false` means `issues` names a problem or `checkErrors` names a read that failed, leaving part of the rule unchecked; `unreadable:true` means nothing could be read, which is not evidence of breakage. A `checkErrors` entry is not evidence about the rule either. A Rule Machine rule whose `broken` could not be read always has a `checkErrors` entry, so `broken:null` never reads `ok:true`; hub_set_rule(operation='update') refuses a rule with `broken:null`, whose compiled state went unread (`disabledActions:null`), or whose marked rows went unread (`brokenRows:null`), before any backup or write. A structural issue is expected while a block is built across several calls; finish it with a hub_set_rule(operation='update') terminator change, and compare with hub_get_rule(sections=['actions']) before considering a restore. hub_set_rule(operation='update') refuses a rule that is already broken before any backup or write, naming each marked row by kind and native id. A rule with marked rows that is not broken can be updated, as in the Hubitat UI: the result lists the rows already marked before the write in `brokenRowsBefore`, and the write fails only if it adds a row Rule Machine newly marks.
+`ok:true` means everything was read and nothing is wrong. `ok:false` with `unreadable:false` means `issues` names a problem or `checkErrors` names a read that failed, leaving part of the rule unchecked; `unreadable:true` means nothing could be read, which is not evidence of breakage. A `checkErrors` entry is not evidence about the rule either. A Rule Machine rule whose `broken` could not be read always has a `checkErrors` entry, so `broken:null` never reads `ok:true`; hub_set_rule(operation='update') refuses a rule with `broken:null`, whose compiled state went unread (`disabledActions:null`), or whose marked rows went unread (`brokenRows:null`), before any backup or write. A structural issue is expected while a block is built across several calls; finish it with a hub_set_rule(operation='update') terminator change, and compare with hub_get_rule(sections=['actions']) before considering a restore. hub_set_rule(operation='update') refuses a rule that is already broken, before any backup or write; one with marked rows that is not broken can be updated (see set_rule_reference).
 
 ### hub_delete_native_app
 
