@@ -16046,7 +16046,7 @@ private String findRuleAppRedirect(ruleId, String verb) {
                 return "Rule ${idStr} is a Hubitat built-in ${appTypeName} app. " +
                     "Use `hub_read_rules -> hub_get_rule(ruleId=${idStr})` for read-only inspection. " +
                     "`hub_test_custom_rule` only handles MCP's own rule engine, not Hubitat built-in apps, and Rule Machine has no dry run: " +
-                    "`hub_call_rule(ruleId=${idStr})` runs every one of the rule's actions at once, skipping its conditions " +
+                    "`hub_call_rule(ruleId=${idStr}, action='actions')` runs the rule's actions at once, without its triggers or Required Expression " +
                     "(requires the Write master)."
             } else {
                 return "Rule ${idStr} is a Hubitat built-in ${appTypeName} app. " +
@@ -17013,6 +17013,7 @@ def toolGetAppConfig(args) {
         }
         Map lock = _ruleLockParams(parsed.settings instanceof Map ? parsed.settings : [:])
         result.page = _ruleSecretsMasked(result.page, lock)
+        if (result.controls != null) result.controls = _ruleSecretsMasked(result.controls, lock)
         Map fetched = [:]
         int settingsCount = (parsed.settings instanceof Map) ? parsed.settings.size() : 0
         result.settingsKeyCount = settingsCount
@@ -17040,7 +17041,7 @@ def toolGetAppConfig(args) {
                         redacted.put(k, _appConfigIsSecretSetting(key, type, v) ? redactedPw : v)
                     }
                     result.settings = _ruleSecretsMasked(redacted, lock)
-                    result.settingsRedactionNote = "Secret values read ${redactedPw}: every setting the hub types as a password, on any page of the app, plus free-text settings whose names look like credentials (password, passwd, pwd, psw, pass, passphrase, passcode, secret, token, API/access/private key, credential, psk, cookie, session, bearer, a PIN, or a code named for a lock, user, alarm, keypad, installer or similar), the value of a URL query parameter named like one or by a short URL name (key, auth, sig, signature, pin; an HTTP action's apikey= or token=), and every parameter of a lock-code custom action (setCode), here and in the page text. Other free-text values are not recognised. OAuth accessToken settings follow the Hide access tokens setting instead. Empty values are shown as-is. Turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
+                    result.settingsRedactionNote = "Secret values read ${redactedPw}: every setting the hub types as a password, on any page of the app, plus free-text settings whose names look like credentials (password, passwd, pwd, psw, pass, passphrase, passcode, secret, token, API/access/private key, credential, psk, cookie, session, bearer, a PIN, or a code named for a lock, user, alarm, keypad, installer or similar), the value of a URL query parameter named like one or by a short URL name (key, auth, sig, signature, pin; an HTTP action's apikey= or token=), the password in a URL's user:password@, and every parameter of a lock-code custom action (setCode), here and in the page text. Other free-text values are not recognised. OAuth accessToken settings follow the Hide access tokens setting instead. Empty values are shown as-is. Turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
                 }
             }
         } else if (settingsCount > 0) {
@@ -17097,8 +17098,8 @@ private void _appConfigAttachStatus(Map result, Integer appId, Object fetched = 
         result.scheduledJobs = status.scheduledJobs
         if (status.appStateMissing) result.appStateMissing = true
         List redaction = []
-        if (callerClient != null) redaction << "This client's token always reads credential-named appState values and access tokens as redacted, whatever the MCP app's settings say."
-        else if (_redactsCredentials()) redaction << "appState values whose names look like credentials, at any depth, read ${_appConfigRedactedMarker()}, as settings do; turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
+        if (callerClient != null) redaction << "This client's token always reads credential-named appState values, URL secrets inside appState strings and access tokens as redacted, whatever the MCP app's settings say."
+        else if (_redactsCredentials()) redaction << "appState values whose names look like credentials, at any depth, read ${_appConfigRedactedMarker()}, as settings do, and so does a secret-named URL query value or a URL's user:password@ password inside any appState string (every appState row carrying a marker has redacted: true; do not write its value back); turn off Hide passwords and credentials in the MCP app's settings to read them.".toString()
         List held = callerClient == null ? status.appState.findAll { it.name?.toString() in ['accessToken', 'clientTokens'] }*.name*.toString() : []
         if (held && _redactsAccessTokens()) redaction << "The app's access tokens read as redacted (Hide access tokens is on)."
         else if (held) {
@@ -21265,9 +21266,6 @@ private void _rmNativeRestoreFlags(Long id, Map savedState) {
     live = _nrState(id)
     if ((live.paused == true) != (savedState.paused == true)) _nrHandle(id).appButtonHandler('pausRule')
 }
-private String _rmLabelName(label) {
-    (label?.toString() ?: '').replaceAll(/(?:\s*<span\b[^>]*>\s*(?:\*BROKEN\*|\((?:Not Installed|Stopped|Paused|Required Expression false|Repeating)\))\s*<\/span>)+\s*$/, '')
-}
 private boolean _rmLabelCarriesName(label, String name) {
     String live = label?.toString() ?: ''
     live == name || (live.startsWith(name) && _rmLabelName(live.substring(name.length())).trim().isEmpty())
@@ -22653,15 +22651,16 @@ private String _rmStripTrailingDecoration(Object raw, String suffix) {
     if (!trimmed.endsWith(suffix)) return s
     return trimmed.substring(0, trimmed.length() - suffix.length()).replaceAll(/\s+$/, "")
 }
-private List<Integer> _rmRuleIdListArg(Object raw) {
+private List<Integer> _rmRuleIdListArg(Object raw, boolean visualRules = false) {
     if (raw == null) throw new IllegalArgumentException("ruleId is required")
     def rawList = (raw instanceof List) ? raw : [raw]
-    if (rawList.isEmpty()) throw new IllegalArgumentException("ruleId array must not be empty")
+    String find = "Find rule ids with ${_rmRuleIdSources(visualRules)}."
+    if (rawList.isEmpty()) throw new IllegalArgumentException("ruleId array must not be empty: name one rule id or more. ${find}")
     List<Integer> ids = []
     rawList.each { id ->
         def n = _exactIntId(id)
         if (n == null) {
-            throw new IllegalArgumentException("ruleId '${id}' is not a valid rule id (a positive whole number). Use hub_list_rules to find valid ids.")
+            throw new IllegalArgumentException("${_idShown(id)} is not a valid rule id for ruleId (a positive whole number within the hub's id range). ${find}")
         }
         if (!ids.contains(n)) ids << n
     }
@@ -22669,7 +22668,7 @@ private List<Integer> _rmRuleIdListArg(Object raw) {
 }
 def toolRunRmRule(args) {
     if (args?.ruleId == null) throw new IllegalArgumentException("ruleId is required")
-    List<Integer> ruleIds = _rmRuleIdListArg(args.ruleId)
+    List<Integer> ruleIds = _rmRuleIdListArg(args.ruleId, true)
     def action = args?.action
     if (!(action in ["actions", "stop", "start", "pause", "resume"])) {
         throw new IllegalArgumentException("${action == null ? 'action is required' : "Invalid action '${action}'"}: 'actions' (runs the rule's actions without its triggers or Required Expression), 'stop', 'start', 'pause' or 'resume'. Nothing was dispatched.")
@@ -22709,7 +22708,13 @@ def toolRunRmRule(args) {
         results << perRule(ruleIds[i])
     }
     List failed = []
-    results.eachWithIndex { r, i -> if (r?.success != true) failed << ruleIds[i] }
+    List paused = []
+    List unread = []
+    results.eachWithIndex { r, i ->
+        if (r?.success != true) failed << ruleIds[i]
+        if (r?.paused == true) paused << ruleIds[i]
+        if (r?.pausedUnread == true) unread << ruleIds[i]
+    }
     def out = [
         success: failed.isEmpty() && !budgetPaused,
         partial: failed.size() < results.size() && (budgetPaused || !failed.isEmpty()),
@@ -22724,7 +22729,7 @@ def toolRunRmRule(args) {
             ? "${action} failed for EVERY rule ${budgetPaused ? 'reached' : 'in the batch'} (${failed.join(', ')}); per-rule detail in results[].".toString()
             : "${action} failed for rule(s) ${failed.join(', ')} -- the other ${actionedCount} rule(s) in the batch WERE actioned; per-rule detail in results[].".toString()
         out.note = runActions
-            ? _rmRunFailedNote(failed)
+            ? _rmRunFailedNote(failed, paused)
             : "Re-issue for the failed ids only. A repeat of a succeeded id is safe: the toggle no-ops rules already in the target state."
     }
     if (budgetPaused) {
@@ -22732,16 +22737,20 @@ def toolRunRmRule(args) {
         if (!out.error) out.error = "Response-budget checkpoint: rule(s) ${remaining.join(', ')} were not yet actioned."
         if (runActions) {
             out.note = ("Budget checkpoint -- re-issue with ruleId=[${remaining.join(', ')}] to run the rules not yet reached; leave out the rules already run, or their actions run again." +
-                (failed ? " ${_rmRunFailedNote(failed)}" : "")).toString()
+                (failed ? " ${_rmRunFailedNote(failed, paused)}" : "")).toString()
         } else {
             def reissueIds = (remaining + failed).unique()
             out.note = "Budget checkpoint -- re-issue with ruleId=[${reissueIds.join(', ')}] to finish${failed ? " (includes the ${failed.size()} failed id(s), not just the un-reached ones)" : ""}; already-actioned rules no-op safely.".toString()
         }
     }
+    if (unread) out.note = ((out.note ? "${out.note} " : "") + "Rule(s) ${unread.join(', ')}: paused state could not be read; the click was sent; if paused, nothing ran -- check with hub_get_rule.").toString()
     return out
 }
-private String _rmRunFailedNote(List failed) {
-    "Rule(s) ${failed.join(', ')} failed: read each one's results[] note before running it again, because a run whose answer was lost may already have run the actions. A repeat of a succeeded id runs that rule's actions again.".toString()
+private String _rmRunFailedNote(List failed, List paused) {
+    List lost = failed - paused
+    String note = paused ? "Rule(s) ${paused.join(', ')} were not run because they are paused; resume them with action:'resume' first. " : ""
+    if (lost) note += "Rule(s) ${lost.join(', ')} failed: read each one's results[] note before running it again, because a run whose answer was lost may already have run the actions. "
+    (note + "A repeat of a succeeded id runs that rule's actions again.").toString()
 }
 private Map _rmRunGuardFailure(List<Integer> ruleIds, Map guard) {
     Map failure = guard.failure as Map
@@ -22776,17 +22785,17 @@ private Map _rmRequireRuleTargets(List<Integer> ruleIds, String toolName, boolea
         }
     }
     String accepts = visualRules ? "Rule Machine rules, Button Rules and Visual Rules" : "Rule Machine rules and Button Rules"
-    if (missing) {
-        throw new IllegalArgumentException("${_rmNoAppText(missing)}; ${toolName} acts only on ${accepts}. Find rule ids with hub_list_rules (Rule Machine), hub_list_apps (Button Rules and Basic Rules) or hub_get_visual_rule (Visual Rules). Nothing was dispatched.")
-    }
-    if (notRules) {
-        throw new IllegalArgumentException("${_rmNotRuleText(notRules)}; ${toolName} acts only on ${accepts}. Find rule ids with hub_list_rules (Rule Machine), hub_list_apps (Button Rules and Basic Rules) or hub_get_visual_rule (Visual Rules). Nothing was dispatched.")
-    }
+    String find = "; ${toolName} acts only on ${accepts}. Find rule ids with ${_rmRuleIdSources(visualRules)}. Nothing was dispatched."
+    if (missing) throw new IllegalArgumentException("${_rmNoAppText(missing)}${find}")
+    if (notRules) throw new IllegalArgumentException("${_rmNotRuleText(notRules)}${find}")
     if (unreadable) {
         unreadable.each { id, why -> mcpLog("warn", "rm-interop", "${toolName}: app ${id} could not be identified (${why}); nothing dispatched") }
         return [failure: _rmLookupFailure(unreadable), unreadable: unreadable]
     }
     return [types: types]
+}
+private String _rmRuleIdSources(boolean visualRules) {
+    "hub_list_rules (Rule Machine)${visualRules ? ',' : ' or'} hub_list_apps(nameFilter:'Button Rule') (Button Rules)${visualRules ? ' or hub_get_visual_rule (Visual Rules)' : ''}"
 }
 private Map _rmLookupFailure(Map reasonsById) {
     def detail = reasonsById.collect { id, why -> "app ${id}: ${why}" }.join('; ')
@@ -22794,13 +22803,26 @@ private Map _rmLookupFailure(Map reasonsById) {
             note: "Nothing was changed. Retry once; if it fails again, check that the hub answers with hub_get_info. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
 }
 private Map _rmRunActionsButton(Integer ruleId) {
+    boolean paused = false
+    String unread = null
+    try { paused = _rmRuntimeFlag(ruleId, "paused") }
+    catch (Exception e) {
+        unread = e.message ?: e.toString()
+        mcpLog("warn", "rm-interop", "hub_call_rule action=actions: rule ${ruleId}'s paused state could not be read (${unread}); clicking runAction anyway", ruleId.toString())
+    }
+    if (paused) {
+        return [success: false, ruleId: ruleId, dispatched: false, paused: true, error: "hub_call_rule action=actions: rule ${ruleId} is paused, and Rule Machine does not run a paused rule's actions, so nothing was run.".toString(),
+                note: "Resume it first with action:'resume', then run its actions. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
+    }
     try {
         _rmClickAppButton(ruleId, "runAction")
     } catch (Exception e) {
         return [success: false, ruleId: ruleId, error: "hub_call_rule action=actions: runAction button click failed (${e.message})".toString(),
                 note: "The click may have reached the hub and run the rule's actions before failing. Check the rule's effects and hub_get_logs before retrying, because a retry runs the actions again. See hub_get_tool_guide(section='builtin_app_tools_rules')."]
     }
-    return [success: true, ruleId: ruleId, rmAction: "runAction button"]
+    Map done = [success: true, ruleId: ruleId, rmAction: "runAction button"]
+    if (unread) { done.pausedUnread = true; done.note = "The rule's paused state could not be read (${unread}), so the click was sent; if the rule is paused, Rule Machine ran nothing. Check with hub_get_rule.".toString() }
+    return done
 }
 private boolean _rmRuntimeFlag(Integer ruleId, String name) {
     Map flag = _appStatusFlag(_appStatusFlagsRead(ruleId), name)
@@ -24336,7 +24358,11 @@ def toolGetNativeRule(args) {
 Map _rmPublicLocalVariable(String name, Map row) {
     Map result = [name: name, type: row?.type, value: row?.value]
     if (_appConfigMasksSetting(name, row?.type == 'boolean' ? 'bool' : 'text', row?.value)) { result.value = null; result.redacted = true }
-    else if (_redactsAccessTokens() && name ==~ /(?i)access_?token/ && row?.value instanceof CharSequence) result.value = _accessTokenRedactedMarker()
+    else if (_redactsAccessTokens() && name ==~ /(?i)access_?token/ && row?.value instanceof CharSequence) { result.value = _accessTokenRedactedMarker(); result.redacted = true }
+    else if (row?.value instanceof CharSequence) {
+        result.value = _ruleSecretsMasked(row.value, [names: [], codes: []])
+        if (result.value?.toString() != row.value.toString()) result.redacted = true
+    }
     result
 }
 private boolean _rmReusableBackupFileMatches(Map entry, Integer ruleId) {
@@ -25819,7 +25845,7 @@ private void _nmWriteActionOrder(Long ruleId, List actionList) {
     variable: ['operation', 'name', 'type', 'value'], required: ['tokens'], delete: ['part', 'id'], order: ['ids'], terminator: ['subtype']]
 private Long _ndId(Object id) {
     Integer exact = _exactIntId(id)
-    if (exact == null) throw new IllegalArgumentException("A positive native application ID is required, got: ${id}.".toString())
+    if (exact == null) throw new IllegalArgumentException("A positive native application ID is required, got: ${_idShown(id)}.".toString())
     exact as Long
 }
 private Object _ndJson(Object value) {
@@ -25838,8 +25864,8 @@ private List _ndSettings(Long id) {
     response.settings.collect { row ->
         boolean secret = _redactsCredentials() && (row.type == 'password' || _appConfigIsSecretSetting(row.name, row.type, row.value) || row.name in lock.names)
         def setting = [name: row.name, type: row.type, multiple: row.multiple, value: secret ? null : _ruleSecretsMasked(row.value, lock), deviceIds: row.deviceList instanceof Map ? row.deviceList.keySet().collect { it.toString() }.sort() : null]
-        if (secret) setting.redacted = true
-        else if (_redactsAccessTokens() && row.name ==~ /(?i)access_?token/ && row.value instanceof CharSequence) setting.value = _accessTokenRedactedMarker()
+        if (!secret && _redactsAccessTokens() && row.name ==~ /(?i)access_?token/ && row.value instanceof CharSequence) setting.value = _accessTokenRedactedMarker()
+        if (secret || setting.value != row.value) setting.redacted = true
         setting
     }
 }
@@ -25907,13 +25933,17 @@ private Map _ndRender(Long id, String page) {
 }
 private Map _ndDocumentArgs(Map args, List allowed, String toolName) {
     def sections = args.sections == null ? allowed : args.sections
-    if (!(sections instanceof List) || sections.any { !(it in allowed) }) throw new IllegalArgumentException('Unknown document section')
+    String guide = "See hub_get_tool_guide(section='${toolName == 'hub_get_rule' ? 'builtin_app_tools_rules' : 'set_rule_reference'}')."
+    if (!(sections instanceof List) || sections.any { !(it in allowed) }) {
+        def bad = sections instanceof List ? sections.findAll { !(it in allowed) } : sections
+        throw new IllegalArgumentException("${sections instanceof List ? 'Unknown section' : 'sections must be a list of names, not'} ${groovy.json.JsonOutput.toJson(bad)}; ${toolName} sections are ${allowed.join(', ')}. ${guide}".toString())
+    }
     boolean paged = args.containsKey('cursor') || args.containsKey('limit')
-    if (paged && sections.size() != 1) throw new IllegalArgumentException('Paged reads require exactly one section')
+    if (paged && sections.size() != 1) throw new IllegalArgumentException("Paged reads require exactly one section, got ${groovy.json.JsonOutput.toJson(sections)}. ${guide}".toString())
     def cursor = args.containsKey('cursor') ? args.cursor : ''
     def limit = args.containsKey('limit') ? args.limit : 50
     if (paged && (!(cursor instanceof String) || !(limit instanceof Number) || !limit.toString().isLong() || limit < 1 || limit > 100))
-        throw new IllegalArgumentException('Read cursor must be a string and limit an integer from 1 to 100')
+        throw new IllegalArgumentException("Read cursor must be a string and limit an integer from 1 to 100, got cursor ${groovy.json.JsonOutput.toJson(cursor)} and limit ${groovy.json.JsonOutput.toJson(limit)}. ${guide}".toString())
     if (paged) _parseListCursor(cursor, Integer.MAX_VALUE, toolName)
     [sections: sections, paged: paged, cursor: cursor, limit: limit]
 }
@@ -26540,7 +26570,8 @@ private void _ndValidateSchema(Object value, Map schema, String path, boolean co
     boolean valid = schema.type == 'object' ? value instanceof Map : schema.type == 'array' ? value instanceof List :
         schema.type == 'string' ? value instanceof String : schema.type == 'boolean' ? value instanceof Boolean :
         schema.type == 'integer' ? value instanceof Number && value.toString().isLong() : true
-    if (!valid || (schema.enum != null && !(value in schema.enum))) throw new IllegalArgumentException("Invalid ${path}")
+    if (!valid) throw new IllegalArgumentException("Invalid ${path}")
+    if (schema.enum != null && !(value in schema.enum)) throw new IllegalArgumentException("Invalid ${path}: ${groovy.json.JsonOutput.toJson(value)} is not one of ${schema.enum.join(', ')}".toString())
     if (schema.type == 'object') {
         def unknown = schema.additionalProperties == false ? value.keySet().find { !schema.properties.containsKey(it) } : null
         if (unknown != null) throw new IllegalArgumentException("Unknown ${path} property: ${unknown}".toString())
@@ -26609,7 +26640,7 @@ String _ndGuide() {
 
 Call hub_set_rule without operation for help, or choose a write operation without confirm to inspect its schema without changing the rule. Top-level ruleId identifies the target; args cannot override it or confirm. When mandatory guide acknowledgment is enabled, pass its key as top-level bestPracticeKey alongside operation, ruleId, args and confirm.
 
-Read hub_set_rule(operation:"read",ruleId,args:{sections:[...]}) before editing an existing native rule; hub_get_rule returns the same document from the read-only tools, with the local variables as a localVariables list in place of the variables section. A read does not open the rule's page: it returns health, the same report hub_get_rule returns (broken from the rule's own check, brokenRows for the rows its page marks, paused, stopped, privateBoolean, structuralIssues; see builtin_app_tools_rules). The sections come from native state and typed settings. Sections: actions, conditions, triggers, expressions, variables, settings. Action IDs and order are native IDs, preserved for in-place edits; omitted parts and unknown settings remain native-owned.
+Read hub_set_rule(operation:"read",ruleId,args:{sections:[...]}) before editing an existing native rule; hub_get_rule returns the same document from the read-only tools, with the local variables as a localVariables list in place of the variables section. A read does not open the rule's page: it returns health, the same report hub_get_rule returns (broken from the rule's own check, brokenRows for the rows its page marks, paused, stopped, privateBoolean, structuralIssues; see builtin_app_tools_rules). The sections come from native state and typed settings. Sections: actions, conditions, triggers, expressions, variables, settings. variables and settings mask secrets as hub_get_rule does; every row that carries a marker has redacted:true, and its value must never be written back. Action IDs and order are native IDs, preserved for in-place edits; omitted parts and unknown settings remain native-owned.
 
 For large rules, read one section with args:{sections:["settings"],cursor:"",limit:50}. Paging requires exactly one section; limit is 1..100 (default 50). The section keeps its usual map or list shape. Pass the returned top-level nextCursor into args.cursor until nextCursor is null. page returns offset, limit, total and revision, a hash of the complete section; restart if revision changes. Pages may contain fewer than limit rows to fit the response size cap; a row too large to send beside the health alone returns success:false with the health, never truncated. Actions retain native order, settings sort by name, and map sections sort by string key. Omit cursor and limit for an unpaged read; one too large for the response cap returns health and the parts that fit whole, pages the first part that does not (pagedSection, nextCursor) and lists the other parts that do not fit in omittedSections.
 
@@ -31500,7 +31531,7 @@ def getGatewayConfig() {
             summaries: [
                 hub_set_rule: "Read, create, update or use native Rule Machine forms. Args: operation?, ruleId?, args?, confirm?. Omit operation for help; unconfirmed writes return schemas.",
                 hub_list_rules: "List the Rule Machine 5.x rules with IDs, labels and status. Button Rules are listed by hub_list_apps and Visual Rules by hub_get_visual_rule",
-                hub_call_rule: "Run the actions of one or more rules, or stop, start, pause or resume them, through each rule's own page buttons (a Visual Rule: pause, resume, and actions on a 2.0 rule). Args: ruleId (id or array of ids), action (actions/stop/start/pause/resume, default actions)",
+                hub_call_rule: "Run the actions of one or more rules, or stop, start, pause or resume them, through each rule's own page buttons (a Visual Rule: pause, resume, and actions on a 2.0 rule). Args: ruleId (id or array of ids), action (actions/stop/start/pause/resume, required)",
                 hub_set_rule_private_boolean: "Set the private boolean of one or more Rule Machine rules or Button Rules. Args: ruleId (id or array of ids), value (bool)",
                 hub_set_native_app: "Create, update or drive the native forms of classic apps (Room Lighting, Button Controller and Button Rule, Basic Rule, Notifier, Groups and Scenes, Thermostat Scheduler and Controller, user and community apps). Args: operation?, app_id?, args?, confirm?. Omit operation for help; unconfirmed writes return schemas. Rule Machine rules use hub_set_rule.",
                 hub_delete_native_app: "Delete any classic native app (soft by default, force=true for hard). Auto-backs-up first. Args: appId, force (opt), confirm",
@@ -31624,7 +31655,7 @@ def getGatewayConfig() {
             summaries: [
                 hub_set_rule: "Read, create, update or use native Rule Machine forms. Args: operation?, ruleId?, args?, confirm?. Omit operation for help; unconfirmed writes return schemas.",
                 hub_list_rules: "List the Rule Machine 5.x rules with IDs, labels and status. Button Rules are listed by hub_list_apps and Visual Rules by hub_get_visual_rule",
-                hub_call_rule: "Run the actions of one or more rules, or stop, start, pause or resume them, through each rule's own page buttons (a Visual Rule: pause, resume, and actions on a 2.0 rule). Args: ruleId (id or array of ids), action (actions/stop/start/pause/resume, default actions)",
+                hub_call_rule: "Run the actions of one or more rules, or stop, start, pause or resume them, through each rule's own page buttons (a Visual Rule: pause, resume, and actions on a 2.0 rule). Args: ruleId (id or array of ids), action (actions/stop/start/pause/resume, required)",
                 hub_set_rule_private_boolean: "Set the private boolean of one or more Rule Machine rules or Button Rules. Args: ruleId (id or array of ids), value (bool)",
                 hub_get_rule: "Read one Rule Machine rule, Button Rule or Basic Rule without opening its page: its health (broken, broken rows by native id, paused, stopped, private boolean, disabled rows, block structure, live subscription and job counts) and, for a Rule Machine 5.1 rule or Button Rule, its actions, conditions, triggers, expressions, settings and local variables; a Basic Rule's settings. Any other app returns its health alone. Args: ruleId, sections?, cursor?, limit?",
                 hub_delete_native_app: "Delete any classic native app incl. RM rules (soft by default, force=true for hard). Auto-backs-up first. Args: appId, force (opt), confirm.",
@@ -34258,8 +34289,12 @@ def _exceptionStack(Throwable e) {
 }
 private Integer normalizeRuleId(def ruleId) {
     Integer exact = _exactIntId(ruleId)
-    if (exact == null) throw new IllegalArgumentException("The app id must be a positive whole number within the hub's id range, got: ${ruleId}. Find app ids with hub_list_apps or hub_list_rules.")
+    if (exact == null) throw new IllegalArgumentException("The app id must be a positive whole number within the hub's id range, got: ${_idShown(ruleId)}. Find app ids with hub_list_apps or hub_list_rules.")
     return exact
+}
+String _idShown(Object id) {
+    try { if (new BigDecimal(id.toString().trim()).abs() > Integer.MAX_VALUE) return "a number outside the hub's id range" } catch (Exception ignored) { }
+    id instanceof CharSequence ? "'${id}'".toString() : id?.toString()
 }
 Integer _exactIntId(Object id) {
     try {
@@ -34583,7 +34618,8 @@ Map _appStatusRead(Integer appId, Object fetched = null) {
         String key = row.name?.toString()
         def value = _appStateMasked(key, row.value)
         if (maskTokens) value = _redactAccessTokens([(key): value]).get(key)
-        [name: row.name, value: value]
+        def masked = _ruleSecretsMasked(value, [names: [], codes: []])
+        masked == row.value ? [name: row.name, value: masked] : [name: row.name, value: masked, redacted: true]
      }] + _appStatusLists(sections.eventSubscriptions, sections.scheduledJobs) + [
      appSettings: (sections.appSettings ?: []).findAll { it instanceof Map }.collect { row ->
         def ids = row.deviceIdsForDeviceList instanceof List ? row.deviceIdsForDeviceList : []
@@ -34621,10 +34657,25 @@ private Object _ruleSecretsMasked(Object value, Map lock) {
         if (node instanceof Map) return node.collectEntries { k, v -> [(k): walk.call(v, k == 'value' && row != null ? row : k?.toString())] }
         if (node instanceof List) return node.collect { walk.call(it, key) }
         if (!(node instanceof CharSequence)) return node
-        String text = !credentials ? node.toString() : node.toString().replaceAll(/([?&])([^=&\s"'<>#?]+)=([^&\s"'<>#?]*)/) { all, sep, name, val ->
-            boolean secret = !(name ==~ /(?i)access_?token/) && (name ==~ /(?i)(?:[\w.\-]*[_.\-])?(?:api_?key|key|token|secret|pass|passwd|password|pwd|auth|sig|signature|pin)/ || _appConfigSecretName(name))
-            secret && val && !val.startsWith('***redacted') ? "${sep}${name}=${marker}".toString() : all
+        String text = node.toString()
+        if (credentials) {
+            def pair = text =~ /([?&])([^=&\s"'<>#?]+)=([^&\s"'<>#?]*)/
+            def stop = text =~ /[&\s"'<>#]/
+            StringBuilder out = new StringBuilder()
+            int pos = 0
+            while (pos < text.length() && pair.find(pos)) {
+                String name = pair.group(2)
+                boolean secret = !(name ==~ /(?i)access_?token/) && (name ==~ /(?i)(?:[\w.\-]*[_.\-])?(?:api_?key|key|token|secret|pass|passwd|password|pwd|auth|sig|signature|pin)/ || _appConfigSecretName(name))
+                int from = pair.start(3)
+                boolean masked = secret && text.startsWith('***redacted', from)
+                int end = (!secret || masked) ? pair.end() : (stop.find(from) ? stop.start() : text.length())
+                if (secret && !masked && end > from) out.append(text.substring(pos, from)).append(marker)
+                else { end = pair.end(); out.append(text.substring(pos, end)) }
+                pos = end
+            }
+            text = out.append(text.substring(pos)).toString()
         }
+        if (credentials) text = text.replaceAll(/([A-Za-z][\w+.\-]{0,31}:\/\/[^\s:\/@?#"'<>]*:)[^\s\/?#"'<>]+(?=@)/) { all, pre -> "${pre}${marker}".toString() }
         if (credentials && text =~ /\s/) lock.codes.each { code -> text = text.replaceAll('(?<![\\w.])' + java.util.regex.Pattern.quote(code) + '(?![\\w.])', marker) }
         (lock.texts ?: [:]).each { secret, mask -> text = text.replace(secret, mask) }
         text
@@ -34881,6 +34932,9 @@ private List _rmDisabledRowIds(Map compiled, String key, List checkErrors) {
     checkErrors << "the rule's ${key} is not a list (${value}), so its disabled rows were not read".toString()
     return null
 }
+private String _rmLabelName(label) {
+    (label?.toString() ?: '').replaceAll(/(?:\s*<span\b[^>]*>\s*(?:\*BROKEN\*|\((?:Not Installed|Stopped|Paused|Required Expression false|Repeating)\))\s*<\/span>)+\s*$/, '')
+}
 Map _rmCheckRuleHealth(Integer appId, Map marked = null) {
     def issues = []
     def checkErrors = []
@@ -34921,7 +34975,7 @@ Map _rmCheckRuleHealth(Integer appId, Map marked = null) {
         else labelPaused = true
         label = label.substring(0, decoration.start()).trim()
     }
-    result.label = label?.replaceAll(/<[^>]+>/, "")?.trim()
+    result.label = label == null ? null : _rmLabelName(label).replaceAll(/<[^>]+>/, "").trim()
     Map compiled = null
     if (ruleType) result.ruleFormat = "rm"
     boolean otherApp = typeName != null && !visual && !ruleType
@@ -36319,8 +36373,8 @@ A single tool can also be switched off under **Advanced: Per-tool Overrides**. A
   - `pageNote` appears when the hub rendered another page than `pageName`: the app reaches that page only through its link, so open it in a form workflow.
   - Each input is the field hub_set_native_app(operation='form') returns; a device picker adds `selected`, its devices with labels. `unsupported` lists page parts a form cannot drive, such as a community app's create button. When the page cannot be modelled, `formError` says why: inputs carry no values and there are no controls.
   - `appType.namespace` and `appType.name` name the type; `appType.system` and `appType.menu` are the fields hub_list_apps(scope='types') gives for every type at once.
-  - `includeSettings=true` adds the raw settings map: 500-1000 app-encoded keys on large apps (Room Lighting stores per-device scene levels as `dm~<deviceId>~<scene>`). Secrets read `***redacted (password)***`: every setting the hub types as a password, on any page, and free-text settings with credential-shaped names (password, pass, psw, secret, token, API key, credential, cookie, session, bearer, PIN, lock or alarm code, ...). A secret-named URL query parameter (an HTTP action's `apikey=` or `token=`) and every parameter of a lock-code custom action (setCode, whose parameters carry the PIN) read the marker too, in the settings and in the page's inputs, links and text; other free-text values are not recognised. OAuth accessToken settings follow the Hide access tokens setting. Page inputs read as in the form tools: a password input carries no value and `redacted: true`; a credential-named input reads the marker. With Hide passwords and credentials turned off in the MCP app's settings they read as stored. When the setting types cannot be read the map is withheld and `settingsNote` says why.
-  - `includeStatus=true` adds the app's App Status lists, for any app and also with `summary=true`: `appState` (the app's stored state as `[{name, value}]`; a community app's working data, a webCoRE piston's definition, logs and trace), `eventSubscriptions` and `scheduledJobs`. With Hide passwords and credentials on, a value whose name looks like a credential (a session cookie included) reads `***redacted (password)***`, also inside nested maps and lists, where a key is judged on its own and after its parent's name (a bare `code` under `lockCodes`) and a `{name, value}` row by its name; in `eventSubscriptions` and `scheduledJobs` map data is masked by key name the same way, while string data (a hub stores `subscriptionData` as a string such as `"3"`) is shown as the hub stores it, except that a secret-named URL query value in it is masked; `statusRedactionNote` says so. Access tokens (an `accessToken` entry, each per-client token in `clientTokens`) read `***redacted (access token)***` whenever Hide access tokens is on, and always for a per-client token; `statusRedactionNote` also says whether an app's stored token is shown; for a per-client token it says both are always hidden. A status page that carried no app state reads `appState: []` with `appStateMissing: true`, unlike an app whose state is empty. When the lists would push the response past the size cap (a webCoRE piston's state can), `appState` lists names only with its values omitted, `statusTruncated` is true and `statusTruncatedNote` says what was cut; if that is still too large, `eventSubscriptions` and `scheduledJobs` are cut too, with `eventSubscriptionsTotal` / `scheduledJobsTotal` giving their full counts, and as a last resort `appState` is left out with `appStateTotal` giving its count. When the status page cannot be read the three lists are omitted and `statusNote` says why. hub_get_rule counts a rule's subscriptions and jobs from the same read.
+  - `includeSettings=true` adds the raw settings map: 500-1000 app-encoded keys on large apps (Room Lighting stores per-device scene levels as `dm~<deviceId>~<scene>`). Secrets read `***redacted (password)***`: every setting the hub types as a password, on any page, and free-text settings with credential-shaped names (password, pass, psw, secret, token, API key, credential, cookie, session, bearer, PIN, lock or alarm code, ...). A secret-named URL query parameter (an HTTP action's `apikey=` or `token=`), the password in a URL's `user:password@` (one holding a raw `/` cannot be told from the path and is not masked) and every parameter of a lock-code custom action (setCode, whose parameters carry the PIN) read the marker too, in the settings and in the page's inputs, links and text; other free-text values are not recognised. OAuth accessToken settings follow the Hide access tokens setting. Page inputs read as in the form tools: a password input carries no value and `redacted: true`; a credential-named input reads the marker. With Hide passwords and credentials turned off in the MCP app's settings they read as stored. When the setting types cannot be read the map is withheld and `settingsNote` says why.
+  - `includeStatus=true` adds the app's App Status lists, for any app and also with `summary=true`: `appState` (the app's stored state as `[{name, value}]`; a community app's working data, a webCoRE piston's definition, logs and trace), `eventSubscriptions` and `scheduledJobs`. With Hide passwords and credentials on, a value whose name looks like a credential (a session cookie included) reads `***redacted (password)***`, also inside nested maps and lists, where a key is judged on its own and after its parent's name (a bare `code` under `lockCodes`) and a `{name, value}` row by its name; in `eventSubscriptions` and `scheduledJobs` map data is masked by key name the same way, while string data (a hub stores `subscriptionData` as a string such as `"3"`) is shown as the hub stores it, except that a secret-named URL query value or a URL's `user:password@` password in it is masked, as in any `appState` string; every `appState` row that carries a marker (by its name, an access token or a URL secret, nested values included) has `redacted: true`, and its value must not be written back; `statusRedactionNote` says so. Access tokens (an `accessToken` entry, each per-client token in `clientTokens`) read `***redacted (access token)***` whenever Hide access tokens is on, and always for a per-client token; `statusRedactionNote` also says whether an app's stored token is shown; for a per-client token it says both are always hidden. A status page that carried no app state reads `appState: []` with `appStateMissing: true`, unlike an app whose state is empty. When the lists would push the response past the size cap (a webCoRE piston's state can), `appState` lists names only with its values omitted, `statusTruncated` is true and `statusTruncatedNote` says what was cut; if that is still too large, `eventSubscriptions` and `scheduledJobs` are cut too, with `eventSubscriptionsTotal` / `scheduledJobsTotal` giving their full counts, and as a last resort `appState` is left out with `appStateTotal` giving its count. When the status page cannot be read the three lists are omitted and `statusNote` says why. hub_get_rule counts a rule's subscriptions and jobs from the same read.
   - A type='mode' input's `value` is its stored setting. Day Lights uses ten of them for per-mode levels, gated by `useModeOverrides`; most apps use one as an "only during these modes" restriction.
   - **Mode gating in the built-in apps.** The hub has no "modes in use by" list, so read each app; resolve mode IDs with hub_list_modes.
     - **Notifier** — `modes` (mode ids) on `moreOptions`; restricts.
@@ -36405,7 +36459,7 @@ For BACKUP enumeration and restore, use the unified **hub_list_backups** (in hub
 
 `action` (required; a call without it is refused) selects what to do:
 
-- **`actions`**: run the rule's actions directly. A Rule Machine rule's (or Button Rule's) Run Actions button (`runAction`) is clicked, which runs its actions without its triggers or Required Expression; conditions inside the actions (IF blocks, conditional actions) are still evaluated. A Visual Rule Builder 2.0 rule runs through its builder's run endpoint, whose conditions still pick the branch, and a run the hub declines comes back as success:false with the hub's own message. A Visual Rule Builder 1.0 rule has no run button, so `actions` naming one refuses the whole call before anything runs; pause and resume work on it.
+- **`actions`**: run the rule's actions directly. A Rule Machine rule's (or Button Rule's) Run Actions button (`runAction`) is clicked, which runs its actions without its triggers or Required Expression; conditions inside the actions (IF blocks, conditional actions) are still evaluated. Rule Machine runs nothing for a paused rule, so a paused Rule Machine rule or Button Rule is not clicked and returns success:false (`dispatched:false`, `paused:true`; in a batch the note says it was not run); resume it first with `resume`. When the paused state cannot be read the click is sent anyway, and the row carries `pausedUnread:true` and a `note` saying so (in a batch, the top-level note names those rules; a batch continued across responses can name only the last part's, so read the per-rule `paused`/`pausedUnread` flags in `results`); check with hub_get_rule. A Visual Rule Builder 2.0 rule runs through its builder's run endpoint, whose conditions still pick the branch, and a run the hub declines comes back as success:false with the hub's own message. A Visual Rule Builder 1.0 rule has no run button, so `actions` naming one refuses the whole call before anything runs; pause and resume work on it.
 - **`stop`**: halt the rule's in-progress actions (Rule Machine only).
 - **`start`**: restart a stopped rule (clears stopped and re-initializes it; the private boolean is unchanged; Rule Machine only).
 - **`pause`** / **`resume`**: pause or resume the rule; a paused rule does not fire on its triggers. A Rule Machine rule's Pause button (`pausRule`) is clicked; a Visual Rule is paused through its builder's pause endpoint, and its paused state is read again afterwards, so an endpoint success that left it unchanged returns success:false.
@@ -36416,9 +36470,9 @@ Every action on a Rule Machine rule clicks the rule's own page button (`runActio
 
 ### hub_get_rule
 
-`hub_get_rule(ruleId, sections?, cursor?, limit?)` reads one Rule Machine rule, Button Rule or Basic Rule. It returns `health` (first), `ruleId`, `localVariables` and, for a Rule Machine 5.1 rule or Button Rule, the document hub_set_rule(operation='read') returns: `actions`, `conditions`, `triggers`, `expressions` and `settings`, all by default, or the ones named in `sections`; `sections: []` returns the health and local variables alone. Page one section, `localVariables` included, with `cursor` ("" first, then each `nextCursor`) and `limit` (1-100, default 50), exactly as the hub_set_rule read does (see set_rule_reference); a page of another section leaves `localVariables` out. A read over the response size cap returns `health`, then the parts that fit whole; the first that does not fit is paged (`pagedSection`, `page`, `nextCursor`: continue with `sections: [<pagedSection>]` and that cursor), the rest are listed in `omittedSections` (read each with `sections: [<name>]`, `cursor: ""`); a single row too large to send beside the health returns `success:false` with the health. A Basic Rule returns `health`, `localVariables: null` and its `settings` (the same `[{name, type, multiple, value, deviceIds}]` rows; whole, so `cursor` and `limit` are refused). Requested settings that cannot be read return `success:false` with `error`, `settingsError` and the health, for every rule type. With Hide passwords and credentials on, `settings` masks credential-named and password-typed values (`value: null`, `redacted: true`), every parameter of a lock-code custom action (setCode, whose parameters carry the PIN) the same way, and a secret-named URL query parameter inside a value (an HTTP action's `apikey=` or `token=`); other free-text values are not recognised. A paged `localVariables` read that fails returns `success:false` with the `cursor` to retry. Any other app returns `health`, `localVariables: null` and a `note`: a Visual Rule's definition is read with hub_get_visual_rule, any other app's configuration and App Status with hub_get_app_config(includeStatus: true).
+`hub_get_rule(ruleId, sections?, cursor?, limit?)` reads one Rule Machine rule, Button Rule or Basic Rule. It returns `health` (first), `ruleId`, `localVariables` and, for a Rule Machine 5.1 rule or Button Rule, the document hub_set_rule(operation='read') returns: `actions`, `conditions`, `triggers`, `expressions` and `settings`, all by default, or the ones named in `sections`; `sections: []` returns the health and local variables alone. Page one section, `localVariables` included, with `cursor` ("" first, then each `nextCursor`) and `limit` (1-100, default 50), exactly as the hub_set_rule read does (see set_rule_reference); a page of another section leaves `localVariables` out. A read over the response size cap returns `health`, then the parts that fit whole; the first that does not fit is paged (`pagedSection`, `page`, `nextCursor`: continue with `sections: [<pagedSection>]` and that cursor), the rest are listed in `omittedSections` (read each with `sections: [<name>]`, `cursor: ""`); a single row too large to send beside the health returns `success:false` with the health. A Basic Rule returns `health`, `localVariables: null` and its `settings` (the same `[{name, type, multiple, value, deviceIds}]` rows; whole, so `cursor` and `limit` are refused). Requested settings that cannot be read return `success:false` with `error`, `settingsError` and the health, for every rule type. With Hide passwords and credentials on, `settings` masks credential-named and password-typed values (`value: null`, `redacted: true`), every parameter of a lock-code custom action (setCode, whose parameters carry the PIN) the same way, and a secret-named URL query parameter or a URL's `user:password@` password inside a value (an HTTP action's `apikey=` or `token=`; a password holding a raw `/` cannot be told from the path and is not masked); other free-text values are not recognised. Every `settings` or `localVariables` row that carries a marker, hidden whole, masked in part or an access token, has `redacted: true`, and its value must not be written back. A paged `localVariables` read that fails returns `success:false` with the `cursor` to retry. Any other app returns `health`, `localVariables: null` and a `note`: a Visual Rule's definition is read with hub_get_visual_rule, any other app's configuration and App Status with hub_get_app_config(includeStatus: true).
 
-- `localVariables`: `[{name, type, value}]`, the rule's own list, including a value the running rule just set. `type` is Rule Machine's token (integer, bigdecimal, string, boolean, datetime), the value a hub_set_rule variable change takes. A credential-named variable's value is hidden (`redacted:true`) while credential hiding is on. Hub globals are read with hub_list_variables.
+- `localVariables`: `[{name, type, value}]`, the rule's own list, including a value the running rule just set. `type` is Rule Machine's token (integer, bigdecimal, string, boolean, datetime), the value a hub_set_rule variable change takes. A credential-named variable's value is hidden (`redacted:true`) while credential hiding is on, and a URL in a string value has its secret-named query value and `user:password@` password masked as in `settings`; an `accessToken` variable follows Hide access tokens. Each such row has `redacted: true`. Hub globals are read with hub_list_variables.
 - If the local variables alone cannot be read, `localVariables` is null and `localVariablesError` says why; the health and the requested sections still return.
 - If the rule cannot be identified but its health can still be read, that health returns with `localVariables: null` and no document sections: as `success:false` with the reason in `error` when sections were requested, and with the reason in `documentError` for `sections: []`.
 - The read does not open the app's page or change its configuration, so it never runs the app's page code; a Rule Machine 5.1 rule's or Button Rule's own broken() check can refresh its stored broken flag. A read that fails returns `success:false` with `error` and `note`; retrying it once is safe.
